@@ -1,0 +1,89 @@
+acpSessionTitleRefreshEnabled = false
+acpChatEventPageSize = 96
+acpChatEventWindowPageCount = 3
+acpChatResourceCacheSessionCount = 8
+acpRawMaxSizeBytes = 2097152
+acpRawTargetSizeBytes = 1048576
+acpSessionForegroundLeaseTtlSecs = 90
+acpSessionForegroundLeaseRenewIntervalSecs = 30
+acpSessionIdleTtlSecs = 600
+acpAdapterConnectionIdleTtlSecs = 600
+acpMaxIdleSessionRuntimes = 8
+acpMaxIdleAdapterConnections = 4
+acpTimelineCompactMaxSizeBytes = 8388608
+acpTimelineCompactPatchRatio = 4
+conversationAutoTitleMaxChars = 48
+conversationInlineContentMaxBytes = 20000
+conversationInlineImageMaxBytes = 4194304
+conversationInlineImageMaxDimension = 2560
+notificationAutoDismissTargetSecs = 20
+requireLocalClaudeExecutable = false
+
+[projectIdentity]
+maxLength = 80
+hashHexLength = 8
+separator = "--"
+
+[workspaceLayout]
+shellMinWidth = 480
+shellMinHeight = 680
+
+[workspaceLayout.rightWorkspace]
+minWidth = 288
+defaultWidth = 440
+maxWidth = 1440
+
+[workspaceLayout.rightWorkspace.file]
+splitMinWidth = 500
+treeDefaultWidth = 280
+treeMinWidth = 200
+treeMaxWidth = 420
+
+[workspaceLayout.conversation]
+centerMinWidth = 360
+centerAutoCollapseWidth = 420
+windowMinWidth = 480
+
+[workspaceLayout.contextCards]
+centerMinWidth = 520
+centerAutoCollapseWidth = 520
+windowMinWidth = 520
+
+[workspaceLayout.workflowCanvas]
+centerMinWidth = 640
+centerAutoCollapseWidth = 640
+windowMinWidth = 640
+
+[workspaceLayout.settings]
+centerMinWidth = 480
+centerAutoCollapseWidth = 480
+windowMinWidth = 480
+
+[workspaceFiles]
+autoSaveDelayMs = 300
+searchDebounceMs = 200
+searchResultLimit = 500
+textEditableMaxBytes = 2097152
+textHighlightMaxChars = 120000
+textReadOnlyMaxBytes = 10485760
+imagePreviewMaxBytes = 20971520
+imagePreviewMaxPixels = 40000000
+contentCacheEntries = 12
+contentCacheMaxBytes = 16777216
+watchDebounceMs = 150
+previewTokenTtlSeconds = 300
+externalAccessGrantTtlSeconds = 1800
+markdownLivePreviewMaxChars = 200000
+markdownEmbeddedImageLimit = 100
+markdownEmbeddedImageMaxConcurrent = 4
+
+[turnFiles]
+cardPreviewLimit = 3
+attachmentCardPreviewLimit = 1
+captureMaxEntries = 256
+captureMaxFileBytes = 2097152
+captureMaxTotalBytes = 16777216
+diffTextMaxBytes = 2097152
+diffTextMaxLines = 100000
+blobCacheMaxBytes = 0
+blobRetentionPolicy = "attempt"
