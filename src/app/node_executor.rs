@@ -1,0 +1,1751 @@
+use anyhow::{Result, anyhow, bail, ensure};
+use camino::Utf8PathBuf;
+use std::collections::{BTreeMap, HashSet};
+use std::time::Instant;
+
+use tracing::{info, warn};
+
+use crate::acp::events::annotate_runtime_control_output;
+use crate::artifacts::parse_json_artifact;
+use crate::domain::{
+    InvocationKind, NodeOutcome, RunStatus, SessionMode, TurnControlMode, VERSION,
+};
+use crate::dsl::{
+    JsonConditionDsl, JsonPathSegment, NodeDsl, ValidatedWorkflow, WorkerNode, parse_json_path,
+};
+use crate::dynamic::AI_DYNAMIC_RESULT_ARTIFACT;
+use crate::observability::{ProgressStage, progress};
+use crate::prompts::PromptExecutionSurface;
+use crate::provider::{
+    ConversationPromptInput, OutputEmissionMode, PromptArtifactRef, PromptAttachmentRef,
+    PromptOutputContract, PromptPredecessorContext, PromptRuntimeContext, PromptVisibility,
+    ProviderRunResult, ProviderRunStatus, RuntimeControlIntent, RuntimeControlOutput, StreamMode,
+    UserPromptRenderMode, WorkerInvocation,
+};
+use crate::runtime::{
+    NodeState, RoundState, RoundTraceStep, WorkerRefState, validate_node_state,
+    validate_worker_ref_state, write_node_state,
+};
+use crate::runtime_error::runtime_error;
+use crate::storage::sqlite::{AttemptIndexContext, index_attempt_with_retry};
+use crate::storage::{read_json, write_json};
+
+use super::ids::now_rfc3339_like;
+use super::{AcpLiveEventContext, App};
+
+fn worker_task_instruction(worker: &WorkerNode) -> Option<String> {
+    worker
+        .goal
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn attempt_is_still_current_running(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    round_id: &str,
+    node_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    let run: crate::runtime::RunState = read_json(&app.paths.run_file(task_id, run_id))?;
+    Ok(run.status == RunStatus::Running
+        && run.current_round.as_deref() == Some(round_id)
+        && run.current_node.as_deref() == Some(node_id)
+        && run.current_attempt.as_deref() == Some(attempt_id))
+}
+
+fn success_condition_text(condition: &JsonConditionDsl) -> String {
+    match condition {
+        JsonConditionDsl::Expression { expression } => expression.clone(),
+        JsonConditionDsl::PathEquals { path, equals } => {
+            format!("JSON field `{}` equals `{}`", path, equals)
+        }
+    }
+}
+
+fn worker_output_contract(worker: &WorkerNode) -> Option<PromptOutputContract> {
+    worker.output.as_ref().map(|output| PromptOutputContract {
+        artifact: output.artifact.clone(),
+        kind: format!("{:?}", output.kind).to_ascii_lowercase(),
+        schema: output.schema.clone(),
+        schema_text: None,
+        success_condition: worker
+            .success_condition
+            .as_ref()
+            .map(success_condition_text),
+        finalize_context: None,
+        emission_mode: OutputEmissionMode::PostTurnProjection,
+    })
+}
+
+fn runtime_prompt_context(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    round_id: &str,
+    node_id: &str,
+    attempt_id: &str,
+) -> PromptRuntimeContext {
+    PromptRuntimeContext {
+        project_id: app.paths.project_id.clone(),
+        task_id: task_id.to_string(),
+        run_id: run_id.to_string(),
+        round_id: round_id.to_string(),
+        node_id: node_id.to_string(),
+        attempt_id: attempt_id.to_string(),
+        runtime_node_id: None,
+        runtime_attempt_id: None,
+        attempt_state_file: Some(
+            app.paths
+                .node_file(task_id, run_id, round_id, node_id, attempt_id),
+        ),
+        language: app.config.desktop_language,
+        run_dir: app.paths.run_dir(task_id, run_id),
+        round_dir: app.paths.round_dir(task_id, run_id, round_id),
+        node_dir: app.paths.node_dir(task_id, run_id, round_id, node_id),
+        attempt_dir: app
+            .paths
+            .attempt_dir(task_id, run_id, round_id, node_id, attempt_id),
+        attachments_dir: app
+            .paths
+            .attachments_dir(task_id, run_id, round_id, node_id, attempt_id),
+        task_inputs_dir: super::existing_task_inputs_dir(app, task_id),
+    }
+}
+
+#[derive(Clone)]
+struct TraceRef {
+    round_id: String,
+    step: RoundTraceStep,
+}
+
+fn load_rounds_through_current(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    current_round: &RoundState,
+) -> Vec<RoundState> {
+    let rounds_dir = app.paths.run_dir(task_id, run_id).join("rounds");
+    let mut rounds = std::fs::read_dir(rounds_dir.as_std_path())
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(std::result::Result::ok))
+        .filter_map(|entry| Utf8PathBuf::from_path_buf(entry.path()).ok())
+        .map(|path| path.join("round.json"))
+        .filter(|path| path.exists())
+        .filter_map(|path| read_json::<RoundState>(&path).ok())
+        .filter(|round| round.id != current_round.id)
+        .collect::<Vec<_>>();
+    rounds.push(current_round.clone());
+    rounds.sort_by_key(|round| round.index);
+    rounds
+}
+
+fn trace_refs_before_current_attempt(
+    round: &RoundState,
+    current_node_id: &str,
+    current_attempt_id: &str,
+) -> Vec<TraceRef> {
+    let mut refs = Vec::new();
+    let mut trace = round.trace.clone();
+    trace.sort_by_key(|step| step.sequence);
+    for step in trace {
+        if step.node_id == current_node_id && step.attempt_id == current_attempt_id {
+            return refs;
+        }
+        refs.push(TraceRef {
+            round_id: round.id.clone(),
+            step,
+        });
+    }
+    refs
+}
+
+fn current_round_entry_step(round: &RoundState) -> Option<RoundTraceStep> {
+    round.trace.iter().min_by_key(|step| step.sequence).cloned()
+}
+
+fn is_current_round_entry_attempt(
+    round: &RoundState,
+    current_node_id: &str,
+    current_attempt_id: &str,
+) -> bool {
+    current_round_entry_step(round)
+        .map(|entry| entry.node_id == current_node_id && entry.attempt_id == current_attempt_id)
+        .unwrap_or(false)
+}
+
+fn stable_prefix_node_ids(rounds: &[RoundState], current_round: &RoundState) -> Vec<String> {
+    if current_round.trigger != crate::domain::RoundTrigger::NewRound {
+        return Vec::new();
+    }
+    let Some(entry_step) = current_round_entry_step(current_round) else {
+        return Vec::new();
+    };
+    let mut best = Vec::new();
+    for round in rounds
+        .iter()
+        .filter(|round| round.index < current_round.index)
+    {
+        let mut trace = round.trace.clone();
+        trace.sort_by_key(|step| step.sequence);
+        let Some(entry_index) = trace
+            .iter()
+            .position(|step| step.node_id == entry_step.node_id)
+        else {
+            continue;
+        };
+        let mut candidate = Vec::new();
+        for step in trace.iter().take(entry_index) {
+            if !candidate.contains(&step.node_id) {
+                candidate.push(step.node_id.clone());
+            }
+        }
+        if candidate.len() >= best.len() {
+            best = candidate;
+        }
+    }
+    best
+}
+
+fn scoped_predecessor_trace_refs(
+    rounds: &[RoundState],
+    current_round: &RoundState,
+    current_node_id: &str,
+    current_attempt_id: &str,
+) -> Vec<TraceRef> {
+    let current_round_refs =
+        trace_refs_before_current_attempt(current_round, current_node_id, current_attempt_id);
+    let current_round_node_ids = current_round_refs
+        .iter()
+        .map(|trace_ref| trace_ref.step.node_id.clone())
+        .collect::<HashSet<_>>();
+    let prefix_node_ids =
+        if is_current_round_entry_attempt(current_round, current_node_id, current_attempt_id) {
+            stable_prefix_node_ids(rounds, current_round)
+        } else {
+            Vec::new()
+        };
+    let mut scoped = Vec::new();
+
+    for node_id in prefix_node_ids {
+        if current_round_node_ids.contains(&node_id) {
+            continue;
+        }
+        let latest = rounds
+            .iter()
+            .filter(|round| round.index < current_round.index)
+            .flat_map(|round| {
+                let mut trace = round.trace.clone();
+                trace.sort_by_key(|step| step.sequence);
+                trace
+                    .into_iter()
+                    .filter(|step| step.node_id == node_id)
+                    .map(|step| TraceRef {
+                        round_id: round.id.clone(),
+                        step,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .last();
+        if let Some(trace_ref) = latest {
+            scoped.push(trace_ref);
+        }
+    }
+
+    scoped.extend(current_round_refs);
+    scoped
+}
+
+fn new_round_trigger_trace_ref(
+    rounds: &[RoundState],
+    current_round: &RoundState,
+) -> Option<TraceRef> {
+    if current_round.trigger != crate::domain::RoundTrigger::NewRound {
+        return None;
+    }
+    let previous_round = rounds
+        .iter()
+        .filter(|round| round.index < current_round.index)
+        .max_by_key(|round| round.index)?;
+    let step = previous_round
+        .trace
+        .iter()
+        .max_by_key(|step| step.sequence)?
+        .clone();
+    Some(TraceRef {
+        round_id: previous_round.id.clone(),
+        step,
+    })
+}
+
+fn branch_kind_for_node(node: &NodeDsl) -> String {
+    if node.manual_check_enabled() {
+        return "人工check".to_string();
+    }
+    match node {
+        NodeDsl::Worker(worker)
+            if worker.output.is_some() || worker.success_condition.is_some() =>
+        {
+            "节点输出检查".to_string()
+        }
+        _ => "普通".to_string(),
+    }
+}
+
+fn output_contract_reason(_worker: &WorkerNode) -> Option<String> {
+    None
+}
+
+fn artifact_preview(path: &Utf8PathBuf) -> Option<String> {
+    let content = std::fs::read_to_string(path.as_std_path()).ok()?;
+    const LIMIT: usize = 2048;
+    if content.len() > LIMIT {
+        let preview = content.chars().take(LIMIT).collect::<String>();
+        Some(format!(
+            "{}\n... preview omitted; read the file if needed",
+            preview
+        ))
+    } else {
+        Some(content)
+    }
+}
+
+fn output_artifact_for_predecessor(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    round_id: &str,
+    trace: &RoundTraceStep,
+    node_dsl: &NodeDsl,
+) -> Option<PromptArtifactRef> {
+    let artifact = match node_dsl {
+        NodeDsl::Worker(worker) => worker
+            .output
+            .as_ref()
+            .map(|output| output.artifact.as_str()),
+        NodeDsl::AiDynamic(_) => Some(AI_DYNAMIC_RESULT_ARTIFACT),
+    }?;
+    let path = app.paths.artifact_file(
+        task_id,
+        run_id,
+        round_id,
+        &trace.node_id,
+        &trace.attempt_id,
+        artifact,
+    );
+    Some(PromptArtifactRef {
+        name: artifact.to_string(),
+        preview: path.exists().then(|| artifact_preview(&path)).flatten(),
+        path,
+    })
+}
+
+fn predecessor_attachments(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    round_id: &str,
+    trace: &RoundTraceStep,
+) -> Vec<PromptAttachmentRef> {
+    let dir =
+        app.paths
+            .attachments_dir(task_id, run_id, round_id, &trace.node_id, &trace.attempt_id);
+    let mut refs = std::fs::read_dir(dir.as_std_path())
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    let path = Utf8PathBuf::from_path_buf(entry.path()).ok()?;
+                    let name = path.file_name()?.to_string();
+                    (path.is_file() && !name.starts_with('.')).then(|| PromptAttachmentRef { name })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    refs.sort_by(|a, b| a.name.cmp(&b.name));
+    refs
+}
+
+fn predecessor_context_from_trace_ref(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    trace_ref: &TraceRef,
+    node_dsl: &NodeDsl,
+    branch_direction: Option<String>,
+) -> PromptPredecessorContext {
+    let node = read_json::<NodeState>(&app.paths.node_file(
+        task_id,
+        run_id,
+        &trace_ref.round_id,
+        &trace_ref.step.node_id,
+        &trace_ref.step.attempt_id,
+    ))
+    .ok();
+    let branch_reason = match node_dsl {
+        NodeDsl::Worker(worker) => output_contract_reason(worker),
+        NodeDsl::AiDynamic(_) => None,
+    };
+    PromptPredecessorContext {
+        round_id: trace_ref.round_id.clone(),
+        node_id: trace_ref.step.node_id.clone(),
+        attempt_id: trace_ref.step.attempt_id.clone(),
+        node_type: format!("{:?}", node_dsl.node_type()).to_ascii_lowercase(),
+        branch_kind: branch_kind_for_node(node_dsl),
+        outcome: node
+            .and_then(|node| node.outcome)
+            .map(|outcome| format!("{:?}", outcome).to_ascii_lowercase()),
+        branch_direction,
+        output_artifact: output_artifact_for_predecessor(
+            app,
+            task_id,
+            run_id,
+            &trace_ref.round_id,
+            &trace_ref.step,
+            node_dsl,
+        ),
+        branch_reason,
+        attachments: predecessor_attachments(
+            app,
+            task_id,
+            run_id,
+            &trace_ref.round_id,
+            &trace_ref.step,
+        ),
+    }
+}
+
+fn build_predecessor_contexts(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    current_round: &RoundState,
+    current_node_id: &str,
+    current_attempt_id: &str,
+    workflow: &ValidatedWorkflow,
+) -> Vec<PromptPredecessorContext> {
+    let rounds = load_rounds_through_current(app, task_id, run_id, current_round);
+    let traces =
+        scoped_predecessor_trace_refs(&rounds, current_round, current_node_id, current_attempt_id);
+
+    traces
+        .iter()
+        .enumerate()
+        .filter_map(|(index, trace_ref)| {
+            let node_dsl = workflow.get_node(&trace_ref.step.node_id)?;
+            let next = traces.get(index + 1);
+            let branch_direction = next
+                .and_then(|next| next.step.edge_outcome.clone())
+                .or_else(|| {
+                    if trace_ref.round_id == current_round.id {
+                        current_round
+                            .trace
+                            .iter()
+                            .find(|step| {
+                                step.node_id == current_node_id
+                                    && step.attempt_id == current_attempt_id
+                                    && step.from_node_id.as_deref()
+                                        == Some(trace_ref.step.node_id.as_str())
+                            })
+                            .and_then(|step| step.edge_outcome.clone())
+                    } else {
+                        None
+                    }
+                });
+            Some(predecessor_context_from_trace_ref(
+                app,
+                task_id,
+                run_id,
+                trace_ref,
+                node_dsl,
+                branch_direction,
+            ))
+        })
+        .collect()
+}
+
+pub(super) fn build_new_round_trigger_context(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    current_round: &RoundState,
+    current_node_id: &str,
+    current_attempt_id: &str,
+    workflow: &ValidatedWorkflow,
+) -> Option<PromptPredecessorContext> {
+    if !is_current_round_entry_attempt(current_round, current_node_id, current_attempt_id) {
+        return None;
+    }
+    let rounds = load_rounds_through_current(app, task_id, run_id, current_round);
+    let trigger = new_round_trigger_trace_ref(&rounds, current_round)?;
+    let node_dsl = workflow.get_node(&trigger.step.node_id)?;
+    Some(predecessor_context_from_trace_ref(
+        app,
+        task_id,
+        run_id,
+        &trigger,
+        node_dsl,
+        Some("$new-round".to_string()),
+    ))
+}
+
+pub(crate) fn build_worker_invocation(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    round: &RoundState,
+    attempt_id: &str,
+    workflow: &ValidatedWorkflow,
+    node_id: &str,
+    session_mode: SessionMode,
+    continue_ref: Option<serde_json::Value>,
+    resume_prompt: Option<String>,
+    resume_prompt_id: Option<String>,
+    prompt_display: Option<ConversationPromptInput>,
+    resume_prompt_visibility: PromptVisibility,
+    user_prompt_render_mode: UserPromptRenderMode,
+    resume_input_attachment_paths: Vec<String>,
+    model_override: Option<String>,
+    permission_mode_override: Option<String>,
+) -> Result<WorkerInvocation> {
+    let invocation_started_at = Instant::now();
+    let round_id = round.id.as_str();
+    let node_dsl = workflow.get_node(node_id).expect("validated node exists");
+    let (
+        profile,
+        permission_mode,
+        configured_model,
+        output_contract,
+        task_instruction,
+        invocation_kind,
+        cold_artifacts,
+        cold_attachments,
+        prompt_envelope,
+        configured_options,
+    ) = match node_dsl {
+        NodeDsl::Worker(worker) => (
+            worker.profile.clone(),
+            worker.permission_mode.clone(),
+            worker.model.clone(),
+            worker_output_contract(worker),
+            worker_task_instruction(worker),
+            InvocationKind::WorkerGeneric,
+            Vec::new(),
+            Vec::new(),
+            worker.prompt_envelope,
+            worker.config_options.clone(),
+        ),
+        NodeDsl::AiDynamic(_) => {
+            bail!("ai-dynamic nodes must be executed by the dynamic orchestrator")
+        }
+    };
+    let model = model_override
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or(configured_model);
+    let permission_mode = permission_mode_override
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or(permission_mode);
+
+    let profile_entry = profile
+        .as_deref()
+        .map(|id| app.profile_show(id))
+        .transpose()?;
+    let profile_content = profile_entry
+        .as_ref()
+        .map(|profile| profile.content.clone());
+    let profile_dynamic_template = profile_entry
+        .as_ref()
+        .is_some_and(|profile| profile.dynamic_template);
+
+    let runtime_context =
+        runtime_prompt_context(app, task_id, run_id, round_id, node_id, attempt_id);
+    let mut config_options = configured_options;
+    config_options.extend(current_acp_config_option_overrides(
+        &runtime_context.attempt_dir,
+    ));
+    let predecessors =
+        build_predecessor_contexts(app, task_id, run_id, round, node_id, attempt_id, workflow);
+    let new_round_trigger =
+        build_new_round_trigger_context(app, task_id, run_id, round, node_id, attempt_id, workflow);
+    let (task_input_attachment_paths, user_input_attachment_paths) = match session_mode {
+        SessionMode::New => (super::task_input_attachment_paths(app, task_id), Vec::new()),
+        SessionMode::Continue => (Vec::new(), resume_input_attachment_paths),
+    };
+
+    let mcp_resolution_started_at = Instant::now();
+    let mcp_mgr = crate::mcp::McpManager::new(app.paths.user_settings_file());
+    let mcp_servers = mcp_mgr.configured_acp_mcp_servers().unwrap_or_else(|e| {
+        warn!(%e, "failed to load MCP servers for ACP session, falling back to empty list");
+        Vec::new()
+    });
+    info!(
+        target: "sasuke::perf",
+        task_id,
+        run_id,
+        round_id,
+        node_id,
+        attempt_id,
+        server_count = mcp_servers.len(),
+        elapsed_ms = mcp_resolution_started_at.elapsed().as_millis(),
+        "ACP MCP configuration resolved"
+    );
+
+    info!(
+        target: "sasuke::perf",
+        task_id,
+        run_id,
+        round_id,
+        node_id,
+        attempt_id,
+        elapsed_ms = invocation_started_at.elapsed().as_millis(),
+        "worker invocation built"
+    );
+
+    let workspace_dir = super::orchestrator::run_workspace_dir(app, task_id, run_id)?;
+
+    Ok(WorkerInvocation {
+        invocation_kind,
+        turn_control_mode: if prompt_envelope == crate::dsl::PromptEnvelopeMode::RawAgent {
+            TurnControlMode::NonRuntimeControlled
+        } else {
+            TurnControlMode::RuntimeControlled
+        },
+        runtime_control_intent: RuntimeControlIntent::Unchanged,
+        prompt_envelope,
+        execution_surface: PromptExecutionSurface::Workflow,
+        profile,
+        profile_content,
+        profile_dynamic_template,
+        requirement_path: Some(app.paths.requirement_file(task_id)),
+        requirement_text: None,
+        adapter_workspace_dir: app.paths.repo_root.clone(),
+        workspace_dir,
+        attempt_dir: runtime_context.attempt_dir.clone(),
+        output_contract,
+        runtime_context,
+        predecessors,
+        new_round_trigger,
+        extra_system_sections: Vec::new(),
+        extra_hidden_sections: Vec::new(),
+        task_instruction,
+        user_tips_instruction: None,
+        resume_task_instruction: None,
+        session_mode,
+        user_prompt_render_mode,
+        permission_mode,
+        model,
+        config_options,
+        continue_ref,
+        resume_prompt,
+        resume_prompt_id,
+        prompt_display,
+        resume_prompt_visibility,
+        stream_mode: StreamMode::StreamJson,
+        log_prompts: app.config.log_prompts,
+        log_provider_command: app.config.log_provider_command,
+        attachments_dir: matches!(node_dsl, NodeDsl::Worker(_)).then(|| {
+            app.paths
+                .attachments_dir(task_id, run_id, round_id, node_id, attempt_id)
+        }),
+        cold_artifacts,
+        cold_attachments,
+        task_input_attachment_paths,
+        user_input_attachment_paths,
+        attachment_projection_policy: crate::provider::AttachmentProjectionPolicy::from(
+            &app.config,
+        ),
+        mcp_servers,
+        scheduled_context: app.scheduled_task_context().cloned(),
+    })
+}
+
+fn current_acp_config_option_overrides(attempt_dir: &camino::Utf8Path) -> BTreeMap<String, String> {
+    let snapshot_path = attempt_dir.join("acp.snapshot.json");
+    let session_path = attempt_dir.join("acp.session.json");
+    let path = if snapshot_path.exists() {
+        snapshot_path
+    } else if session_path.exists() {
+        session_path
+    } else {
+        return BTreeMap::new();
+    };
+    crate::acp::events::load_session_metadata(&path, None)
+        .ok()
+        .map(|metadata| metadata.config_option_overrides)
+        .unwrap_or_default()
+}
+
+pub(crate) fn execute_ai_node(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    round: &RoundState,
+    attempt_id: &str,
+    workflow: &ValidatedWorkflow,
+    node_id: &str,
+    node: NodeState,
+    session_mode: SessionMode,
+    continue_ref: Option<serde_json::Value>,
+    resume_prompt: Option<String>,
+    resume_prompt_id: Option<String>,
+    prompt_display: Option<ConversationPromptInput>,
+    resume_prompt_visibility: PromptVisibility,
+    user_prompt_render_mode: UserPromptRenderMode,
+    resume_input_attachment_paths: Vec<String>,
+    runtime_control_intent: RuntimeControlIntent,
+    model_override: Option<String>,
+    permission_mode_override: Option<String>,
+) -> Result<NodeState> {
+    let round_id = round.id.as_str();
+    let mut invocation = build_worker_invocation(
+        app,
+        task_id,
+        run_id,
+        round,
+        attempt_id,
+        workflow,
+        node_id,
+        session_mode,
+        continue_ref,
+        resume_prompt,
+        resume_prompt_id,
+        prompt_display,
+        resume_prompt_visibility,
+        user_prompt_render_mode,
+        resume_input_attachment_paths,
+        model_override,
+        permission_mode_override,
+    )?;
+    invocation.runtime_control_intent = runtime_control_intent;
+
+    progress(&format!(
+        "calling provider for {}/{}/{}",
+        round_id, node_id, attempt_id
+    ));
+    progress(&format!(
+        "raw stream file: {}",
+        app.paths
+            .raw_stream_file(task_id, run_id, round_id, node_id, attempt_id)
+    ));
+    let provider_id = node
+        .resolved_config
+        .get("provider")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow!("node `{node_id}` is missing resolved provider"))?;
+    tracing::debug!(task_id, run_id, round_id, node_id, attempt_id, provider_id, stage = ?ProgressStage::CallingProvider, "calling provider");
+    let live_update_context = AcpLiveEventContext {
+        task_id: task_id.to_string(),
+        task_uuid: app
+            .run_status(task_id, run_id)
+            .ok()
+            .and_then(|run| run.task_uuid),
+        run_id: run_id.to_string(),
+        round_id: round_id.to_string(),
+        node_id: node_id.to_string(),
+        attempt_id: attempt_id.to_string(),
+        outer_node_id: None,
+        outer_attempt_id: None,
+    };
+    let attempt_dir_for_index = invocation.attempt_dir.clone();
+    let live_update = app.acp_live_update_for(live_update_context.clone());
+    let session_update = app.acp_session_update_for(live_update_context.clone());
+    let prompt_accepted = app.acp_prompt_accepted_for(live_update_context);
+    let runtime_prompt_accepted = |prompt_id: &str| {
+        app.transition_runtime_execution_phase(
+            task_id,
+            run_id,
+            round_id,
+            node_id,
+            attempt_id,
+            crate::runtime::RuntimeExecutionPhase::RunningNode,
+        )?;
+        if let Some(callback) = prompt_accepted.as_ref() {
+            callback(prompt_id)?;
+        }
+        Ok(())
+    };
+    let runtime_phase_update = |phase| {
+        let phase = match phase {
+            crate::provider::ProviderRuntimePhase::FinalizingArtifact => {
+                crate::runtime::RuntimeExecutionPhase::FinalizingArtifact
+            }
+        };
+        let state_lock =
+            super::attempt_runtime_state_lock(app, task_id, run_id, round_id, node_id, attempt_id);
+        let _guard = state_lock
+            .lock()
+            .map_err(|_| anyhow!("attempt runtime state lock poisoned"))?;
+        let run_path = app.paths.run_file(task_id, run_id);
+        let mut durable_run: crate::runtime::RunState = read_json(&run_path)?;
+        if durable_run.status != RunStatus::Running
+            || durable_run.current_round.as_deref() != Some(round_id)
+            || durable_run.current_node.as_deref() != Some(node_id)
+            || durable_run.current_attempt.as_deref() != Some(attempt_id)
+        {
+            return Ok(());
+        }
+        durable_run.updated_at = super::ids::now_rfc3339_like();
+        durable_run.transition_current_execution(phase, durable_run.updated_at.clone())?;
+        crate::runtime::validate_run_state(&durable_run)?;
+        write_json(&run_path, &durable_run)
+    };
+    let result = app
+        .provider_for_id(provider_id)?
+        .run_worker_with_runtime_callbacks(
+            invocation,
+            live_update.as_ref().map(|callback| callback as _),
+            session_update.as_ref().map(|callback| callback as _),
+            Some(&runtime_prompt_accepted),
+            Some(&runtime_phase_update),
+        )?;
+
+    if !attempt_is_still_current_running(app, task_id, run_id, round_id, node_id, attempt_id)? {
+        return Ok(read_json(
+            &app.paths
+                .node_file(task_id, run_id, round_id, node_id, attempt_id),
+        )
+        .unwrap_or(node));
+    }
+
+    // Fire-and-forget: index this attempt for cross-session search
+    let ctx = AttemptIndexContext {
+        task_id: task_id.to_string(),
+        run_id: run_id.to_string(),
+        round_id: round_id.to_string(),
+        node_id: node_id.to_string(),
+        attempt_id: attempt_id.to_string(),
+        outer_node_id: None,
+        outer_attempt_id: None,
+    };
+    std::thread::spawn(move || {
+        index_attempt_with_retry(&attempt_dir_for_index, &ctx);
+    });
+
+    progress(&format!(
+        "normalizing artifact for {}/{}/{}",
+        round_id, node_id, attempt_id
+    ));
+    tracing::debug!(task_id, run_id, round_id, node_id, attempt_id, stage = ?ProgressStage::NormalizingArtifact, "normalizing provider result");
+    finalize_ai_attempt(
+        app, task_id, run_id, round_id, attempt_id, node_id, node, result,
+    )
+}
+
+fn evaluate_json_success_condition(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    round_id: &str,
+    node: &NodeState,
+    artifact_name: &str,
+) -> Result<Option<NodeOutcome>> {
+    let artifact_path = app.paths.artifact_file(
+        task_id,
+        run_id,
+        round_id,
+        &node.node_id,
+        &node.attempt_id,
+        artifact_name,
+    );
+    let content = std::fs::read_to_string(artifact_path.as_std_path())?;
+    let Ok(value) = parse_json_artifact(&content) else {
+        return Ok(Some(NodeOutcome::Invalid));
+    };
+
+    if let Some(schema) = node.resolved_config.get("outputSchema") {
+        if !matches_simple_schema(&value, schema)? {
+            return Ok(Some(NodeOutcome::Invalid));
+        }
+    }
+
+    if let Some(expression) = node
+        .resolved_config
+        .get("successConditionExpression")
+        .and_then(|value| value.as_str())
+    {
+        return evaluate_json_expression(&value, expression).map(|success| {
+            Some(if success {
+                NodeOutcome::Success
+            } else {
+                NodeOutcome::Failure
+            })
+        });
+    }
+
+    let Some(path) = node
+        .resolved_config
+        .get("successConditionPath")
+        .and_then(|value| value.as_str())
+    else {
+        return Ok(None);
+    };
+    let Some(expected) = node.resolved_config.get("successConditionEquals") else {
+        return Ok(Some(NodeOutcome::Invalid));
+    };
+    let Some(cursor) = select_json_path(&value, path) else {
+        return Ok(Some(NodeOutcome::Invalid));
+    };
+    Ok(Some(if json_values_equal(cursor, expected) {
+        NodeOutcome::Success
+    } else {
+        NodeOutcome::Failure
+    }))
+}
+
+fn select_json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let segments = parse_json_path(path).ok()?;
+    let mut cursor = value;
+    for segment in segments {
+        cursor = match segment {
+            JsonPathSegment::Key(key) => cursor.get(key)?,
+            JsonPathSegment::Index(index) => cursor.as_array()?.get(index)?,
+        };
+    }
+    Some(cursor)
+}
+
+fn evaluate_json_expression(value: &serde_json::Value, expression: &str) -> Result<bool> {
+    const OPERATORS: [&str; 6] = [">=", "<=", "!=", "==", ">", "<"];
+    let trimmed = expression.trim();
+    let (operator, left, right) = OPERATORS
+        .iter()
+        .find_map(|operator| {
+            trimmed
+                .split_once(operator)
+                .map(|(left, right)| (*operator, left.trim(), right.trim()))
+        })
+        .ok_or_else(|| anyhow!("unsupported success expression: {expression}"))?;
+    ensure!(
+        left.starts_with('$'),
+        "success expression left side must start with `$`: {expression}"
+    );
+    let Some(actual) = select_json_path(value, left) else {
+        return Ok(false);
+    };
+    let expected = parse_expression_value(right)?;
+    compare_json_values(actual, &expected, operator)
+}
+
+fn parse_expression_value(value: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(value)
+        .or_else(|_| serde_json::from_str(&format!("\"{}\"", value.trim_matches('"'))))
+        .map_err(|error| anyhow!("invalid success expression value `{value}`: {error}"))
+}
+
+fn compare_json_values(
+    actual: &serde_json::Value,
+    expected: &serde_json::Value,
+    operator: &str,
+) -> Result<bool> {
+    Ok(match operator {
+        "==" => json_values_equal(actual, expected),
+        "!=" => !json_values_equal(actual, expected),
+        ">" => json_number(actual)? > json_number(expected)?,
+        ">=" => json_number(actual)? >= json_number(expected)?,
+        "<" => json_number(actual)? < json_number(expected)?,
+        "<=" => json_number(actual)? <= json_number(expected)?,
+        _ => bail!("unsupported success expression operator: {operator}"),
+    })
+}
+
+fn json_values_equal(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
+    if actual == expected {
+        return true;
+    }
+    match (actual, expected) {
+        (serde_json::Value::Bool(left), serde_json::Value::String(right))
+        | (serde_json::Value::String(right), serde_json::Value::Bool(left)) => {
+            right.eq_ignore_ascii_case(&left.to_string())
+        }
+        (serde_json::Value::Number(_), serde_json::Value::String(_))
+        | (serde_json::Value::String(_), serde_json::Value::Number(_)) => json_number(actual)
+            .and_then(|left| json_number(expected).map(|right| left == right))
+            .unwrap_or(false),
+        (serde_json::Value::Null, serde_json::Value::String(right))
+        | (serde_json::Value::String(right), serde_json::Value::Null) => {
+            right.eq_ignore_ascii_case("null")
+        }
+        _ => false,
+    }
+}
+
+fn json_number(value: &serde_json::Value) -> Result<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|value| value.parse::<f64>().ok()))
+        .ok_or_else(|| anyhow!("success expression comparison requires numbers"))
+}
+
+fn matches_simple_schema(value: &serde_json::Value, schema: &serde_json::Value) -> Result<bool> {
+    match schema {
+        serde_json::Value::String(type_name) => Ok(matches_simple_type(value, type_name)),
+        serde_json::Value::Object(schema_object) => {
+            let Some(value_object) = value.as_object() else {
+                return Ok(false);
+            };
+            for (key, field_schema) in schema_object {
+                let Some(field_value) = value_object.get(key) else {
+                    return Ok(false);
+                };
+                if !matches_simple_schema(field_value, field_schema)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        serde_json::Value::Array(items) => {
+            let Some(value_array) = value.as_array() else {
+                return Ok(false);
+            };
+            let Some(item_schema) = items.first() else {
+                return Ok(true);
+            };
+            for item in value_array {
+                if !matches_simple_schema(item, item_schema)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        serde_json::Value::Null => Ok(true),
+        _ => Ok(true),
+    }
+}
+
+fn matches_simple_type(value: &serde_json::Value, type_name: &str) -> bool {
+    match type_name.trim().to_ascii_lowercase().as_str() {
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "boolean" => value.is_boolean(),
+        "bool" => value.is_boolean(),
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "null" => value.is_null(),
+        _ => true,
+    }
+}
+
+pub(crate) fn finalize_ai_attempt(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    round_id: &str,
+    attempt_id: &str,
+    node_id: &str,
+    mut node: NodeState,
+    result: ProviderRunResult,
+) -> Result<NodeState> {
+    node.finished_at = Some(now_rfc3339_like());
+    if let Some(seed) = result.worker_ref_seed.clone() {
+        let worker_ref = WorkerRefState {
+            version: VERSION.to_string(),
+            provider: seed.provider,
+            mode: seed.mode,
+            supports_open_session: seed.supports_open_session,
+            supports_continue_session: seed.supports_continue_session,
+            continue_ref: seed.continue_ref,
+            open_command: seed.open_command,
+        };
+        validate_worker_ref_state(&worker_ref)?;
+        write_json(
+            &app.paths
+                .worker_ref_file(task_id, run_id, round_id, node_id, attempt_id),
+            &worker_ref,
+        )?;
+    }
+
+    if let Some(info) = result.runtime_error {
+        return Err(runtime_error(info));
+    }
+    if let Some(control_output) = result.runtime_control_output.as_ref() {
+        annotate_runtime_control_output_best_effort(
+            app,
+            task_id,
+            run_id,
+            round_id,
+            node_id,
+            attempt_id,
+            control_output,
+            "workflow-output",
+        );
+    }
+
+    match result.status {
+        ProviderRunStatus::Success => {
+            if let Some(payload) = result.result_payload {
+                if let Some(output_artifact) = payload.output_artifact {
+                    if !output_artifact.content.trim().is_empty() {
+                        let artifact_path = app.paths.artifact_file(
+                            task_id,
+                            run_id,
+                            round_id,
+                            node_id,
+                            attempt_id,
+                            &output_artifact.name,
+                        );
+                        std::fs::create_dir_all(
+                            app.paths
+                                .artifacts_dir(task_id, run_id, round_id, node_id, attempt_id)
+                                .as_std_path(),
+                        )?;
+                        std::fs::write(artifact_path.as_std_path(), output_artifact.content)?;
+                    }
+                }
+            }
+
+            let needs_output_artifact = node.resolved_config.contains_key("outputArtifact");
+            let expected_artifact = node
+                .resolved_config
+                .get("outputArtifact")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            let has_artifact = expected_artifact.as_ref().is_some_and(|artifact| {
+                app.paths
+                    .artifact_file(task_id, run_id, round_id, node_id, attempt_id, artifact)
+                    .exists()
+            });
+            node.status = RunStatus::Completed;
+            node.outcome = Some(if needs_output_artifact && !has_artifact {
+                NodeOutcome::Invalid
+            } else {
+                expected_artifact
+                    .as_deref()
+                    .map(|artifact| {
+                        evaluate_json_success_condition(
+                            app, task_id, run_id, round_id, &node, artifact,
+                        )
+                    })
+                    .transpose()?
+                    .flatten()
+                    .unwrap_or(NodeOutcome::Success)
+            });
+        }
+        ProviderRunStatus::Failure => {
+            node.status = RunStatus::Completed;
+            node.outcome = Some(NodeOutcome::Failure);
+        }
+        ProviderRunStatus::Interrupted
+        | ProviderRunStatus::WaitingForUserInput
+        | ProviderRunStatus::PermissionRequested => {
+            node.status = RunStatus::Paused;
+            node.outcome = None;
+        }
+    }
+    validate_node_state(&node)?;
+    Ok(node)
+}
+
+fn annotate_runtime_control_output_best_effort(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    round_id: &str,
+    node_id: &str,
+    attempt_id: &str,
+    control_output: &RuntimeControlOutput,
+    kind: &str,
+) {
+    let attempt_dir = app
+        .paths
+        .attempt_dir(task_id, run_id, round_id, node_id, attempt_id);
+    let path =
+        crate::acp::branches::branch_timeline_path(&attempt_dir, &control_output.source.branch_id);
+    if let Err(error) = annotate_runtime_control_output(
+        &path,
+        &control_output.source.item_id,
+        &control_output.artifact_name,
+        kind,
+        &control_output.span,
+    ) {
+        warn!(
+            task_id,
+            run_id,
+            round_id,
+            node_id,
+            attempt_id,
+            artifact_name = control_output.artifact_name,
+            branch_id = control_output.source.branch_id,
+            item_id = control_output.source.item_id,
+            error = %error,
+            "failed to annotate runtime control output display"
+        );
+    }
+}
+
+pub(crate) fn re_evaluate_attempt(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    round_id: &str,
+    mut node: NodeState,
+) -> Result<NodeState> {
+    let artifact_name = node
+        .resolved_config
+        .get("outputArtifact")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+
+    if let Some(artifact_name) = artifact_name {
+        let path = app.paths.artifact_file(
+            task_id,
+            run_id,
+            round_id,
+            &node.node_id,
+            &node.attempt_id,
+            &artifact_name,
+        );
+        if !path.exists() {
+            node.status = RunStatus::Completed;
+            node.outcome = Some(NodeOutcome::Invalid);
+            validate_node_state(&node)?;
+            write_node_state(
+                &app.paths
+                    .node_file(task_id, run_id, round_id, &node.node_id, &node.attempt_id),
+                &node,
+            )?;
+            return Ok(node);
+        }
+
+        node.outcome = Some(
+            evaluate_json_success_condition(app, task_id, run_id, round_id, &node, &artifact_name)?
+                .unwrap_or(NodeOutcome::Success),
+        );
+    }
+
+    node.status = RunStatus::Completed;
+    node.finished_at = Some(now_rfc3339_like());
+    validate_node_state(&node)?;
+    write_node_state(
+        &app.paths
+            .node_file(task_id, run_id, round_id, &node.node_id, &node.attempt_id),
+        &node,
+    )?;
+    Ok(node)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsl::{OutputContractDsl, OutputKind};
+    use crate::runtime_error::{RuntimeErrorDomain, manual_runtime_error_info};
+
+    #[test]
+    fn workflow_output_contract_uses_post_turn_projection() {
+        let mut worker = WorkerNode {
+            id: "review".to_string(),
+            execution_slot_id: None,
+            provider: Some("claude-acp".to_string()),
+            model: None,
+            profile: None,
+            goal: Some("Review the implementation".to_string()),
+            output: Some(OutputContractDsl {
+                kind: OutputKind::Json,
+                artifact: "review-result".to_string(),
+                schema: Some(serde_json::json!({ "result": "boolean" })),
+            }),
+            success_condition: None,
+            permission_mode: None,
+            config_options: Default::default(),
+            manual_check: None,
+            prompt_envelope: crate::dsl::PromptEnvelopeMode::RuntimeManaged,
+        };
+
+        let contract = worker_output_contract(&worker).unwrap();
+
+        assert_eq!(
+            contract.emission_mode,
+            OutputEmissionMode::PostTurnProjection
+        );
+        worker.output = None;
+        assert!(worker_output_contract(&worker).is_none());
+        worker.manual_check = Some(true);
+        assert!(worker_output_contract(&worker).is_none());
+    }
+
+    #[test]
+    fn selects_nested_array_json_path() {
+        let value = serde_json::json!({ "xx": { "yy": [{ "zz": true }] } });
+        assert_eq!(
+            select_json_path(&value, "$.xx.yy[0].zz"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn evaluates_no_space_and_quoted_boolean_expressions() {
+        let value = serde_json::json!({ "result": true });
+        assert!(
+            evaluate_json_expression(&value, "$.result==true").expect("expression should evaluate")
+        );
+        assert!(
+            evaluate_json_expression(&value, "$.result == \"true\"")
+                .expect("expression should evaluate")
+        );
+    }
+
+    #[test]
+    fn matches_simplified_schema() {
+        let value = serde_json::json!({ "reason": "ok", "result": true, "extra": 1 });
+        let schema = serde_json::json!({ "reason": "String", "result": "boolean" });
+        assert!(matches_simple_schema(&value, &schema).expect("schema should match"));
+    }
+
+    #[test]
+    fn rejects_missing_simplified_schema_field() {
+        let value = serde_json::json!({ "reason": "ok" });
+        let schema = serde_json::json!({ "reason": "String", "result": "boolean" });
+        assert!(!matches_simple_schema(&value, &schema).expect("schema should not match"));
+    }
+
+    #[test]
+    fn provider_runtime_error_does_not_become_business_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let app = App::with_config(
+            Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 temp path"),
+            crate::config::RuntimeConfig::default(),
+        );
+        let node = NodeState {
+            version: VERSION.to_string(),
+            acp_storage_schema_version: crate::runtime::CURRENT_ACP_STORAGE_SCHEMA_VERSION,
+            node_id: "node-001".to_string(),
+            node_type: crate::domain::NodeType::Worker,
+            run_id: "run-001".to_string(),
+            round_id: "round-001".to_string(),
+            attempt_id: "attempt-001".to_string(),
+            status: RunStatus::Running,
+            outcome: None,
+            started_at: "2026-07-01T00:00:00Z".to_string(),
+            finished_at: None,
+            manual_check_pending: false,
+            runtime_execution_id: None,
+            resolved_config: Default::default(),
+            uuid: None,
+        };
+        let result = ProviderRunResult {
+            status: ProviderRunStatus::Failure,
+            exit_code: None,
+            result_payload: None,
+            worker_ref_seed: None,
+            stream_path: None,
+            runtime_error: Some(manual_runtime_error_info(
+                RuntimeErrorDomain::Provider,
+                "provider.execution-error",
+                "provider failed before business result",
+                serde_json::json!({}),
+            )),
+            runtime_control_output: None,
+        };
+
+        let error = finalize_ai_attempt(
+            &app,
+            "task-001",
+            "run-001",
+            "round-001",
+            "attempt-001",
+            "node-001",
+            node,
+            result,
+        )
+        .expect_err("runtime error should bubble to orchestrator");
+
+        assert!(
+            error
+                .to_string()
+                .contains("provider failed before business result")
+        );
+    }
+
+    #[test]
+    fn finalize_ai_attempt_marks_invalid_runtime_control_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let app = App::with_config(
+            Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 temp path"),
+            crate::config::RuntimeConfig::default(),
+        );
+        let content = "好的\n```json\n{\"reason\":\"unterminated,\"result\":true}\n```";
+        let timeline_path = app.paths.acp_timeline_file(
+            "task-001",
+            "run-001",
+            "round-001",
+            "node-001",
+            "attempt-001",
+        );
+        crate::acp::events::write_timeline_items(
+            &timeline_path,
+            &[crate::acp::events::AcpUiEvent {
+                id: "assistant-message-1".to_string(),
+                seq: 10,
+                timestamp: "10Z".to_string(),
+                kind: "textDelta".to_string(),
+                session_id: Some("session-1".to_string()),
+                content: Some(content.to_string()),
+                title: None,
+                tool_call_id: None,
+                status: None,
+                started_seq: Some(10),
+                ended_seq: Some(10),
+                started_at: Some("10Z".to_string()),
+                ended_at: Some("10Z".to_string()),
+                timing: None,
+                raw: None,
+            }],
+        )
+        .unwrap();
+        let mut resolved_config = crate::domain::ResolvedConfig::new();
+        resolved_config.insert(
+            "outputArtifact".to_string(),
+            serde_json::Value::String("node-result".to_string()),
+        );
+        let node = NodeState {
+            version: VERSION.to_string(),
+            acp_storage_schema_version: crate::runtime::CURRENT_ACP_STORAGE_SCHEMA_VERSION,
+            node_id: "node-001".to_string(),
+            node_type: crate::domain::NodeType::Worker,
+            run_id: "run-001".to_string(),
+            round_id: "round-001".to_string(),
+            attempt_id: "attempt-001".to_string(),
+            status: RunStatus::Running,
+            outcome: None,
+            started_at: "2026-07-01T00:00:00Z".to_string(),
+            finished_at: None,
+            manual_check_pending: false,
+            runtime_execution_id: None,
+            resolved_config,
+            uuid: None,
+        };
+        let result = ProviderRunResult {
+            status: ProviderRunStatus::Success,
+            exit_code: None,
+            result_payload: Some(crate::provider::ProviderResultPayload {
+                output_artifact: Some(crate::provider::OutputArtifactPayload {
+                    name: "node-result".to_string(),
+                    content: content.to_string(),
+                }),
+            }),
+            worker_ref_seed: None,
+            stream_path: None,
+            runtime_error: None,
+            runtime_control_output: Some(crate::provider::RuntimeControlOutput {
+                artifact_name: "node-result".to_string(),
+                source: crate::acp::client::AcpPromptMessageSource {
+                    branch_id: "root".to_string(),
+                    item_id: "assistant-message-1".to_string(),
+                },
+                span: crate::artifacts::json_artifact_display_span(content).unwrap(),
+            }),
+        };
+
+        let node = finalize_ai_attempt(
+            &app,
+            "task-001",
+            "run-001",
+            "round-001",
+            "attempt-001",
+            "node-001",
+            node,
+            result,
+        )
+        .expect("attempt should finalize as invalid business output");
+
+        assert_eq!(node.outcome, Some(NodeOutcome::Invalid));
+        let items = crate::acp::events::load_timeline_items(&timeline_path).unwrap();
+        let display = items[0]
+            .raw
+            .as_ref()
+            .and_then(|raw| raw.get("runtimeControlOutputDisplay"))
+            .unwrap();
+        assert_eq!(
+            display
+                .get("artifactName")
+                .and_then(serde_json::Value::as_str),
+            Some("node-result")
+        );
+        assert_eq!(
+            display
+                .get("parseStatus")
+                .and_then(serde_json::Value::as_str),
+            Some("invalid")
+        );
+    }
+
+    fn attachment_test_workflow() -> ValidatedWorkflow {
+        crate::dsl::validate_workflow(crate::dsl::WorkflowDsl {
+            version: VERSION.to_string(),
+            id: "workflow-001".to_string(),
+            entry: "dev".to_string(),
+            control: Default::default(),
+            nodes: vec![NodeDsl::Worker(WorkerNode {
+                id: "dev".to_string(),
+                execution_slot_id: None,
+                provider: Some("claude-acp".to_string()),
+                model: None,
+                profile: None,
+                goal: Some("Do the work".to_string()),
+                output: None,
+                success_condition: None,
+                permission_mode: None,
+                config_options: Default::default(),
+                manual_check: None,
+                prompt_envelope: crate::dsl::PromptEnvelopeMode::RuntimeManaged,
+            })],
+            edges: vec![crate::dsl::EdgeDsl {
+                from: "dev".to_string(),
+                to: crate::dsl::END_NODE.to_string(),
+                on: crate::dsl::EdgeOutcome::Success,
+                session: None,
+                new_round_entry: None,
+            }],
+        })
+        .expect("workflow should validate")
+    }
+
+    fn attachment_test_round() -> RoundState {
+        RoundState {
+            version: VERSION.to_string(),
+            id: "round-001".to_string(),
+            run_id: "run-001".to_string(),
+            index: 1,
+            status: RunStatus::Running,
+            outcome: None,
+            trigger: crate::domain::RoundTrigger::Initial,
+            started_at: "2026-07-01T00:00:00Z".to_string(),
+            trace: Vec::new(),
+            uuid: None,
+        }
+    }
+
+    fn write_attachment_test_run(app: &App) {
+        let run = crate::runtime::RunState {
+            version: VERSION.to_string(),
+            id: "run-001".to_string(),
+            task_id: "task-001".to_string(),
+            task_uuid: None,
+            status: RunStatus::Running,
+            outcome: None,
+            started_at: "2026-07-01T00:00:00Z".to_string(),
+            updated_at: "2026-07-01T00:00:00Z".to_string(),
+            workflow_snapshot: "workflow.snapshot.json".to_string(),
+            current_round: Some("round-001".to_string()),
+            current_node: Some("dev".to_string()),
+            current_attempt: Some("attempt-001".to_string()),
+            new_rounds_opened: 0,
+            pause_reason: None,
+            uuid: None,
+            last_executed_node: None,
+            worktree: None,
+            execution: Default::default(),
+        };
+        crate::storage::write_json(&app.paths.run_file("task-001", "run-001"), &run).unwrap();
+    }
+
+    fn trace_step(sequence: u32, node_id: &str, from_node_id: Option<&str>) -> RoundTraceStep {
+        RoundTraceStep {
+            sequence,
+            node_id: node_id.to_string(),
+            attempt_id: "attempt-001".to_string(),
+            from_node_id: from_node_id.map(str::to_string),
+            edge_outcome: from_node_id.map(|_| "success".to_string()),
+            entered_at: format!("2026-07-01T00:00:0{sequence}Z"),
+        }
+    }
+
+    fn traced_round(
+        id: &str,
+        index: u32,
+        trigger: crate::domain::RoundTrigger,
+        trace: Vec<RoundTraceStep>,
+    ) -> RoundState {
+        RoundState {
+            version: VERSION.to_string(),
+            id: id.to_string(),
+            run_id: "run-001".to_string(),
+            index,
+            status: RunStatus::Running,
+            outcome: None,
+            trigger,
+            started_at: "2026-07-01T00:00:00Z".to_string(),
+            trace,
+            uuid: None,
+        }
+    }
+
+    #[test]
+    fn new_round_predecessors_use_stable_prefix_and_current_round_only() {
+        let round1 = traced_round(
+            "round-001",
+            1,
+            crate::domain::RoundTrigger::Initial,
+            vec![
+                trace_step(1, "plan", None),
+                trace_step(2, "dev", Some("plan")),
+                trace_step(3, "accept", Some("dev")),
+            ],
+        );
+        let round2 = traced_round(
+            "round-002",
+            2,
+            crate::domain::RoundTrigger::NewRound,
+            vec![
+                trace_step(1, "dev", None),
+                trace_step(2, "accept", Some("dev")),
+            ],
+        );
+        let rounds = vec![round1, round2.clone()];
+
+        let dev_predecessors =
+            scoped_predecessor_trace_refs(&rounds, &round2, "dev", "attempt-001");
+        assert_eq!(dev_predecessors.len(), 1);
+        assert_eq!(dev_predecessors[0].round_id, "round-001");
+        assert_eq!(dev_predecessors[0].step.node_id, "plan");
+
+        let accept_predecessors =
+            scoped_predecessor_trace_refs(&rounds, &round2, "accept", "attempt-001");
+        let locators = accept_predecessors
+            .iter()
+            .map(|trace_ref| format!("{}/{}", trace_ref.round_id, trace_ref.step.node_id))
+            .collect::<Vec<_>>();
+        assert_eq!(locators, vec!["round-002/dev"]);
+    }
+
+    #[test]
+    fn continue_worker_invocation_uses_only_resume_attachments() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_root =
+            Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 temp path");
+        let app = App::with_config(repo_root, crate::config::RuntimeConfig::default());
+        write_attachment_test_run(&app);
+        let task_id = "task-001";
+        let task_input_dir = crate::app::task_inputs_dir(&app, task_id);
+        std::fs::create_dir_all(task_input_dir.as_std_path()).unwrap();
+        let original_input = task_input_dir.join("original.txt");
+        std::fs::write(original_input.as_std_path(), "original").unwrap();
+        let resume_input = temp.path().join("resume.txt");
+        std::fs::write(&resume_input, "resume").unwrap();
+        let resume_input = resume_input.to_string_lossy().to_string();
+
+        let invocation = build_worker_invocation(
+            &app,
+            task_id,
+            "run-001",
+            &attachment_test_round(),
+            "attempt-001",
+            &attachment_test_workflow(),
+            "dev",
+            SessionMode::Continue,
+            Some(serde_json::json!({ "acpSessionId": "session-001" })),
+            Some("continue".to_string()),
+            Some("prompt-001".to_string()),
+            None,
+            PromptVisibility::Visible,
+            UserPromptRenderMode::UserMessage,
+            vec![resume_input.clone()],
+            None,
+            None,
+        )
+        .expect("invocation should build");
+
+        assert_eq!(invocation.user_input_attachment_paths, vec![resume_input]);
+        assert!(
+            !invocation
+                .user_input_attachment_paths
+                .iter()
+                .any(|path| path.ends_with("original.txt"))
+        );
+        assert!(invocation.task_input_attachment_paths.is_empty());
+    }
+
+    #[test]
+    fn new_worker_invocation_uses_task_input_attachments() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_root =
+            Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 temp path");
+        let app = App::with_config(repo_root, crate::config::RuntimeConfig::default());
+        write_attachment_test_run(&app);
+        let task_id = "task-001";
+        let task_input_dir = crate::app::task_inputs_dir(&app, task_id);
+        std::fs::create_dir_all(task_input_dir.as_std_path()).unwrap();
+        let original_input = task_input_dir.join("original.txt");
+        std::fs::write(original_input.as_std_path(), "original").unwrap();
+
+        let invocation = build_worker_invocation(
+            &app,
+            task_id,
+            "run-001",
+            &attachment_test_round(),
+            "attempt-001",
+            &attachment_test_workflow(),
+            "dev",
+            SessionMode::New,
+            None,
+            None,
+            None,
+            None,
+            PromptVisibility::Visible,
+            UserPromptRenderMode::RequirementTask,
+            vec!["ignored-on-new.txt".to_string()],
+            None,
+            None,
+        )
+        .expect("invocation should build");
+
+        assert_eq!(
+            invocation.task_input_attachment_paths,
+            vec![original_input.to_string()]
+        );
+        assert!(invocation.user_input_attachment_paths.is_empty());
+        assert_eq!(
+            invocation.turn_control_mode,
+            TurnControlMode::RuntimeControlled
+        );
+    }
+
+    #[test]
+    fn direct_raw_agent_first_turn_is_non_runtime_controlled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_root =
+            Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 temp path");
+        let app = App::with_config(repo_root, crate::config::RuntimeConfig::default());
+        write_attachment_test_run(&app);
+        let mut workflow = attachment_test_workflow();
+        let NodeDsl::Worker(worker) = &mut workflow.raw.nodes[0] else {
+            panic!("expected worker node");
+        };
+        worker.prompt_envelope = crate::dsl::PromptEnvelopeMode::RawAgent;
+        workflow
+            .nodes_by_id
+            .insert("dev".to_string(), workflow.raw.nodes[0].clone());
+
+        let invocation = build_worker_invocation(
+            &app,
+            "task-001",
+            "run-001",
+            &attachment_test_round(),
+            "attempt-001",
+            &workflow,
+            "dev",
+            SessionMode::New,
+            None,
+            None,
+            None,
+            None,
+            PromptVisibility::Visible,
+            UserPromptRenderMode::RequirementTask,
+            Vec::new(),
+            None,
+            None,
+        )
+        .expect("direct invocation should build");
+
+        assert_eq!(
+            invocation.turn_control_mode,
+            TurnControlMode::NonRuntimeControlled
+        );
+    }
+}
