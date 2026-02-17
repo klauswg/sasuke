@@ -1,0 +1,109 @@
+use crate::domain::{PauseReason, RunOutcome, SessionMode};
+use crate::dsl::{END_NODE, ENTRY_NODE, EdgeOutcome, NEW_ROUND_NODE, ValidatedWorkflow};
+use crate::provider::supports_continue_session;
+use crate::runtime::{NodeState, RoundState};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlDecision {
+    TransitionToNode {
+        node_id: String,
+        session: SessionMode,
+    },
+    OpenNewRound {
+        entry_node_id: String,
+    },
+    CompleteRun(RunOutcome),
+    PauseRun(PauseReason),
+}
+
+pub fn decide_next_step(
+    workflow: &ValidatedWorkflow,
+    _run: &crate::runtime::RunState,
+    _round: &RoundState,
+    node: &NodeState,
+) -> ControlDecision {
+    match node.outcome {
+        Some(crate::domain::NodeOutcome::Success) => {
+            match_edge_or_default(workflow, &node.node_id, EdgeOutcome::Success, || {
+                ControlDecision::CompleteRun(RunOutcome::Success)
+            })
+        }
+        Some(crate::domain::NodeOutcome::Failure) => {
+            match_edge_or_default(workflow, &node.node_id, EdgeOutcome::Failure, || {
+                ControlDecision::CompleteRun(RunOutcome::Failure)
+            })
+        }
+        Some(crate::domain::NodeOutcome::Invalid) => {
+            ControlDecision::CompleteRun(RunOutcome::Failure)
+        }
+        Some(crate::domain::NodeOutcome::Killed) => {
+            ControlDecision::CompleteRun(RunOutcome::Failure)
+        }
+        None => ControlDecision::PauseRun(PauseReason::ProcessInterrupted),
+    }
+}
+
+fn match_edge_or_default<F>(
+    workflow: &ValidatedWorkflow,
+    node_id: &str,
+    outcome: EdgeOutcome,
+    default: F,
+) -> ControlDecision
+where
+    F: FnOnce() -> ControlDecision,
+{
+    find_edge_decision(workflow, node_id, outcome).unwrap_or_else(default)
+}
+
+fn find_edge_decision(
+    workflow: &ValidatedWorkflow,
+    node_id: &str,
+    outcome: EdgeOutcome,
+) -> Option<ControlDecision> {
+    workflow
+        .raw
+        .edges
+        .iter()
+        .find(|edge| edge.from == node_id && edge.on == outcome)
+        .map(|edge| {
+            if edge.to == END_NODE {
+                ControlDecision::CompleteRun(match outcome {
+                    EdgeOutcome::Success => RunOutcome::Success,
+                    EdgeOutcome::Failure => RunOutcome::Failure,
+                })
+            } else if edge.to == NEW_ROUND_NODE {
+                let new_round_entry = edge
+                    .new_round_entry
+                    .as_deref()
+                    .expect("validated `$new-round` edge declares new_round_entry");
+                let entry_node_id = if new_round_entry == ENTRY_NODE {
+                    workflow.raw.entry.clone()
+                } else {
+                    new_round_entry.to_string()
+                };
+                ControlDecision::OpenNewRound { entry_node_id }
+            } else {
+                ControlDecision::TransitionToNode {
+                    node_id: edge.to.clone(),
+                    session: session_for_target(workflow, &edge.to, edge.session),
+                }
+            }
+        })
+}
+
+fn session_for_target(
+    workflow: &ValidatedWorkflow,
+    target_node_id: &str,
+    requested: Option<SessionMode>,
+) -> SessionMode {
+    match requested.unwrap_or(SessionMode::New) {
+        SessionMode::New => SessionMode::New,
+        SessionMode::Continue => workflow
+            .get_node(target_node_id)
+            .and_then(|node| node.provider())
+            .map(|provider| supports_continue_session(provider).unwrap_or(false))
+            .unwrap_or(false)
+            .then_some(SessionMode::Continue)
+            .unwrap_or(SessionMode::New),
+    }
+}
