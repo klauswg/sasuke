@@ -1,0 +1,41 @@
+# sasuke runtime context for this invocation
+
+- Session mode: {{ session_mode }}
+- Round: {{ round_id }}
+- Attempt: {{ attempt_id }}
+- Attempt directory: {{ attempt_dir }}
+- Attachments directory (default location for this node's reports, temporary scripts, process notes, and other free-form outputs): {{ attachments_dir }}
+{% if invocation_reason %}
+- Invocation reason: {{ invocation_reason }}
+{% endif %}
+
+{% if predecessors.is_empty %}
+## Latest predecessor chain
+Previous executed nodes: none. This node is the entry node for the current round.
+{% else %}
+## Latest predecessor chain
+{{ predecessors.chain }}
+{% endif %}
+
+{% if predecessors.reason_lines_empty %}
+{% if predecessors.is_empty %}
+## Latest predecessor transition reasons
+None.
+{% else %}
+## Latest predecessor transition reasons
+All previous nodes were ordinary transitions based on node outcome.
+{% endif %}
+{% else %}
+## Latest predecessor transition reasons
+{{ predecessors.reason_lines }}
+{% endif %}
+
+{% if predecessors.has_ai_dynamic_report_manifest %}
+## AI-DYNAMIC full report manifest (read on demand)
+The `reportManifest.path` in the predecessor `ai-dynamic-result` points to the complete internal execution report index, including node/group topology, dependencies and timing, workspaces, internal summaries, and attachment locators. By default, use the business handoff `summary`; read the manifest only when you need to verify internal execution, locate report attachments, or the `summary` lacks required detail.
+{% endif %}
+
+{% if not predecessors.attachment_lines_empty %}
+## Latest predecessor attachments
+{{ predecessors.attachment_lines }}
+{% endif %}
