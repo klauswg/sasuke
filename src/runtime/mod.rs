@@ -1,0 +1,750 @@
+use crate::domain::{
+    NodeOutcome, NodeType, PauseReason, ResolvedConfig, RoundTrigger, RunOutcome, RunStatus,
+    SessionMode, VERSION,
+};
+use anyhow::{Result, ensure};
+use camino::{Utf8Path, Utf8PathBuf};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+pub const CURRENT_ACP_STORAGE_SCHEMA_VERSION: u32 = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[error("{msg}")]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeLifecycleTransitionError {
+    pub code: String,
+    pub msg: String,
+    pub from: RuntimeExecutionPhase,
+    pub to: RuntimeExecutionPhase,
+}
+
+pub struct RuntimeLifecycleStore;
+
+impl RuntimeLifecycleStore {
+    pub fn transition(
+        run: &mut RunState,
+        phase: RuntimeExecutionPhase,
+        locator: Option<RuntimeAttemptLocator>,
+        updated_at: impl Into<String>,
+    ) -> std::result::Result<(), RuntimeLifecycleTransitionError> {
+        let from = run.execution.phase;
+        if !runtime_execution_transition_allowed(from, phase) {
+            return Err(RuntimeLifecycleTransitionError {
+                code: "runtime.execution-transition-invalid".to_string(),
+                msg: format!("runtime execution cannot transition from {from:?} to {phase:?}"),
+                from,
+                to: phase,
+            });
+        }
+        run.execution.revision = run.execution.revision.saturating_add(1);
+        run.execution.phase = phase;
+        run.execution.locator = locator;
+        run.execution.updated_at = updated_at.into();
+        Ok(())
+    }
+}
+
+pub(crate) fn runtime_execution_transition_allowed(
+    from: RuntimeExecutionPhase,
+    to: RuntimeExecutionPhase,
+) -> bool {
+    use RuntimeExecutionPhase::*;
+    from == to
+        || matches!(
+            (from, to),
+            (
+                StartingNode,
+                RunningNode
+                    | FinalizingArtifact
+                    | RepairingArtifact
+                    | PreparingWorkspace
+                    | Paused
+                    | Terminal
+            ) | (
+                RunningNode,
+                StartingNode
+                    | FinalizingArtifact
+                    | RepairingArtifact
+                    | AwaitingManualCheck
+                    | Transitioning
+                    | PreparingWorkspace
+                    | Paused
+                    | Terminal
+            ) | (
+                FinalizingArtifact,
+                RepairingArtifact | AwaitingManualCheck | Transitioning | Paused | Terminal
+            ) | (
+                RepairingArtifact,
+                FinalizingArtifact | AwaitingManualCheck | Transitioning | Paused | Terminal
+            ) | (AwaitingManualCheck, Transitioning | Paused)
+                | (
+                    Transitioning,
+                    LaunchingNextNode | StartingNode | PreparingWorkspace | Paused | Terminal
+                )
+                | (
+                    LaunchingNextNode,
+                    StartingNode | RunningNode | PreparingWorkspace | Paused | Terminal
+                )
+                | (
+                    PreparingWorkspace,
+                    StartingNode
+                        | RunningNode
+                        | Transitioning
+                        | LaunchingNextNode
+                        | Paused
+                        | Terminal
+                )
+                | (
+                    Paused,
+                    StartingNode
+                        | FinalizingArtifact
+                        | RepairingArtifact
+                        | AwaitingManualCheck
+                        | Transitioning
+                        | PreparingWorkspace
+                )
+                | (Terminal, Terminal)
+        )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeAttemptLocator {
+    pub round_id: String,
+    pub node_id: String,
+    pub attempt_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outer_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outer_attempt_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeExecutionPhase {
+    StartingNode,
+    RunningNode,
+    FinalizingArtifact,
+    RepairingArtifact,
+    AwaitingManualCheck,
+    Transitioning,
+    LaunchingNextNode,
+    PreparingWorkspace,
+    Paused,
+    Terminal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeExecutionState {
+    pub revision: u64,
+    pub phase: RuntimeExecutionPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<RuntimeAttemptLocator>,
+    /// Fencing token for the current persisted runtime recovery candidate.
+    /// It does not express lifecycle state; `run.status` remains canonical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_candidate_token: Option<String>,
+    pub updated_at: String,
+}
+
+impl Default for RuntimeExecutionState {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            phase: RuntimeExecutionPhase::StartingNode,
+            locator: None,
+            recovery_candidate_token: None,
+            updated_at: String::new(),
+        }
+    }
+}
+
+impl RuntimeExecutionState {
+    pub fn new(
+        phase: RuntimeExecutionPhase,
+        locator: Option<RuntimeAttemptLocator>,
+        updated_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            revision: 1,
+            phase,
+            locator,
+            recovery_candidate_token: None,
+            updated_at: updated_at.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LastExecutedNode {
+    pub node_id: String,
+    pub uuid: String,
+    #[serde(default)]
+    pub round_uuid: String,
+    pub node_name: String,
+    #[serde(default)]
+    pub seq: Option<u32>,
+    #[serde(default)]
+    pub agent_type: Option<String>,
+    pub status: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    /// Path to this node's attempt directory. Subscribers read
+    /// `acp.snapshot.json` from here for token counts.
+    #[serde(default)]
+    pub attempt_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskState {
+    pub version: String,
+    pub id: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub uuid: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunWorktreeState {
+    pub path: Utf8PathBuf,
+    pub branch: String,
+    pub fork_commit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunState {
+    pub version: String,
+    pub id: String,
+    pub task_id: String,
+    #[serde(default)]
+    pub task_uuid: Option<String>,
+    pub status: RunStatus,
+    pub outcome: Option<RunOutcome>,
+    pub started_at: String,
+    pub updated_at: String,
+    pub workflow_snapshot: String,
+    pub current_round: Option<String>,
+    pub current_node: Option<String>,
+    pub current_attempt: Option<String>,
+    #[serde(default, alias = "acceptance_loops_used")]
+    pub new_rounds_opened: u32,
+    pub pause_reason: Option<PauseReason>,
+    #[serde(default)]
+    pub uuid: Option<String>,
+    #[serde(default)]
+    pub last_executed_node: Option<LastExecutedNode>,
+    /// Runtime-owned worktree selected when this run was created. `None`
+    /// means the run executes in the project's main workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<RunWorktreeState>,
+    /// Authoritative Workflow Runtime phase. ACP session/turn state must never
+    /// infer or mutate this aggregate.
+    #[serde(default)]
+    pub execution: RuntimeExecutionState,
+}
+
+impl RunState {
+    pub fn current_execution_locator(&self) -> Option<RuntimeAttemptLocator> {
+        Some(RuntimeAttemptLocator {
+            round_id: self.current_round.clone()?,
+            node_id: self.current_node.clone()?,
+            attempt_id: self.current_attempt.clone()?,
+            outer_node_id: None,
+            outer_attempt_id: None,
+        })
+    }
+
+    pub fn transition_execution(
+        &mut self,
+        phase: RuntimeExecutionPhase,
+        locator: Option<RuntimeAttemptLocator>,
+        updated_at: impl Into<String>,
+    ) -> std::result::Result<(), RuntimeLifecycleTransitionError> {
+        RuntimeLifecycleStore::transition(self, phase, locator, updated_at)
+    }
+
+    pub fn transition_current_execution(
+        &mut self,
+        phase: RuntimeExecutionPhase,
+        updated_at: impl Into<String>,
+    ) -> std::result::Result<(), RuntimeLifecycleTransitionError> {
+        let locator = self.current_execution_locator();
+        self.transition_execution(phase, locator, updated_at)
+    }
+
+    /// Deterministic one-time migration for run.json written before execution
+    /// phases became authoritative.
+    pub fn reconcile_legacy_execution(&mut self) -> bool {
+        if self.execution.revision != 0 || !self.execution.updated_at.is_empty() {
+            return false;
+        }
+        let phase = match self.status {
+            RunStatus::Running => RuntimeExecutionPhase::StartingNode,
+            RunStatus::Paused => RuntimeExecutionPhase::Paused,
+            RunStatus::Completed => RuntimeExecutionPhase::Terminal,
+        };
+        self.execution = RuntimeExecutionState::new(
+            phase,
+            self.current_execution_locator(),
+            self.updated_at.clone(),
+        );
+        true
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundState {
+    pub version: String,
+    pub id: String,
+    pub run_id: String,
+    pub index: u32,
+    pub status: RunStatus,
+    pub outcome: Option<RunOutcome>,
+    pub trigger: RoundTrigger,
+    pub started_at: String,
+    #[serde(default)]
+    pub trace: Vec<RoundTraceStep>,
+    #[serde(default)]
+    pub uuid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundTraceStep {
+    pub sequence: u32,
+    pub node_id: String,
+    pub attempt_id: String,
+    pub from_node_id: Option<String>,
+    pub edge_outcome: Option<String>,
+    pub entered_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeState {
+    pub version: String,
+    /// Canonical version of the ACP storage layout owned by this attempt.
+    /// Legacy node.json files omit the field and deserialize as version 0.
+    #[serde(default)]
+    pub acp_storage_schema_version: u32,
+    pub node_id: String,
+    pub node_type: NodeType,
+    pub run_id: String,
+    pub round_id: String,
+    pub attempt_id: String,
+    pub status: RunStatus,
+    pub outcome: Option<NodeOutcome>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    #[serde(default)]
+    pub manual_check_pending: bool,
+    /// Identifies the currently authorized Runtime invocation for this attempt.
+    /// A stop clears it and every explicit continue allocates a new value so
+    /// stale background work cannot mutate a newer execution of the same attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_execution_id: Option<String>,
+    pub resolved_config: ResolvedConfig,
+    #[serde(default)]
+    pub uuid: Option<String>,
+}
+
+/// Persists lifecycle state without allowing a stale in-memory NodeState to
+/// lower an ACP storage version already committed by the migration boundary.
+pub fn write_node_state(path: &Utf8Path, state: &NodeState) -> Result<()> {
+    crate::storage::with_file_lock(path, || {
+        let mut durable = state.clone();
+        if path.exists() {
+            let current = crate::storage::read_json::<NodeState>(path)?;
+            durable.acp_storage_schema_version = durable
+                .acp_storage_schema_version
+                .max(current.acp_storage_schema_version);
+        }
+        crate::storage::write_json(path, &durable)
+    })
+}
+
+/// Advances only the ACP storage version while preserving the latest durable
+/// lifecycle fields written by Runtime. The version is monotonic and each
+/// migration step calls this only after its idempotent data rewrite succeeds.
+pub fn advance_node_acp_storage_schema_version(path: &Utf8Path, target: u32) -> Result<bool> {
+    crate::storage::with_file_lock(path, || {
+        let mut current = crate::storage::read_json::<serde_json::Value>(path)?;
+        let object = current
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("acp.attempt-state-invalid"))?;
+        let current_version = object
+            .get("acp_storage_schema_version")
+            .or_else(|| object.get("acpStorageSchemaVersion"))
+            .map(|version| {
+                version
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("acp.attempt-state-invalid"))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        if current_version >= u64::from(target) {
+            return Ok(false);
+        }
+        let field = if object.contains_key("node_id") {
+            "acp_storage_schema_version"
+        } else {
+            "acpStorageSchemaVersion"
+        };
+        object.insert(field.to_string(), serde_json::Value::from(target));
+        crate::storage::write_json(path, &current)?;
+        Ok(true)
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerRefState {
+    pub version: String,
+    pub provider: String,
+    pub mode: SessionMode,
+    pub supports_open_session: bool,
+    pub supports_continue_session: bool,
+    pub continue_ref: Option<serde_json::Value>,
+    pub open_command: Option<String>,
+}
+
+impl TaskState {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            version: VERSION.to_string(),
+            id: id.into(),
+            title: None,
+            description: None,
+            uuid: Some(Uuid::new_v4().simple().to_string()),
+        }
+    }
+}
+
+pub fn validate_task_state(state: &TaskState) -> Result<()> {
+    ensure!(state.version == VERSION, "unsupported task state version");
+    ensure!(!state.id.trim().is_empty(), "task id cannot be empty");
+    Ok(())
+}
+
+pub fn validate_run_state(state: &RunState) -> Result<()> {
+    ensure!(state.version == VERSION, "unsupported run state version");
+    ensure!(
+        !(state.status != RunStatus::Completed && state.outcome.is_some()),
+        "non-completed run cannot have outcome"
+    );
+    ensure!(
+        !(state.status == RunStatus::Completed && state.outcome.is_none()),
+        "completed run must have outcome"
+    );
+    ensure!(
+        !(state.status != RunStatus::Paused && state.pause_reason.is_some()),
+        "non-paused run cannot have pauseReason"
+    );
+    ensure!(
+        !(state.current_attempt.is_some() && state.current_node.is_none()),
+        "currentAttempt requires currentNode"
+    );
+    ensure!(
+        state
+            .execution
+            .recovery_candidate_token
+            .as_deref()
+            .is_none_or(|token| !token.trim().is_empty()),
+        "runtime recovery candidate token cannot be empty"
+    );
+    if let Some(worktree) = state.worktree.as_ref() {
+        ensure!(
+            !worktree.path.as_str().trim().is_empty(),
+            "worktree path cannot be empty"
+        );
+        ensure!(
+            !worktree.branch.trim().is_empty(),
+            "worktree branch cannot be empty"
+        );
+        ensure!(
+            !worktree.fork_commit.trim().is_empty(),
+            "worktree fork commit cannot be empty"
+        );
+    }
+    // A zero revision exists only in in-memory legacy/test fixtures. App
+    // storage access reconciles it before exposing or writing the run.
+    ensure!(
+        state.status != RunStatus::Paused
+            || state.execution.phase == RuntimeExecutionPhase::Paused
+            || state.execution.phase == RuntimeExecutionPhase::AwaitingManualCheck,
+        "paused run must have paused or manual-check runtime execution phase"
+    );
+    ensure!(
+        state.status != RunStatus::Completed
+            || state.execution.phase == RuntimeExecutionPhase::Terminal,
+        "completed run must have terminal runtime execution phase"
+    );
+    ensure!(
+        !(state.current_node.is_some() && state.current_round.is_none()),
+        "currentNode requires currentRound"
+    );
+    Ok(())
+}
+
+pub fn validate_round_state(state: &RoundState) -> Result<()> {
+    ensure!(state.version == VERSION, "unsupported round state version");
+    ensure!(state.index > 0, "round index must be positive");
+    ensure!(
+        !(state.status != RunStatus::Completed && state.outcome.is_some()),
+        "non-completed round cannot have outcome"
+    );
+    ensure!(
+        !(state.status == RunStatus::Completed && state.outcome.is_none()),
+        "completed round must have outcome"
+    );
+    for step in &state.trace {
+        ensure!(step.sequence > 0, "round trace sequence must be positive");
+        ensure!(
+            !step.node_id.trim().is_empty(),
+            "round trace node id cannot be empty"
+        );
+        ensure!(
+            !step.attempt_id.trim().is_empty(),
+            "round trace attempt id cannot be empty"
+        );
+    }
+    Ok(())
+}
+
+pub fn validate_node_state(state: &NodeState) -> Result<()> {
+    ensure!(state.version == VERSION, "unsupported node state version");
+    ensure!(
+        state.acp_storage_schema_version <= CURRENT_ACP_STORAGE_SCHEMA_VERSION,
+        "acp.storage-schema-version-unsupported"
+    );
+    ensure!(
+        !(state.status != RunStatus::Completed && state.outcome.is_some()),
+        "non-completed node cannot have outcome"
+    );
+    ensure!(
+        !(state.status == RunStatus::Completed && state.outcome.is_none()),
+        "completed node must have outcome"
+    );
+    ensure!(
+        !(state.status == RunStatus::Completed && state.finished_at.is_none()),
+        "completed node must have finishedAt"
+    );
+    Ok(())
+}
+
+pub fn validate_worker_ref_state(state: &WorkerRefState) -> Result<()> {
+    ensure!(state.version == VERSION, "unsupported worker-ref version");
+    ensure!(
+        !state.provider.trim().is_empty(),
+        "worker-ref provider cannot be empty"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_node(storage_version: u32) -> NodeState {
+        NodeState {
+            version: VERSION.to_string(),
+            acp_storage_schema_version: storage_version,
+            node_id: "node-a".to_string(),
+            node_type: NodeType::Worker,
+            run_id: "run-001".to_string(),
+            round_id: "round-001".to_string(),
+            attempt_id: "attempt-001".to_string(),
+            status: RunStatus::Running,
+            outcome: None,
+            started_at: "t0".to_string(),
+            finished_at: None,
+            manual_check_pending: false,
+            runtime_execution_id: Some("execution-001".to_string()),
+            resolved_config: ResolvedConfig::new(),
+            uuid: None,
+        }
+    }
+
+    fn test_run(status: RunStatus, phase: RuntimeExecutionPhase) -> RunState {
+        RunState {
+            version: VERSION.to_string(),
+            id: "run-001".to_string(),
+            task_id: "task-001".to_string(),
+            task_uuid: None,
+            status,
+            outcome: None,
+            started_at: "t0".to_string(),
+            updated_at: "t0".to_string(),
+            workflow_snapshot: "workflow.snapshot.json".to_string(),
+            current_round: Some("round-001".to_string()),
+            current_node: Some("node-a".to_string()),
+            current_attempt: Some("attempt-001".to_string()),
+            new_rounds_opened: 0,
+            pause_reason: None,
+            uuid: None,
+            last_executed_node: None,
+            worktree: None,
+            execution: RuntimeExecutionState::new(
+                phase,
+                Some(RuntimeAttemptLocator {
+                    round_id: "round-001".to_string(),
+                    node_id: "node-a".to_string(),
+                    attempt_id: "attempt-001".to_string(),
+                    outer_node_id: None,
+                    outer_attempt_id: None,
+                }),
+                "t0",
+            ),
+        }
+    }
+
+    #[test]
+    fn task_state_new_generates_uuid() {
+        let task = TaskState::new("task-001");
+        let uuid = task.uuid.expect("TaskState::new must generate a uuid");
+        assert_eq!(uuid.len(), 32);
+        assert!(uuid.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn stale_lifecycle_write_cannot_lower_acp_storage_schema_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("node.json")).unwrap();
+        let mut stale = test_node(0);
+        crate::storage::write_json(&path, &stale).unwrap();
+
+        assert!(
+            advance_node_acp_storage_schema_version(&path, CURRENT_ACP_STORAGE_SCHEMA_VERSION)
+                .unwrap()
+        );
+        stale.manual_check_pending = true;
+        write_node_state(&path, &stale).unwrap();
+
+        let durable = crate::storage::read_json::<NodeState>(&path).unwrap();
+        assert_eq!(
+            durable.acp_storage_schema_version,
+            CURRENT_ACP_STORAGE_SCHEMA_VERSION
+        );
+        assert!(durable.manual_check_pending);
+    }
+
+    #[test]
+    fn task_state_uuid_is_unique_per_construction() {
+        let a = TaskState::new("task-a");
+        let b = TaskState::new("task-b");
+        assert_ne!(a.uuid, b.uuid);
+    }
+
+    #[test]
+    fn runtime_lifecycle_transition_is_validated_and_revision_is_monotonic() {
+        let mut run = test_run(RunStatus::Running, RuntimeExecutionPhase::StartingNode);
+        let locator = run.current_execution_locator();
+        RuntimeLifecycleStore::transition(
+            &mut run,
+            RuntimeExecutionPhase::RunningNode,
+            locator.clone(),
+            "t1",
+        )
+        .unwrap();
+        RuntimeLifecycleStore::transition(
+            &mut run,
+            RuntimeExecutionPhase::FinalizingArtifact,
+            locator,
+            "t2",
+        )
+        .unwrap();
+        assert_eq!(run.execution.revision, 3);
+        assert_eq!(
+            run.execution.phase,
+            RuntimeExecutionPhase::FinalizingArtifact
+        );
+    }
+
+    #[test]
+    fn runtime_lifecycle_allows_workspace_preparation_before_provider_start() {
+        let mut run = test_run(RunStatus::Running, RuntimeExecutionPhase::StartingNode);
+        let locator = run.current_execution_locator();
+
+        RuntimeLifecycleStore::transition(
+            &mut run,
+            RuntimeExecutionPhase::PreparingWorkspace,
+            locator,
+            "t1",
+        )
+        .unwrap();
+
+        assert_eq!(
+            run.execution.phase,
+            RuntimeExecutionPhase::PreparingWorkspace
+        );
+        assert_eq!(run.execution.revision, 2);
+    }
+
+    #[test]
+    fn runtime_lifecycle_rejects_terminal_to_running_transition() {
+        let mut run = test_run(RunStatus::Completed, RuntimeExecutionPhase::Terminal);
+        run.outcome = Some(RunOutcome::Success);
+        let error = RuntimeLifecycleStore::transition(
+            &mut run,
+            RuntimeExecutionPhase::RunningNode,
+            None,
+            "t1",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "runtime.execution-transition-invalid");
+        assert_eq!(run.execution.phase, RuntimeExecutionPhase::Terminal);
+        assert_eq!(run.execution.revision, 1);
+    }
+
+    #[test]
+    fn legacy_run_migration_uses_run_status_without_acp_facts() {
+        let mut run = test_run(RunStatus::Paused, RuntimeExecutionPhase::StartingNode);
+        run.pause_reason = Some(PauseReason::ProcessInterrupted);
+        run.execution = RuntimeExecutionState::default();
+        assert!(run.reconcile_legacy_execution());
+        assert_eq!(run.execution.phase, RuntimeExecutionPhase::Paused);
+        assert_eq!(run.execution.revision, 1);
+        assert!(!run.reconcile_legacy_execution());
+    }
+
+    #[test]
+    fn run_worktree_state_round_trips_and_legacy_runs_default_to_main_workspace() {
+        let mut run = test_run(
+            RunStatus::Running,
+            RuntimeExecutionPhase::PreparingWorkspace,
+        );
+        run.worktree = Some(RunWorktreeState {
+            path: Utf8PathBuf::from("D:/Sasuke/worktrees/abc123"),
+            branch: "sasuke/conversation/abc123".to_string(),
+            fork_commit: "0123456789abcdef".to_string(),
+        });
+
+        let serialized = serde_json::to_value(&run).unwrap();
+        let restored: RunState = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.worktree, run.worktree);
+
+        let mut legacy = serde_json::to_value(&run).unwrap();
+        legacy.as_object_mut().unwrap().remove("worktree");
+        let restored_legacy: RunState = serde_json::from_value(legacy).unwrap();
+        assert!(restored_legacy.worktree.is_none());
+    }
+
+    #[test]
+    fn runtime_recovery_candidate_token_is_optional_but_never_empty() {
+        let mut run = test_run(RunStatus::Running, RuntimeExecutionPhase::RunningNode);
+        assert!(validate_run_state(&run).is_ok());
+
+        run.execution.recovery_candidate_token = Some("candidate-001".to_string());
+        assert!(validate_run_state(&run).is_ok());
+        let serialized = serde_json::to_value(&run).unwrap();
+        assert_eq!(
+            serialized["execution"]["recoveryCandidateToken"],
+            "candidate-001"
+        );
+
+        run.execution.recovery_candidate_token = Some("  ".to_string());
+        assert!(validate_run_state(&run).is_err());
+    }
+}
