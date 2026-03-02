@@ -1,0 +1,160 @@
+use std::{env, fs, path::PathBuf};
+
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChannelConfig {
+    channel: String,
+    #[serde(default)]
+    silent_update_enabled: bool,
+    app_name: String,
+    app_key: String,
+    config_dir_name: String,
+    home_env_var: String,
+    updater_endpoint: String,
+    updater_public_key: String,
+    allow_http_updater: bool,
+    metrics_enabled: bool,
+    #[serde(default)]
+    feedback_enabled: bool,
+    metrics_toggle_locked: bool,
+    #[serde(default)]
+    metrics_base_url: String,
+    metrics_api_key: String,
+    #[serde(default)]
+    builtin_mcp_servers: Vec<serde_json::Value>,
+    #[serde(default)]
+    multica_enabled: bool,
+    #[serde(default)]
+    multica_toggle_locked: bool,
+    #[serde(default)]
+    multica_base_url: String,
+    #[serde(default)]
+    multica_app_url: String,
+}
+
+fn main() {
+    println!("cargo:rerun-if-env-changed=SASUKE_RELEASE_CHANNEL");
+    println!("cargo:rerun-if-env-changed=SASUKE_METRICS_API_KEY");
+    println!("cargo:rerun-if-env-changed=SASUKE_METRICS_BASE_URL");
+    println!("cargo:rerun-if-env-changed=SASUKE_MULTICA_ENABLED");
+    println!("cargo:rerun-if-env-changed=SASUKE_MULTICA_TOGGLE_LOCKED");
+    println!("cargo:rerun-if-env-changed=SASUKE_MULTICA_BASE_URL");
+    println!("cargo:rerun-if-env-changed=SASUKE_MULTICA_APP_URL");
+    println!("cargo:rerun-if-changed=../configs/channels");
+
+    let channel = env::var("SASUKE_RELEASE_CHANNEL").unwrap_or_else(|_| "default".to_string());
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set"));
+    let config_path = manifest_dir
+        .parent()
+        .expect("src-tauri has a parent directory")
+        .join("configs")
+        .join("channels")
+        .join(format!("{channel}.json"));
+    let config_text = fs::read_to_string(&config_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read channel config {}: {error}",
+            config_path.display()
+        )
+    });
+    let config: ChannelConfig = serde_json::from_str(&config_text).unwrap_or_else(|error| {
+        panic!(
+            "failed to parse channel config {}: {error}",
+            config_path.display()
+        )
+    });
+
+    if config.channel != channel {
+        panic!(
+            "channel config mismatch: expected {}, found {} in {}",
+            channel,
+            config.channel,
+            config_path.display()
+        );
+    }
+
+    println!(
+        "cargo:rustc-env=SASUKE_RELEASE_CHANNEL={}",
+        config.channel
+    );
+    println!("cargo:rustc-env=SASUKE_APP_NAME={}", config.app_name);
+    println!("cargo:rustc-env=SASUKE_APP_KEY={}", config.app_key);
+    println!(
+        "cargo:rustc-env=SASUKE_CONFIG_DIR_NAME={}",
+        config.config_dir_name
+    );
+    println!(
+        "cargo:rustc-env=SASUKE_HOME_ENV_VAR={}",
+        config.home_env_var
+    );
+    println!(
+        "cargo:rustc-env=SASUKE_UPDATER_ENDPOINT={}",
+        config.updater_endpoint
+    );
+    println!(
+        "cargo:rustc-env=SASUKE_UPDATER_PUBLIC_KEY={}",
+        config.updater_public_key
+    );
+    println!(
+        "cargo:rustc-env=SASUKE_ALLOW_HTTP_UPDATER={}",
+        config.allow_http_updater
+    );
+    println!(
+        "cargo:rustc-env=SASUKE_METRICS_ENABLED={}",
+        config.metrics_enabled
+    );
+    println!(
+        "cargo:rustc-env=SASUKE_FEEDBACK_ENABLED={}",
+        config.feedback_enabled
+    );
+    println!(
+        "cargo:rustc-env=SASUKE_METRICS_TOGGLE_LOCKED={}",
+        config.metrics_toggle_locked
+    );
+    let metrics_base_url =
+        env::var("SASUKE_METRICS_BASE_URL").unwrap_or(config.metrics_base_url);
+    println!(
+        "cargo:rustc-env=SASUKE_METRICS_BASE_URL={}",
+        metrics_base_url
+    );
+    // Allow env var to override JSON value — keeps secrets out of the repo.
+    let metrics_api_key = env::var("SASUKE_METRICS_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(config.metrics_api_key);
+    println!(
+        "cargo:rustc-env=SASUKE_METRICS_API_KEY={}",
+        metrics_api_key
+    );
+    println!(
+        "cargo:rustc-env=SASUKE_SILENT_UPDATE_ENABLED={}",
+        config.silent_update_enabled
+    );
+    let builtin_mcp_json = serde_json::to_string(&config.builtin_mcp_servers).unwrap_or_default();
+    println!("cargo:rustc-env=SASUKE_BUILTIN_MCP_SERVERS={builtin_mcp_json}");
+
+    println!(
+        "cargo:rustc-env=SASUKE_MULTICA_ENABLED={}",
+        config.multica_enabled
+    );
+    println!(
+        "cargo:rustc-env=SASUKE_MULTICA_TOGGLE_LOCKED={}",
+        config.multica_toggle_locked
+    );
+    let multica_base_url =
+        env::var("SASUKE_MULTICA_BASE_URL").unwrap_or(config.multica_base_url.clone());
+    println!(
+        "cargo:rustc-env=SASUKE_MULTICA_BASE_URL={}",
+        multica_base_url
+    );
+    let multica_app_url =
+        env::var("SASUKE_MULTICA_APP_URL").unwrap_or(config.multica_app_url.clone());
+    println!(
+        "cargo:rustc-env=SASUKE_MULTICA_APP_URL={}",
+        multica_app_url
+    );
+
+    tauri_build::build()
+}
