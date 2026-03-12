@@ -1,0 +1,2942 @@
+use base64::Engine;
+use camino::Utf8PathBuf;
+use sasuke::app::App;
+use sasuke::config::{
+    ConversationAllowedWorkflowRef, ConversationAutoConfig, ConversationDirectConfig,
+    ConversationDynamicAgentRef, ConversationDynamicControl, ConversationPin, ConversationRunMode,
+    ConversationRunModeEntry, ConversationWorkspaceEntry, DesktopUiMode,
+};
+use sasuke::storage::SasukePaths;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
+use std::str::FromStr;
+use std::time::Instant;
+use tauri::{AppHandle, State};
+use tracing::{info, warn};
+use uuid::Uuid;
+
+use crate::commands::{
+    CommandErrorVm, CommandResult, command_error, configure_conversation_runtime_callbacks,
+    resolve_command_app, spawn_blocking_command, validate_runtime_workspace_for_command,
+};
+use crate::conversation_attention::{
+    ConversationTerminalResultAcknowledgementVm, acknowledge_terminal_result, remove_task_attention,
+};
+use crate::conversation_workspace::{
+    app_for_workspace, project_id_for_workspace, project_ids_match, remove_workspace_from_state,
+    workspace_entry_for_project,
+};
+use crate::state::{DesktopContext, DesktopState, provision_project_manifest_for_desktop};
+use crate::view_models::ContentVm;
+use crate::workspace_files::WorkspaceFileRuntime;
+
+fn scheduled_service_error(
+    error: crate::scheduled_service::ScheduledServiceError,
+) -> CommandErrorVm {
+    let mut params = error.params;
+    if let Some(trace_id) = error.trace_id {
+        if let Some(object) = params.as_object_mut() {
+            object.insert("traceId".to_string(), serde_json::json!(trace_id));
+        }
+    }
+    CommandErrorVm::new(error.code.to_string(), params)
+}
+
+async fn runtime_workspace_entry_for_project(
+    state: &sasuke::config::StateConfig,
+    project_id: &str,
+) -> CommandResult<(String, String)> {
+    let (workspace_path, resolved_project_id) = workspace_entry_for_project(state, project_id)
+        .ok_or_else(|| {
+            CommandErrorVm::new(
+                "workspace.not-found",
+                serde_json::json!({ "projectId": project_id }),
+            )
+        })?;
+    validate_runtime_workspace_for_command(&resolved_project_id, &workspace_path).await?;
+    Ok((workspace_path, resolved_project_id))
+}
+fn validate_scheduled_runtime_settings_input(
+    input: &crate::view_models_conversation::ScheduledRuntimeSettingsInputVm,
+) -> crate::scheduled_service::ScheduledServiceResult<()> {
+    use sasuke::scheduler::queue::{
+        MAX_OCCURRENCE_RETENTION_DAYS, MIN_OCCURRENCE_RETENTION_DAYS,
+    };
+
+    if !(MIN_OCCURRENCE_RETENTION_DAYS..=MAX_OCCURRENCE_RETENTION_DAYS)
+        .contains(&input.occurrence_retention_days)
+    {
+        return Err(crate::scheduled_service::ScheduledServiceError::new(
+            sasuke::scheduler::occurrence::ScheduledErrorCode::ValidationFailed,
+            serde_json::json!({
+                "field": "occurrenceRetentionDays",
+                "minimum": MIN_OCCURRENCE_RETENTION_DAYS,
+                "maximum": MAX_OCCURRENCE_RETENTION_DAYS,
+                "actual": input.occurrence_retention_days,
+            }),
+        ));
+    }
+    Ok(())
+}
+
+fn scheduled_runtime_settings_vm(
+    config: &sasuke::config::RuntimeConfig,
+    power: crate::scheduled_runtime::power::ScheduledPowerStatus,
+) -> crate::view_models_conversation::ScheduledRuntimeSettingsVm {
+    crate::view_models_conversation::ScheduledRuntimeSettingsVm {
+        keep_awake_enabled: config.scheduled_keep_awake_enabled,
+        keep_awake_effective: power.effective,
+        completion_notifications_enabled: config.scheduled_completion_notifications_enabled,
+        enabled_job_count: power.enabled_job_count,
+        occurrence_retention_days: config.scheduled_occurrence_retention_days,
+        power_error_code: power.error.map(|error| error.code.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn get_scheduled_runtime_settings(
+    state: State<'_, DesktopState>,
+) -> CommandResult<crate::view_models_conversation::ScheduledRuntimeSettingsVm> {
+    let context = state.context().map_err(command_error)?;
+    let power = state.scheduled_power_status().map_err(command_error)?;
+    Ok(scheduled_runtime_settings_vm(&context.config, power))
+}
+
+#[tauri::command]
+pub fn save_scheduled_runtime_settings(
+    state: State<'_, DesktopState>,
+    input: crate::view_models_conversation::ScheduledRuntimeSettingsInputVm,
+) -> CommandResult<crate::view_models_conversation::ScheduledRuntimeSettingsVm> {
+    validate_scheduled_runtime_settings_input(&input).map_err(scheduled_service_error)?;
+
+    let app = state.app().map_err(command_error)?;
+    let mut settings = app.load_settings().map_err(command_error)?;
+    settings.scheduled_keep_awake_enabled = Some(input.keep_awake_enabled);
+    settings.scheduled_completion_notifications_enabled =
+        Some(input.completion_notifications_enabled);
+    settings.scheduled_occurrence_retention_days = Some(input.occurrence_retention_days);
+    app.save_settings(&settings).map_err(command_error)?;
+    state
+        .update_settings_config(&settings)
+        .map_err(command_error)?;
+    let power = state
+        .reconcile_scheduled_power_setting()
+        .map_err(command_error)?;
+    let context = state.context().map_err(command_error)?;
+    Ok(scheduled_runtime_settings_vm(&context.config, power))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationRunModeSettingsVm {
+    pub mode: ConversationRunMode,
+    pub workflow_template_id: Option<String>,
+    #[serde(default)]
+    pub optional_entry_preferences: std::collections::HashMap<String, bool>,
+    pub direct_config: Option<crate::view_models_conversation::ConversationDirectConfigVm>,
+    #[serde(default)]
+    pub direct_preferences: std::collections::HashMap<
+        String,
+        crate::view_models_conversation::ConversationDirectConfigVm,
+    >,
+    pub auto_config: Option<crate::view_models_conversation::ConversationAutoConfigVm>,
+}
+
+fn validate_direct_capabilities(
+    state: &DesktopState,
+    input: &crate::view_models_conversation::ConversationCreateInputVm,
+    result: &mut crate::view_models_conversation::ConversationValidationResultVm,
+) -> CommandResult<()> {
+    if input.run_mode != ConversationRunMode::Direct.as_str() {
+        return Ok(());
+    }
+    let Some(config) = input.direct_config.as_ref() else {
+        return Ok(());
+    };
+    let Ok(agent_id) = sasuke::config::ManagedAgentId::from_str(&config.agent_type) else {
+        return Ok(());
+    };
+    let diagnostics = state.agent_diagnostics().map_err(command_error)?;
+    let Some(diagnostic) = diagnostics.get(&agent_id) else {
+        return Ok(());
+    };
+    if !diagnostic.available {
+        result
+            .missing_items
+            .push(crate::view_models_conversation::ConversationMissingItemVm {
+                code: "direct.agent.unavailable".to_string(),
+                label: "Selected Direct Agent is unavailable".to_string(),
+                recovery_path: "/chat/agents".to_string(),
+                params: serde_json::json!({}),
+            });
+    }
+    let models =
+        sasuke::provider::supported_models_from_capabilities(diagnostic.capabilities.as_ref());
+    if let Some(model_id) = config
+        .model_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        && !models.is_empty()
+        && !models.iter().any(|model| model.id == model_id)
+    {
+        result
+            .missing_items
+            .push(crate::view_models_conversation::ConversationMissingItemVm {
+                code: "direct.model.not-found".to_string(),
+                label: "Selected model is not supported by this Agent".to_string(),
+                recovery_path: "/chat".to_string(),
+                params: serde_json::json!({}),
+            });
+    }
+    let modes =
+        sasuke::provider::supported_modes_from_capabilities(diagnostic.capabilities.as_ref());
+    if let Some(permission_mode) = config
+        .permission_mode
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        && !modes.is_empty()
+        && !modes.iter().any(|mode| mode.id == permission_mode)
+    {
+        result
+            .missing_items
+            .push(crate::view_models_conversation::ConversationMissingItemVm {
+                code: "direct.permission.not-found".to_string(),
+                label: "Selected permission mode is not supported by this Agent".to_string(),
+                recovery_path: "/chat".to_string(),
+                params: serde_json::json!({}),
+            });
+    }
+    result.valid = result.missing_items.is_empty();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn save_desktop_ui_mode(state: State<'_, DesktopState>, mode: String) -> CommandResult<()> {
+    let app = state.app().map_err(command_error)?;
+    app.with_state(|state| {
+        state.desktop_ui_mode = Some(match mode.as_str() {
+            "workbench" => DesktopUiMode::Workbench,
+            _ => DesktopUiMode::Conversation,
+        });
+        (true, ())
+    })
+    .map_err(command_error)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_conversation_sidebar_bootstrap(
+    state: State<'_, DesktopState>,
+) -> CommandResult<crate::view_models_conversation::ConversationSidebarBootstrapVm> {
+    let started = Instant::now();
+    let context = state.context().map_err(command_error)?;
+    let result = spawn_blocking_command(move || {
+        let app = context.app();
+        let state = app.load_state().map_err(command_error)?;
+        Ok(crate::view_models_conversation::conversation_sidebar_bootstrap_vm(&state))
+    })
+    .await;
+    info!(
+        target: "sasuke::perf",
+        command = "get_conversation_sidebar_bootstrap",
+        elapsed_ms = started.elapsed().as_millis(),
+        status = if result.is_ok() { "ok" } else { "error" },
+        "conversation sidebar identity loaded"
+    );
+    result
+}
+
+#[tauri::command]
+pub async fn get_conversation_task_page(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    cursor: Option<String>,
+    limit: Option<usize>,
+) -> CommandResult<crate::view_models_conversation::ConversationTaskPageVm> {
+    let started = Instant::now();
+    let context = state.context().map_err(command_error)?;
+    let log_project_id = project_id.clone();
+    let result = spawn_blocking_command(move || {
+        let app = context.app();
+        let state = app.load_state().map_err(command_error)?;
+        let (workspace_path, resolved_project_id) =
+            workspace_entry_for_project(&state, &project_id).ok_or_else(|| {
+                CommandErrorVm::new(
+                    "workspace.not-found",
+                    serde_json::json!({ "projectId": project_id }),
+                )
+            })?;
+        let workspace_app = app_for_workspace(&context, &workspace_path).map_err(command_error)?;
+        crate::view_models_conversation::conversation_task_page_vm(
+            &workspace_app,
+            &state,
+            &resolved_project_id,
+            cursor.as_deref(),
+            limit.unwrap_or(crate::view_models_conversation::CONVERSATION_TASK_PAGE_DEFAULT_LIMIT),
+        )
+        .map_err(command_error)
+    })
+    .await;
+    info!(
+        target: "sasuke::perf",
+        command = "get_conversation_task_page",
+        project_id = %log_project_id,
+        elapsed_ms = started.elapsed().as_millis(),
+        status = if result.is_ok() { "ok" } else { "error" },
+        "conversation task page loaded"
+    );
+    result
+}
+
+#[tauri::command]
+pub async fn get_conversation_pinned_task_page(
+    state: State<'_, DesktopState>,
+    cursor: Option<String>,
+    limit: Option<usize>,
+) -> CommandResult<crate::view_models_conversation::ConversationPinnedTaskPageVm> {
+    let started = Instant::now();
+    let context = state.context().map_err(command_error)?;
+    let result = spawn_blocking_command(move || {
+        let app = context.app();
+        let state = app.load_state().map_err(command_error)?;
+        let sources =
+            conversation_sidebar_sources(&context, &app, &state).map_err(command_error)?;
+        Ok(
+            crate::view_models_conversation::conversation_pinned_task_page_vm(
+                &state,
+                &sources,
+                cursor.as_deref(),
+                limit.unwrap_or(
+                    crate::view_models_conversation::CONVERSATION_TASK_PAGE_DEFAULT_LIMIT,
+                ),
+            ),
+        )
+    })
+    .await;
+    info!(
+        target: "sasuke::perf",
+        command = "get_conversation_pinned_task_page",
+        elapsed_ms = started.elapsed().as_millis(),
+        status = if result.is_ok() { "ok" } else { "error" },
+        "conversation pinned task page loaded"
+    );
+    result
+}
+
+#[tauri::command]
+pub async fn get_conversation_run_summary_page(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    task_id: String,
+    cursor: Option<String>,
+    limit: Option<usize>,
+) -> CommandResult<crate::view_models_conversation::ConversationRunSummaryPageVm> {
+    let started = Instant::now();
+    let context = state.context().map_err(command_error)?;
+    let log_project_id = project_id.clone();
+    let log_task_id = task_id.clone();
+    let result = spawn_blocking_command(move || {
+        let app = context.app();
+        let state = app.load_state().map_err(command_error)?;
+        let (workspace_path, resolved_project_id) =
+            workspace_entry_for_project(&state, &project_id).ok_or_else(|| {
+                CommandErrorVm::new(
+                    "workspace.not-found",
+                    serde_json::json!({ "projectId": project_id }),
+                )
+            })?;
+        let workspace_app = app_for_workspace(&context, &workspace_path).map_err(command_error)?;
+        crate::view_models_conversation::conversation_run_summary_page_vm(
+            &workspace_app,
+            &resolved_project_id,
+            &task_id,
+            cursor.as_deref(),
+            limit.unwrap_or(crate::view_models_conversation::CONVERSATION_RUN_PAGE_DEFAULT_LIMIT),
+        )
+        .map_err(command_error)
+    })
+    .await;
+    info!(
+        target: "sasuke::perf",
+        command = "get_conversation_run_summary_page",
+        project_id = %log_project_id,
+        task_id = %log_task_id,
+        elapsed_ms = started.elapsed().as_millis(),
+        status = if result.is_ok() { "ok" } else { "error" },
+        "conversation run summary page loaded"
+    );
+    result
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcknowledgeConversationTerminalResultInput {
+    project_id: String,
+    task_id: String,
+    event_id: String,
+}
+
+#[tauri::command]
+pub fn acknowledge_conversation_terminal_result(
+    state: State<'_, DesktopState>,
+    input: AcknowledgeConversationTerminalResultInput,
+) -> CommandResult<ConversationTerminalResultAcknowledgementVm> {
+    let app = resolve_command_app(&state, Some(&input.project_id))?;
+    app.task_show(&input.task_id).map_err(|_| {
+        CommandErrorVm::new(
+            "task.not-found",
+            serde_json::json!({
+                "projectId": input.project_id,
+                "taskId": input.task_id,
+            }),
+        )
+    })?;
+    let _write_guard = state
+        .conversation_attention_write_guard()
+        .map_err(command_error)?;
+    acknowledge_terminal_result(&app, &input.task_id, &input.event_id).map_err(command_error)
+}
+
+#[tauri::command]
+pub fn list_scheduled_tasks(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+) -> CommandResult<Vec<crate::view_models_conversation::ScheduledTaskVm>> {
+    let service = state.scheduled_service().map_err(command_error)?;
+    service
+        .list(project_id.as_deref())
+        .map_err(scheduled_service_error)?
+        .into_iter()
+        .map(|record| {
+            let workspace_name = service
+                .workspace_name(&record.definition.project_id)
+                .map_err(scheduled_service_error)?;
+            Ok(
+                crate::view_models_conversation::ScheduledTaskVm::from_definition_in_workspace(
+                    &record.definition,
+                    &workspace_name,
+                    record.next_run_at,
+                ),
+            )
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub fn list_scheduled_task_occurrences(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    scheduled_task_id: String,
+    cursor: Option<String>,
+    status: Option<String>,
+) -> CommandResult<crate::view_models_conversation::ScheduledOccurrencePageVm> {
+    let cursor = cursor
+        .as_deref()
+        .map(decode_occurrence_cursor)
+        .transpose()?;
+    let status = status
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| invalid_occurrence_query("status", "invalid-status"))?;
+    state
+        .scheduled_service()
+        .map_err(command_error)?
+        .list_occurrence_page(&project_id, &scheduled_task_id, status, cursor.as_ref())
+        .map(
+            |page| crate::view_models_conversation::ScheduledOccurrencePageVm {
+                items: scheduled_occurrence_vms_from_occurrences(&page.items),
+                next_cursor: page.next_cursor.as_ref().map(encode_occurrence_cursor),
+            },
+        )
+        .map_err(scheduled_service_error)
+}
+
+fn encode_occurrence_cursor(cursor: &sasuke::scheduler::db::OccurrencePageCursor) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(cursor).expect("occurrence cursor serialization is infallible"))
+}
+
+fn decode_occurrence_cursor(
+    cursor: &str,
+) -> CommandResult<sasuke::scheduler::db::OccurrencePageCursor> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| {
+            CommandErrorVm::new(
+                sasuke::scheduler::occurrence::ScheduledErrorCode::ValidationFailed.to_string(),
+                serde_json::json!({ "field": "cursor", "reason": "invalid-cursor" }),
+            )
+        })?;
+    serde_json::from_slice(&bytes).map_err(|_| {
+        CommandErrorVm::new(
+            sasuke::scheduler::occurrence::ScheduledErrorCode::ValidationFailed.to_string(),
+            serde_json::json!({ "field": "cursor", "reason": "invalid-cursor" }),
+        )
+    })
+}
+
+fn invalid_occurrence_query(field: &str, reason: &str) -> CommandErrorVm {
+    CommandErrorVm::new(
+        sasuke::scheduler::occurrence::ScheduledErrorCode::ValidationFailed.to_string(),
+        serde_json::json!({ "field": field, "reason": reason }),
+    )
+}
+
+fn scheduled_occurrence_vms_from_occurrences(
+    occurrences: &[sasuke::scheduler::occurrence::ScheduledOccurrence],
+) -> Vec<crate::view_models_conversation::ScheduledOccurrenceVm> {
+    occurrences
+        .iter()
+        .map(crate::view_models_conversation::ScheduledOccurrenceVm::from_occurrence)
+        .collect()
+}
+
+#[tauri::command]
+pub fn get_scheduled_task_diagnostics(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    scheduled_task_id: String,
+) -> CommandResult<crate::view_models_conversation::ScheduledTaskDiagnosticsVm> {
+    let service = state.scheduled_service().map_err(command_error)?;
+    let record = service
+        .get(&project_id, &scheduled_task_id)
+        .map_err(scheduled_service_error)?;
+    let (run_count, occurrences) = service
+        .occurrence_diagnostics(&project_id, &scheduled_task_id)
+        .map_err(scheduled_service_error)?;
+    Ok(scheduled_task_diagnostics_vm(
+        project_id,
+        scheduled_task_id,
+        record,
+        run_count,
+        occurrences,
+    ))
+}
+
+fn scheduled_task_diagnostics_vm(
+    project_id: String,
+    scheduled_task_id: String,
+    record: sasuke::scheduler::db::ScheduledJobRecord,
+    run_count: u64,
+    occurrences: Vec<sasuke::scheduler::occurrence::ScheduledOccurrence>,
+) -> crate::view_models_conversation::ScheduledTaskDiagnosticsVm {
+    crate::view_models_conversation::ScheduledTaskDiagnosticsVm {
+        scheduled_task_id,
+        project_id,
+        next_at: record.next_run_at.map(|value| value.to_rfc3339()),
+        last_status: record.definition.last_trigger_status,
+        last_error: record.definition.last_error,
+        run_count,
+        retry_count: record.definition.retry_count,
+        occurrences: occurrences
+            .iter()
+            .map(crate::view_models_conversation::ScheduledOccurrenceVm::from_occurrence)
+            .collect(),
+    }
+}
+
+#[tauri::command]
+pub async fn run_scheduled_task_now(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    scheduled_task_id: String,
+) -> CommandResult<crate::view_models_conversation::RunScheduledTaskResultVm> {
+    let service = state.scheduled_service().map_err(command_error)?;
+    let result = service
+        .run_now(&project_id, &scheduled_task_id)
+        .await
+        .map_err(scheduled_service_error)?;
+    let links = result.immediate_links;
+    Ok(crate::view_models_conversation::RunScheduledTaskResultVm {
+        occurrence: crate::view_models_conversation::ScheduledOccurrenceVm::from_occurrence(
+            &result.occurrence,
+        ),
+        task_id: links
+            .as_ref()
+            .and_then(|links| links.task_id.clone())
+            .or(result.occurrence.task_id),
+        run_id: links
+            .as_ref()
+            .and_then(|links| links.run_id.clone())
+            .or(result.occurrence.run_id),
+        round_id: links
+            .as_ref()
+            .and_then(|links| links.round_id.clone())
+            .or(result.occurrence.round_id),
+        attempt_id: links
+            .as_ref()
+            .and_then(|links| links.attempt_id.clone())
+            .or(result.occurrence.attempt_id),
+    })
+}
+
+#[tauri::command]
+pub fn set_scheduled_task_enabled(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+    scheduled_task_id: String,
+    enabled: bool,
+) -> CommandResult<crate::view_models_conversation::ScheduledTaskVm> {
+    let service = state.scheduled_service().map_err(command_error)?;
+    let project_id = match project_id {
+        Some(project_id) => project_id,
+        None => state.app().map_err(command_error)?.paths.project_id,
+    };
+    let record = service
+        .set_enabled(&project_id, &scheduled_task_id, enabled)
+        .map_err(scheduled_service_error)?;
+    let workspace_name = service
+        .workspace_name(&record.definition.project_id)
+        .map_err(scheduled_service_error)?;
+    Ok(
+        crate::view_models_conversation::ScheduledTaskVm::from_definition_in_workspace(
+            &record.definition,
+            &workspace_name,
+            record.next_run_at,
+        ),
+    )
+}
+
+#[tauri::command]
+pub fn create_scheduled_task(
+    state: State<'_, DesktopState>,
+    input: crate::view_models_conversation::CreateScheduledTaskInputVm,
+) -> CommandResult<crate::view_models_conversation::ScheduledTaskVm> {
+    let service = state.scheduled_service().map_err(command_error)?;
+    let record = service.create(input).map_err(scheduled_service_error)?;
+    let workspace_name = service
+        .workspace_name(&record.definition.project_id)
+        .map_err(scheduled_service_error)?;
+    Ok(
+        crate::view_models_conversation::ScheduledTaskVm::from_definition_in_workspace(
+            &record.definition,
+            &workspace_name,
+            record.next_run_at,
+        ),
+    )
+}
+
+#[tauri::command]
+pub fn get_scheduled_task(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    scheduled_task_id: String,
+) -> CommandResult<crate::view_models_conversation::ScheduledTaskEditVm> {
+    let record = state
+        .scheduled_service()
+        .map_err(command_error)?
+        .get(&project_id, &scheduled_task_id)
+        .map_err(scheduled_service_error)?;
+    Ok(crate::view_models_conversation::ScheduledTaskEditVm::from_definition(&record.definition))
+}
+
+#[tauri::command]
+pub fn update_scheduled_task(
+    state: State<'_, DesktopState>,
+    input: crate::view_models_conversation::UpdateScheduledTaskInputVm,
+) -> CommandResult<crate::view_models_conversation::ScheduledTaskEditVm> {
+    let record = state
+        .scheduled_service()
+        .map_err(command_error)?
+        .update(input)
+        .map_err(scheduled_service_error)?;
+    Ok(crate::view_models_conversation::ScheduledTaskEditVm::from_definition(&record.definition))
+}
+
+#[tauri::command]
+pub fn delete_scheduled_task(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    scheduled_task_id: String,
+) -> CommandResult<()> {
+    state
+        .scheduled_service()
+        .map_err(command_error)?
+        .delete(&project_id, &scheduled_task_id)
+        .map_err(scheduled_service_error)
+}
+
+#[tauri::command]
+pub async fn get_conversation_workspaces(
+    state: State<'_, DesktopState>,
+) -> CommandResult<Vec<crate::view_models_conversation::ConversationWorkspaceVm>> {
+    let started = Instant::now();
+    let context = state.context().map_err(command_error)?;
+    let result = spawn_blocking_command(move || {
+        let app = context.app();
+        let state = app.load_state().map_err(command_error)?;
+        Ok(crate::view_models_conversation::conversation_workspace_vms(
+            &state,
+        ))
+    })
+    .await;
+    info!(
+        target: "sasuke::perf",
+        command = "get_conversation_workspaces",
+        elapsed_ms = started.elapsed().as_millis(),
+        status = if result.is_ok() { "ok" } else { "error" },
+        "conversation workspaces loaded"
+    );
+    result
+}
+
+#[tauri::command]
+pub async fn get_conversation_run(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    task_id: String,
+    run_id: String,
+    selected_session_key: Option<String>,
+) -> CommandResult<crate::view_models_conversation::ConversationRunVm> {
+    let started = Instant::now();
+    let context = state.context().map_err(command_error)?;
+    let log_project_id = project_id.clone();
+    let log_task_id = task_id.clone();
+    let log_run_id = run_id.clone();
+    let log_selected_session_key = selected_session_key.clone();
+    let result = spawn_blocking_command(move || {
+        let global_app = context.app();
+        let app_state = global_app.load_state().map_err(command_error)?;
+        let Some((workspace_path, resolved_project_id)) =
+            workspace_entry_for_project(&app_state, &project_id)
+        else {
+            return Err(CommandErrorVm::new(
+                "workspace.not-found",
+                serde_json::json!({ "projectId": project_id }),
+            ));
+        };
+        let workspace_app =
+            global_app.with_repo_root(Utf8PathBuf::from(&workspace_path), context.config.clone());
+        crate::view_models_conversation::conversation_run_vm(
+            &workspace_app,
+            &resolved_project_id,
+            &task_id,
+            &run_id,
+            selected_session_key.as_deref(),
+        )
+        .map_err(command_error)
+    })
+    .await;
+    info!(
+        target: "sasuke::perf",
+        command = "get_conversation_run",
+        project_id = %log_project_id,
+        task_id = %log_task_id,
+        run_id = %log_run_id,
+        selected_session_key = ?log_selected_session_key,
+        elapsed_ms = started.elapsed().as_millis(),
+        status = if result.is_ok() { "ok" } else { "error" },
+        "conversation run view model loaded"
+    );
+    result
+}
+
+#[tauri::command]
+pub async fn validate_conversation_create(
+    state: State<'_, DesktopState>,
+    input: crate::view_models_conversation::ConversationCreateInputVm,
+) -> CommandResult<crate::view_models_conversation::ConversationValidationResultVm> {
+    let context = state.context().map_err(command_error)?;
+    let global_app = context.app();
+    let app_state = global_app.load_state().map_err(command_error)?;
+    let (workspace_path, resolved_project_id) =
+        runtime_workspace_entry_for_project(&app_state, &input.project_id).await?;
+    let workspace_app = app_for_workspace(&context, &workspace_path).map_err(command_error)?;
+    let mut input = input;
+    input.project_id = resolved_project_id;
+    let mut result =
+        crate::view_models_conversation::validate_conversation_create_vm(&workspace_app, &input)
+            .map_err(command_error)?;
+    validate_direct_capabilities(state.inner(), &input, &mut result)?;
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn create_conversation_run(
+    app_handle: AppHandle,
+    state: State<'_, DesktopState>,
+    input: crate::view_models_conversation::ConversationCreateInputVm,
+) -> CommandResult<crate::view_models_conversation::ConversationCreateResultVm> {
+    let log_project_id = input.project_id.clone();
+    let log_run_mode = input.run_mode.clone();
+    let result = create_conversation_run_inner(app_handle, state, input).await;
+    match &result {
+        Ok(value) => info!(
+            project_id = %value.run.project_id,
+            task_id = %value.run.task_id,
+            run_id = %value.run.run_id,
+            run_mode = %value.run.run_mode,
+            "conversation run created"
+        ),
+        Err(error) => warn!(
+            project_id = %log_project_id,
+            run_mode = %log_run_mode,
+            error_code = %error.code,
+            "conversation run creation failed"
+        ),
+    }
+    result
+}
+
+async fn create_conversation_run_inner(
+    app_handle: AppHandle,
+    state: State<'_, DesktopState>,
+    input: crate::view_models_conversation::ConversationCreateInputVm,
+) -> CommandResult<crate::view_models_conversation::ConversationCreateResultVm> {
+    let _ = state.record_heartbeat_activity();
+    let started = Instant::now();
+    let context = state.context().map_err(command_error)?;
+    let global_app = context.app();
+    let app_state = global_app.load_state().map_err(command_error)?;
+    let (workspace_path, resolved_project_id) =
+        runtime_workspace_entry_for_project(&app_state, &input.project_id).await?;
+    let workspace_app = state
+        .app()
+        .map_err(command_error)?
+        .with_repo_root(Utf8PathBuf::from(&workspace_path), context.config.clone());
+    let mut input = input;
+    input.project_id = resolved_project_id.clone();
+    let project_id_for_current = resolved_project_id.clone();
+    let project_id_for_emit = resolved_project_id;
+    let app = workspace_app;
+    let mut validation =
+        crate::view_models_conversation::validate_conversation_create_vm(&app, &input)
+            .map_err(command_error)?;
+    validate_direct_capabilities(state.inner(), &input, &mut validation)?;
+    if !validation.valid {
+        return Err(CommandErrorVm::new(
+            "conversation.validation-failed",
+            serde_json::json!({
+                "codes": validation
+                    .missing_items
+                    .iter()
+                    .map(|item| item.code.clone())
+                    .collect::<Vec<_>>()
+            }),
+        ));
+    }
+    let app = configure_conversation_runtime_callbacks(
+        app,
+        app_handle.clone(),
+        Some(project_id_for_emit),
+    );
+    let run = tauri::async_runtime::spawn_blocking(move || {
+        crate::view_models_conversation::create_conversation_run_vm(&app, &input)
+            .map_err(command_error)
+    })
+    .await
+    .map_err(|_| CommandErrorVm::new("app.task-join-failed", serde_json::json!({})))??;
+    persist_last_conversation_workspace(&global_app, &project_id_for_current)?;
+    info!(
+        target: "sasuke::perf",
+        command = "create_conversation_run",
+        project_id = %project_id_for_current,
+        elapsed_ms = started.elapsed().as_millis(),
+        "conversation run creation completed"
+    );
+    Ok(run)
+}
+
+#[tauri::command]
+pub async fn rerun_conversation_task(
+    app_handle: AppHandle,
+    state: State<'_, DesktopState>,
+    project_id: String,
+    task_id: String,
+) -> CommandResult<crate::view_models_conversation::ConversationRunVm> {
+    let _ = state.record_heartbeat_activity();
+    let context = state.context().map_err(command_error)?;
+    let global_app = context.app();
+    let app_state = global_app.load_state().map_err(command_error)?;
+    let (workspace_path, resolved_project_id) =
+        runtime_workspace_entry_for_project(&app_state, &project_id).await?;
+    let workspace_app = state
+        .app()
+        .map_err(command_error)?
+        .with_repo_root(Utf8PathBuf::from(&workspace_path), context.config.clone());
+    let app = configure_conversation_runtime_callbacks(
+        workspace_app,
+        app_handle.clone(),
+        Some(resolved_project_id.clone()),
+    );
+    let run = crate::view_models_conversation::rerun_conversation_task_vm(
+        &app,
+        &resolved_project_id,
+        &task_id,
+    )
+    .map_err(command_error)?;
+    persist_last_conversation_workspace(&global_app, &resolved_project_id)?;
+    Ok(run)
+}
+
+#[tauri::command]
+pub async fn update_task_metadata(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    task_id: String,
+    title: String,
+    description: Option<String>,
+) -> CommandResult<crate::view_models_conversation::ConversationTaskRowVm> {
+    let context = state.context().map_err(command_error)?;
+    let global_app = context.app();
+    let app_state = global_app.load_state().map_err(command_error)?;
+    let Some((workspace_path, resolved_project_id)) =
+        workspace_entry_for_project(&app_state, &project_id)
+    else {
+        return Err(CommandErrorVm::new(
+            "workspace.not-found",
+            serde_json::json!({ "projectId": project_id }),
+        ));
+    };
+    let pin = app_state
+        .conversation_pins
+        .iter()
+        .find(|pin| pin.project_id == resolved_project_id && pin.task_id == task_id);
+    let pinned = pin.is_some();
+    let pin_order = pin.map(|pin| pin.order);
+    let workspace_app = app_for_workspace(&context, &workspace_path).map_err(command_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::view_models_conversation::update_task_metadata_vm(
+            &workspace_app,
+            &resolved_project_id,
+            &task_id,
+            &title,
+            description.as_deref(),
+            pinned,
+            pin_order,
+        )
+    })
+    .await
+    .map_err(|_| CommandErrorVm::new("app.task-join-failed", serde_json::json!({})))?
+    .map_err(command_error)
+}
+
+#[tauri::command]
+pub async fn pin_conversation(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    task_id: String,
+) -> CommandResult<crate::view_models_conversation::ConversationSidebarBootstrapVm> {
+    let context = state.context().map_err(command_error)?;
+    spawn_blocking_command(move || {
+        let app = context.app();
+        // RMW 经 with_state 原子化（StateConfig 唯一读改写入口）：与 Multica 后台写入并发互不覆盖。
+        app.with_state(|state| {
+            let (_, resolved_project_id) = match workspace_entry_for_project(state, &project_id) {
+                Some(entry) => entry,
+                None => {
+                    return (
+                        false,
+                        Err(CommandErrorVm::new(
+                            "workspace.not-found",
+                            serde_json::json!({ "projectId": project_id }),
+                        )),
+                    );
+                }
+            };
+            if state.conversation_pins.iter().any(|pin| {
+                project_ids_match(&pin.project_id, &resolved_project_id) && pin.task_id == task_id
+            }) {
+                return (false, conversation_sidebar_bootstrap_for_state(state));
+            }
+            let max_order = state
+                .conversation_pins
+                .iter()
+                .map(|p| p.order)
+                .max()
+                .unwrap_or(0);
+            state.conversation_pins.push(ConversationPin {
+                project_id: resolved_project_id,
+                task_id,
+                order: max_order + 1,
+            });
+            (true, conversation_sidebar_bootstrap_for_state(state))
+        })
+        .map_err(command_error)?
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn unpin_conversation(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    task_id: String,
+) -> CommandResult<crate::view_models_conversation::ConversationSidebarBootstrapVm> {
+    let context = state.context().map_err(command_error)?;
+    spawn_blocking_command(move || {
+        let app = context.app();
+        // RMW 经 with_state 原子化（StateConfig 唯一读改写入口）：与 Multica 后台写入并发互不覆盖。
+        app.with_state(|state| {
+            let (_, resolved_project_id) = match workspace_entry_for_project(state, &project_id) {
+                Some(entry) => entry,
+                None => {
+                    return (
+                        false,
+                        Err(CommandErrorVm::new(
+                            "workspace.not-found",
+                            serde_json::json!({ "projectId": project_id }),
+                        )),
+                    );
+                }
+            };
+            let before = state.conversation_pins.len();
+            state.conversation_pins.retain(|p| {
+                !project_ids_match(&p.project_id, &resolved_project_id) || p.task_id != task_id
+            });
+            let dirty = state.conversation_pins.len() != before;
+            (dirty, conversation_sidebar_bootstrap_for_state(state))
+        })
+        .map_err(command_error)?
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn reorder_pinned_conversations(
+    state: State<'_, DesktopState>,
+    ordered: Vec<sasuke::config::ConversationPin>,
+) -> CommandResult<crate::view_models_conversation::ConversationSidebarBootstrapVm> {
+    let context = state.context().map_err(command_error)?;
+    spawn_blocking_command(move || {
+        let app = context.app();
+        // RMW 经 with_state 原子化（StateConfig 唯一读改写入口）：与 Multica 后台写入并发互不覆盖。
+        app.with_state(|state| {
+            let normalized_pins = ordered
+                .into_iter()
+                .enumerate()
+                .map(|(i, mut pin)| {
+                    let (_, resolved_project_id) =
+                        match workspace_entry_for_project(state, &pin.project_id) {
+                            Some(entry) => entry,
+                            None => {
+                                return Err(CommandErrorVm::new(
+                                    "workspace.not-found",
+                                    serde_json::json!({ "projectId": pin.project_id }),
+                                ));
+                            }
+                        };
+                    pin.project_id = resolved_project_id;
+                    pin.order = i;
+                    Ok(pin)
+                })
+                .collect::<CommandResult<Vec<_>>>();
+            match normalized_pins {
+                Ok(pins) => {
+                    state.conversation_pins = pins;
+                    (true, conversation_sidebar_bootstrap_for_state(state))
+                }
+                // 校验失败 → 不落盘，原样返回错误。
+                Err(error) => (false, Err(error)),
+            }
+        })
+        .map_err(command_error)?
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn search_conversation_tasks(
+    state: State<'_, DesktopState>,
+    query: String,
+    limit: Option<usize>,
+) -> CommandResult<Vec<crate::view_models_conversation::ConversationSearchResultVm>> {
+    let limit = limit.unwrap_or(50).min(200);
+    let context = state.context().map_err(command_error)?;
+    let app = context.app();
+    let app_state = app.load_state().unwrap_or_default();
+    let task_roots = conversation_search_task_roots(&app, &app_state);
+    let index = sasuke::storage::sqlite::search_index()
+        .ok_or_else(|| CommandErrorVm::new("search.index-unavailable", serde_json::json!({})))?;
+    let index = index.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        index
+            .search_tasks_in_task_roots(&query, &task_roots, limit)
+            .map(|results| {
+                results
+                    .into_iter()
+                    .filter_map(|result| {
+                        let (project_id, workspace_name) =
+                            extract_project_from_task_path(&result.task_path, &app_state);
+                        let (workspace_path, resolved_project_id) =
+                            workspace_entry_for_project(&app_state, &project_id)?;
+                        let workspace_app = app_for_workspace(&context, &workspace_path).ok()?;
+                        conversation_search_result_for_workspace(
+                            &workspace_app,
+                            resolved_project_id,
+                            workspace_path,
+                            workspace_name,
+                            result,
+                        )
+                    })
+                    .collect()
+            })
+            .map_err(|error| {
+                CommandErrorVm::new(
+                    "search.query-failed",
+                    serde_json::json!({ "message": error.to_string() }),
+                )
+            })
+    })
+    .await
+    .map_err(|_| CommandErrorVm::new("app.task-join-failed", serde_json::json!({})))?
+}
+
+fn conversation_search_task_roots(
+    _app: &App,
+    state: &sasuke::config::StateConfig,
+) -> Vec<String> {
+    state
+        .conversation_workspaces
+        .iter()
+        .map(|workspace| {
+            sasuke::storage::SasukePaths::new(Utf8PathBuf::from(&workspace.workspace_path))
+                .tasks_dir()
+                .to_string()
+        })
+        .collect()
+}
+
+fn conversation_search_result_for_workspace(
+    workspace_app: &App,
+    project_id: String,
+    workspace_path: String,
+    workspace_name: String,
+    result: sasuke::storage::sqlite::TaskSearchResult,
+) -> Option<crate::view_models_conversation::ConversationSearchResultVm> {
+    let latest_run = workspace_app
+        .task_summary(&result.task_id)
+        .ok()?
+        .latest_run
+        .as_ref()
+        .map(crate::view_models_conversation::conversation_run_summary_vm)?;
+    let metadata =
+        sasuke::storage::read_json::<crate::view_models_conversation::ConversationMetadata>(
+            &Utf8PathBuf::from(&result.task_path)
+                .join("authoring")
+                .join("conversation.json"),
+        )
+        .ok();
+    Some(
+        crate::view_models_conversation::ConversationSearchResultVm {
+            project_id,
+            workspace_path,
+            workspace_name,
+            task_id: result.task_id,
+            title: result.title,
+            description: Some(result.description),
+            requirement_preview: result.requirement_preview,
+            match_preview: result.match_preview,
+            latest_run: Some(latest_run),
+            run_mode: metadata
+                .as_ref()
+                .map(|metadata| metadata.run_mode.clone())
+                .unwrap_or_else(|| "workflow".to_string()),
+            agent_identity: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.agent_identity.clone()),
+            last_activity_at: metadata.as_ref().and_then(|metadata| {
+                metadata
+                    .last_activity_at
+                    .clone()
+                    .or_else(|| Some(metadata.created_at.clone()))
+            }),
+        },
+    )
+}
+
+fn extract_project_from_task_path(
+    task_path: &str,
+    state: &sasuke::config::StateConfig,
+) -> (String, String) {
+    // Path structure: .../projects/{project_id}/tasks/{task_id}
+    let path = task_path.replace('\\', "/");
+    let segments: Vec<&str> = path.split('/').collect();
+    let mut project_id = String::new();
+    for i in 0..segments.len().saturating_sub(1) {
+        if segments[i] == "projects" {
+            project_id = segments
+                .get(i + 1)
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            break;
+        }
+    }
+    let workspace_name = state
+        .conversation_workspaces
+        .iter()
+        .find(|workspace| project_ids_match(&workspace.project_id, &project_id))
+        .map(|w| w.name.clone())
+        .unwrap_or(project_id.clone());
+    (project_id, workspace_name)
+}
+
+fn persist_last_conversation_workspace(app: &App, project_id: &str) -> CommandResult<()> {
+    // RMW 经 with_state 原子化（StateConfig 唯一读改写入口）：与 Multica 后台写入并发互不覆盖。
+    app.with_state(|state| {
+        let Some((_, resolved_project_id)) = workspace_entry_for_project(state, project_id) else {
+            return (
+                false,
+                Err(CommandErrorVm::new(
+                    "workspace.not-found",
+                    serde_json::json!({ "projectId": project_id }),
+                )),
+            );
+        };
+        state.last_conversation_workspace = Some(resolved_project_id);
+        (true, Ok(()))
+    })
+    .map_err(command_error)?
+}
+
+fn conversation_sidebar_sources(
+    context: &DesktopContext,
+    _app: &App,
+    state: &sasuke::config::StateConfig,
+) -> anyhow::Result<Vec<crate::view_models_conversation::ConversationWorkspaceSource>> {
+    state
+        .conversation_workspaces
+        .iter()
+        .map(|workspace| {
+            Ok(
+                crate::view_models_conversation::ConversationWorkspaceSource {
+                    workspace: crate::view_models_conversation::ConversationWorkspaceVm {
+                        project_id: workspace.project_id.clone(),
+                        workspace_path: workspace.workspace_path.clone(),
+                        name: workspace.name.clone(),
+                    },
+                    app: app_for_workspace(context, &workspace.workspace_path)?,
+                },
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn workspace_name_for_project(state: &sasuke::config::StateConfig, project_id: &str) -> String {
+    state
+        .conversation_workspaces
+        .iter()
+        .find(|workspace| project_ids_match(&workspace.project_id, project_id))
+        .map(|workspace| workspace.name.clone())
+        .unwrap_or_else(|| project_id.to_string())
+}
+
+fn conversation_sidebar_bootstrap_for_state(
+    state: &sasuke::config::StateConfig,
+) -> CommandResult<crate::view_models_conversation::ConversationSidebarBootstrapVm> {
+    Ok(crate::view_models_conversation::conversation_sidebar_bootstrap_vm(state))
+}
+
+#[tauri::command]
+pub fn get_conversation_run_mode(
+    state: State<'_, DesktopState>,
+    project_id: String,
+) -> CommandResult<Option<crate::view_models_conversation::ConversationRunModeVm>> {
+    let app = state.app().map_err(command_error)?;
+    let state = app.load_state().map_err(command_error)?;
+    let (_, resolved_project_id) =
+        workspace_entry_for_project(&state, &project_id).ok_or_else(|| {
+            CommandErrorVm::new(
+                "workspace.not-found",
+                serde_json::json!({ "projectId": project_id }),
+            )
+        })?;
+    Ok(state
+        .conversation_run_modes
+        .get(&resolved_project_id)
+        .map(
+            |entry| crate::view_models_conversation::ConversationRunModeVm {
+                mode: entry.mode.as_str().to_string(),
+                workflow_template_id: entry.workflow_template_id.clone(),
+                optional_entry_preferences: entry.optional_entry_preferences.clone(),
+                direct_config: entry.direct_config.as_ref().map(|config| {
+                    crate::view_models_conversation::ConversationDirectConfigVm {
+                        agent_type: config.agent_type.clone(),
+                        model_id: config.model_id.clone(),
+                        permission_mode: config.permission_mode.clone(),
+                        config_options: config.config_options.clone(),
+                    }
+                }),
+                direct_preferences: entry
+                    .direct_preferences
+                    .iter()
+                    .map(|(agent_type, config)| {
+                        (
+                            agent_type.clone(),
+                            crate::view_models_conversation::ConversationDirectConfigVm {
+                                agent_type: config.agent_type.clone(),
+                                model_id: config.model_id.clone(),
+                                permission_mode: config.permission_mode.clone(),
+                                config_options: config.config_options.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+                auto_config: entry.auto_config.as_ref().map(|cfg| {
+                    crate::view_models_conversation::ConversationAutoConfigVm {
+                        agent_strategy: cfg.agent_strategy.clone(),
+                        agent_type: cfg.agent_type.clone(),
+                        bootstrap_agent_type: cfg.bootstrap_agent_type.clone(),
+                        bootstrap_model_id: cfg.bootstrap_model_id.clone(),
+                        bootstrap_config_options: cfg.bootstrap_config_options.clone(),
+                        acceptance_model_id: cfg.acceptance_model_id.clone(),
+                        acceptance_config_options: cfg.acceptance_config_options.clone(),
+                        model_id: cfg.model_id.clone(),
+                        permission_mode: cfg.permission_mode.clone(),
+                        config_options: cfg.config_options.clone(),
+                        available_agents: cfg.available_agents.as_ref().map(|agents| {
+                            agents
+                                .iter()
+                                .map(|agent| {
+                                    crate::view_models_conversation::ConversationDynamicAgentRefVm {
+                                        provider: agent.provider.clone(),
+                                        model: agent.model.clone(),
+                                        permission_mode: agent.permission_mode.clone(),
+                                        config_options: agent.config_options.clone(),
+                                    }
+                                })
+                                .collect()
+                        }),
+                        routing_prompt: cfg.routing_prompt.clone(),
+                        allowed_workflows: cfg.allowed_workflows.as_ref().map(|workflows| {
+                            workflows
+                            .iter()
+                            .map(|workflow| {
+                                crate::view_models_conversation::ConversationAllowedWorkflowRefVm {
+                                    workflow_id: workflow.workflow_id.clone(),
+                                }
+                            })
+                            .collect()
+                        }),
+                        allowed_profiles: cfg.allowed_profiles.clone(),
+                        global_goal: cfg.global_goal.clone(),
+                        control: cfg.control.as_ref().map(|control| {
+                            crate::view_models_conversation::ConversationDynamicControlVm {
+                                max_dynamic_nodes: control.max_dynamic_nodes,
+                                max_fanout: control.max_fanout,
+                                max_depth: control.max_depth,
+                                max_parallel: control.max_parallel,
+                                max_group_depth: control.max_group_depth,
+                                max_workflow_invocations: control.max_workflow_invocations,
+                                allow_nested_dynamic: control.allow_nested_dynamic,
+                            }
+                        }),
+                        active_template_id: cfg.active_template_id.clone(),
+                        active_template_name: cfg.active_template_name.clone(),
+                    }
+                }),
+            },
+        ))
+}
+
+#[tauri::command]
+pub fn save_conversation_run_mode(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    settings: ConversationRunModeSettingsVm,
+) -> CommandResult<()> {
+    let app = state.app().map_err(command_error)?;
+    // RMW 经 with_state 原子化（StateConfig 唯一读改写入口）：与 Multica 后台写入并发互不覆盖。
+    app.with_state(|state| {
+        let Some((_, resolved_project_id)) = workspace_entry_for_project(state, &project_id) else {
+            return (
+                false,
+                Err(CommandErrorVm::new(
+                    "workspace.not-found",
+                    serde_json::json!({ "projectId": project_id }),
+                )),
+            );
+        };
+        state.conversation_run_modes.insert(
+            resolved_project_id,
+            ConversationRunModeEntry {
+                mode: settings.mode,
+                workflow_template_id: settings.workflow_template_id,
+                optional_entry_preferences: settings.optional_entry_preferences,
+                direct_config: settings
+                    .direct_config
+                    .map(|config| ConversationDirectConfig {
+                        agent_type: config.agent_type,
+                        model_id: config.model_id,
+                        permission_mode: config.permission_mode,
+                        config_options: config.config_options,
+                    }),
+                direct_preferences: settings
+                    .direct_preferences
+                    .into_iter()
+                    .map(|(agent_type, config)| {
+                        (
+                            agent_type,
+                            ConversationDirectConfig {
+                                agent_type: config.agent_type,
+                                model_id: config.model_id,
+                                permission_mode: config.permission_mode,
+                                config_options: config.config_options,
+                            },
+                        )
+                    })
+                    .collect(),
+                auto_config: settings.auto_config.map(|cfg| ConversationAutoConfig {
+                    agent_strategy: cfg.agent_strategy,
+                    agent_type: cfg.agent_type,
+                    bootstrap_agent_type: cfg.bootstrap_agent_type,
+                    bootstrap_model_id: cfg.bootstrap_model_id,
+                    bootstrap_config_options: cfg.bootstrap_config_options,
+                    acceptance_model_id: cfg.acceptance_model_id,
+                    acceptance_config_options: cfg.acceptance_config_options,
+                    model_id: cfg.model_id,
+                    permission_mode: cfg.permission_mode,
+                    config_options: cfg.config_options,
+                    available_agents: cfg.available_agents.map(|agents| {
+                        agents
+                            .into_iter()
+                            .map(|agent| ConversationDynamicAgentRef {
+                                provider: agent.provider,
+                                model: agent.model,
+                                permission_mode: agent.permission_mode,
+                                config_options: agent.config_options,
+                            })
+                            .collect()
+                    }),
+                    routing_prompt: cfg.routing_prompt,
+                    allowed_workflows: cfg.allowed_workflows.map(|workflows| {
+                        workflows
+                            .into_iter()
+                            .map(|workflow| ConversationAllowedWorkflowRef {
+                                workflow_id: workflow.workflow_id,
+                            })
+                            .collect()
+                    }),
+                    allowed_profiles: cfg.allowed_profiles,
+                    global_goal: cfg.global_goal,
+                    control: cfg.control.map(|control| ConversationDynamicControl {
+                        max_dynamic_nodes: control.max_dynamic_nodes,
+                        max_fanout: control.max_fanout,
+                        max_depth: control.max_depth,
+                        max_parallel: control.max_parallel,
+                        max_group_depth: control.max_group_depth,
+                        max_workflow_invocations: control.max_workflow_invocations,
+                        allow_nested_dynamic: control.allow_nested_dynamic,
+                    }),
+                    active_template_id: cfg.active_template_id,
+                    active_template_name: cfg.active_template_name,
+                }),
+            },
+        );
+        (true, Ok(()))
+    })
+    .map_err(command_error)?
+}
+
+#[tauri::command]
+pub fn choose_conversation_workspace(
+    state: State<'_, DesktopState>,
+) -> CommandResult<crate::view_models_conversation::ConversationWorkspaceVm> {
+    let context = state.context().map_err(command_error)?;
+    let workspace_path = context.repo_root.to_string();
+    let name = std::path::Path::new(&workspace_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| workspace_path.clone());
+    let project_id = project_id_for_workspace(&workspace_path);
+    Ok(crate::view_models_conversation::ConversationWorkspaceVm {
+        project_id,
+        workspace_path,
+        name,
+    })
+}
+
+/// add_conversation_workspace 的重复/冲突守卫（path 归一化比对 + project_id 比对）。
+/// 入库事务内、外各校验一次：事务外 fail-fast，事务内权威判定（防并发添加竞态入库）。
+fn conversation_workspace_add_error(
+    state: &sasuke::config::StateConfig,
+    selected: &SasukePaths,
+    name: &str,
+    project_id: &str,
+) -> Option<CommandErrorVm> {
+    if state.conversation_workspaces.iter().any(|workspace| {
+        SasukePaths::new(Utf8PathBuf::from(&workspace.workspace_path)).normalized_repo_root
+            == selected.normalized_repo_root
+    }) {
+        return Some(CommandErrorVm::new(
+            "workspace.already-exists",
+            serde_json::json!({ "name": name }),
+        ));
+    }
+    if state
+        .conversation_workspaces
+        .iter()
+        .any(|workspace| workspace.project_id == project_id)
+    {
+        return Some(CommandErrorVm::new(
+            "workspace.project-id-collision",
+            serde_json::json!({ "projectId": project_id }),
+        ));
+    }
+    None
+}
+
+#[tauri::command]
+pub async fn add_conversation_workspace(
+    state: State<'_, DesktopState>,
+    path: String,
+) -> CommandResult<crate::view_models_conversation::ConversationSidebarBootstrapVm> {
+    let context = state.context().map_err(command_error)?;
+    let coordinator = state.scheduler_coordinator().map_err(command_error)?;
+    spawn_blocking_command(move || {
+        let sasuke_app = context.app();
+        let workspace_path = Utf8PathBuf::from(path);
+        let workspace_path_str = workspace_path.as_str().to_string();
+        info!(workspace_path = %workspace_path_str, "conversation workspace picker returned selection");
+
+        let name = std::path::Path::new(&workspace_path_str)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| workspace_path_str.clone());
+        let selected_paths = SasukePaths::new(workspace_path.clone());
+        let project_id = selected_paths.project_id.clone();
+
+        // 预检（只读 load）：fail-fast，重复/冲突时不做 manifest 预置。
+        let pre_state = sasuke_app.load_state().map_err(command_error)?;
+        if let Some(error) =
+            conversation_workspace_add_error(&pre_state, &selected_paths, &name, &project_id)
+        {
+            return Err(error);
+        }
+
+        provision_project_manifest_for_desktop(&selected_paths).map_err(command_error)?;
+
+        // 入库经 with_state 原子 RMW（StateConfig 唯一读改写入口）：事务内权威重校验，
+        // 防并发添加竞态产生重复条目；与 Multica 后台写入并发互不覆盖。
+        let bootstrap = sasuke_app
+            .with_state(|state| {
+                if let Some(error) =
+                    conversation_workspace_add_error(state, &selected_paths, &name, &project_id)
+                {
+                    return (false, Err(error));
+                }
+                state
+                    .conversation_workspaces
+                    .push(ConversationWorkspaceEntry {
+                        project_id: project_id.clone(),
+                        workspace_path: workspace_path_str,
+                        name: name.clone(),
+                        added_at: chrono::Utc::now().to_rfc3339(),
+                    });
+                state.last_conversation_workspace = Some(project_id.clone());
+                (true, conversation_sidebar_bootstrap_for_state(state))
+            })
+            .map_err(command_error)??;
+        coordinator
+            .send(crate::scheduled_runtime::SchedulerCommand::RegisterWorkspace {
+                workspace_path: workspace_path.clone(),
+            })
+            .map_err(scheduled_service_error)?;
+        info!(project_id = %project_id, "conversation workspace added");
+
+        Ok(bootstrap)
+    })
+    .await
+}
+
+#[tauri::command]
+pub fn save_conversation_preference(
+    state: State<'_, DesktopState>,
+    key: String,
+    value: serde_json::Value,
+) -> CommandResult<()> {
+    let app = state.app().map_err(command_error)?;
+    // RMW 经 with_state 原子化（StateConfig 唯一读改写入口）：与 Multica 后台写入并发互不覆盖。
+    app.with_state(|app_state| {
+        app_state.preferences.insert(key, value);
+        (true, ())
+    })
+    .map_err(command_error)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn save_last_conversation_workspace(
+    state: State<'_, DesktopState>,
+    project_id: String,
+) -> CommandResult<()> {
+    let app = state.app().map_err(command_error)?;
+    // RMW 经 with_state 原子化（StateConfig 唯一读改写入口）：与 Multica 后台写入并发互不覆盖。
+    app.with_state(|app_state| {
+        let Some((_, resolved_project_id)) = workspace_entry_for_project(app_state, &project_id)
+        else {
+            return (
+                false,
+                Err(CommandErrorVm::new(
+                    "workspace.not-found",
+                    serde_json::json!({ "projectId": project_id }),
+                )),
+            );
+        };
+        app_state.last_conversation_workspace = Some(resolved_project_id);
+        (true, Ok(()))
+    })
+    .map_err(command_error)?
+}
+
+#[tauri::command]
+pub async fn sync_conversation_workspace(
+    state: State<'_, DesktopState>,
+    workspace_path: String,
+) -> CommandResult<crate::view_models_conversation::ConversationSidebarBootstrapVm> {
+    let context = state.context().map_err(command_error)?;
+    let coordinator = state.scheduler_coordinator().map_err(command_error)?;
+    spawn_blocking_command(move || {
+        let app = context.app();
+        let name = std::path::Path::new(&workspace_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| workspace_path.clone());
+        let selected_paths = SasukePaths::new(Utf8PathBuf::from(&workspace_path));
+        let project_id = selected_paths.project_id.clone();
+
+        // 预读（只读）：仅新增工作区需要预置 manifest；既有条目同步不触碰目标目录。
+        let needs_provision = {
+            let pre_state = app.load_state().map_err(command_error)?;
+            pre_state.conversation_workspaces.iter().all(|workspace| {
+                SasukePaths::new(Utf8PathBuf::from(&workspace.workspace_path))
+                    .normalized_repo_root
+                    != selected_paths.normalized_repo_root
+            }) && pre_state
+                .conversation_workspaces
+                .iter()
+                .all(|workspace| workspace.project_id != project_id)
+        };
+        if needs_provision {
+            provision_project_manifest_for_desktop(&selected_paths).map_err(command_error)?;
+        }
+
+        // 入库经 with_state 原子 RMW（StateConfig 唯一读改写入口）：事务内权威重判定，
+        // 并发添加已存在时幂等采用既有条目；与 Multica 后台写入并发互不覆盖。
+        let bootstrap = app
+            .with_state(|state| {
+                let resolved_project_id = if let Some(workspace) =
+                    state.conversation_workspaces.iter().find(|workspace| {
+                        SasukePaths::new(Utf8PathBuf::from(&workspace.workspace_path))
+                            .normalized_repo_root
+                            == selected_paths.normalized_repo_root
+                    }) {
+                    workspace.project_id.clone()
+                } else if state
+                    .conversation_workspaces
+                    .iter()
+                    .any(|workspace| workspace.project_id == project_id)
+                {
+                    return (
+                        false,
+                        Err(CommandErrorVm::new(
+                            "workspace.project-id-collision",
+                            serde_json::json!({ "projectId": project_id }),
+                        )),
+                    );
+                } else {
+                    state
+                        .conversation_workspaces
+                        .push(ConversationWorkspaceEntry {
+                            project_id: project_id.clone(),
+                            workspace_path: workspace_path.clone(),
+                            name: name.clone(),
+                            added_at: chrono::Utc::now().to_rfc3339(),
+                        });
+                    project_id.clone()
+                };
+                state.last_conversation_workspace = Some(resolved_project_id);
+                (true, conversation_sidebar_bootstrap_for_state(state))
+            })
+            .map_err(command_error)??;
+        coordinator
+            .send(
+                crate::scheduled_runtime::SchedulerCommand::RegisterWorkspace {
+                    workspace_path: Utf8PathBuf::from(workspace_path.clone()),
+                },
+            )
+            .map_err(scheduled_service_error)?;
+
+        Ok(bootstrap)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_conversation_task(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    task_id: String,
+) -> CommandResult<crate::view_models_conversation::ConversationSidebarBootstrapVm> {
+    let context = state.context().map_err(command_error)?;
+    let conversation_attention_write_lock = state.conversation_attention_write_lock();
+    spawn_blocking_command(move || {
+        let app = context.app();
+        // 只读 load 解析工作区归属；重操作（trash/sqlite/attention）不持 state 锁。
+        let app_state = app.load_state().map_err(command_error)?;
+        let Some((workspace_path, normalized_project_id)) =
+            workspace_entry_for_project(&app_state, &project_id)
+        else {
+            return Err(CommandErrorVm::new(
+                "workspace.not-found",
+                serde_json::json!({ "projectId": project_id }),
+            ));
+        };
+        let workspace_app = app_for_workspace(&context, &workspace_path).map_err(command_error)?;
+        let task_dir = workspace_app.paths.task_dir(&task_id);
+        if !task_dir.exists() {
+            return Err(CommandErrorVm::new(
+                "conversation.task-not-found",
+                serde_json::json!({ "taskId": task_id }),
+            ));
+        }
+        if let Ok(runs) = workspace_app.run_list(&task_id)
+            && runs
+                .iter()
+                .any(|run| run.status == sasuke::domain::RunStatus::Running)
+        {
+            return Err(CommandErrorVm::new(
+                "conversation.task-running",
+                serde_json::json!({ "taskId": task_id }),
+            ));
+        }
+        trash::delete(task_dir.as_std_path()).map_err(|error| {
+            CommandErrorVm::new(
+                "conversation.task-delete-failed",
+                serde_json::json!({ "taskId": task_id, "message": error.to_string() }),
+            )
+        })?;
+        sasuke::storage::sqlite::delete_task(&task_dir);
+        {
+            let _attention_guard = conversation_attention_write_lock.lock().map_err(|_| {
+                CommandErrorVm::new(
+                    "conversation.attention-write-lock-failed",
+                    serde_json::json!({ "taskId": task_id }),
+                )
+            })?;
+            remove_task_attention(&workspace_app, &task_id).map_err(command_error)?;
+        }
+        // 清 pin 经 with_state 原子 RMW（StateConfig 唯一读改写入口）：与 Multica 后台写入并发互不覆盖。
+        app.with_state(|state| {
+            let before = state.conversation_pins.len();
+            state
+                .conversation_pins
+                .retain(|p| p.project_id != normalized_project_id || p.task_id != task_id);
+            (
+                state.conversation_pins.len() != before,
+                conversation_sidebar_bootstrap_for_state(state),
+            )
+        })
+        .map_err(command_error)?
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn remove_conversation_workspace(
+    state: State<'_, DesktopState>,
+    project_id: String,
+) -> CommandResult<crate::view_models_conversation::ConversationSidebarBootstrapVm> {
+    let context = state.context().map_err(command_error)?;
+    let coordinator = state.scheduler_coordinator().map_err(command_error)?;
+    spawn_blocking_command(move || {
+        let app = context.app();
+        // 只读 load 解析工作区路径；关闭 ACP 连接等重操作不持 state 锁。
+        let state = app.load_state().map_err(command_error)?;
+        let workspace_path = workspace_entry_for_project(&state, &project_id)
+            .map(|(workspace_path, _)| workspace_path)
+            .ok_or_else(|| {
+                CommandErrorVm::new(
+                    "conversation.workspace-not-found",
+                    serde_json::json!({ "projectId": project_id }),
+                )
+            })?;
+        sasuke::acp::client::close_workspace_connections_bounded(&Utf8PathBuf::from(
+            workspace_path.clone(),
+        ))
+        .map_err(command_error)?;
+
+        // 移除工作区状态经 with_state 原子 RMW（StateConfig 唯一读改写入口）：
+        // 事务内重新解析（并发下已移除则报 not-found），与 Multica 后台写入并发互不覆盖。
+        let bootstrap = app
+            .with_state(
+                |state| match remove_workspace_from_state(state, &project_id) {
+                    Some(_) => (true, conversation_sidebar_bootstrap_for_state(state)),
+                    None => (
+                        false,
+                        Err(CommandErrorVm::new(
+                            "conversation.workspace-not-found",
+                            serde_json::json!({ "projectId": project_id }),
+                        )),
+                    ),
+                },
+            )
+            .map_err(command_error)??;
+        coordinator
+            .send(
+                crate::scheduled_runtime::SchedulerCommand::UnregisterWorkspace {
+                    workspace_path: Utf8PathBuf::from(workspace_path),
+                },
+            )
+            .map_err(scheduled_service_error)?;
+
+        Ok(bootstrap)
+    })
+    .await
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentFileVm {
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaterializeAttachmentFileInput {
+    pub name: String,
+    #[serde(default)]
+    pub mime: Option<String>,
+    pub data_base64: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaterializeConversationAttachmentsInput {
+    pub files: Vec<MaterializeAttachmentFileInput>,
+}
+
+#[tauri::command]
+pub async fn stat_attachment_files(
+    runtime: State<'_, WorkspaceFileRuntime>,
+    paths: Vec<String>,
+) -> CommandResult<Vec<AttachmentFileVm>> {
+    let runtime = runtime.inner().clone();
+    spawn_blocking_command(move || {
+        Ok(paths
+            .into_iter()
+            .filter_map(|p| {
+                let path = Path::new(&p);
+                let name = path.file_name()?.to_str()?.to_string();
+                let size = path.metadata().ok()?.len();
+                let ext = path
+                    .extension()
+                    .and_then(|value| value.to_str())?
+                    .to_ascii_lowercase();
+                let mime = attachment_mime_for_ext(&ext);
+                let preview_url = mime
+                    .starts_with("image/")
+                    .then(|| {
+                        let revision = crate::workspace_files::revision_for_preview(path).ok()?;
+                        runtime
+                            .issue_attachment_preview(
+                                "attachment-picker".to_string(),
+                                path.to_path_buf(),
+                                revision,
+                                mime.to_string(),
+                                60 * 60,
+                            )
+                            .ok()
+                            .map(|grant| grant.token)
+                    })
+                    .flatten();
+                let content_url = (attachment_text_previewable_mime(mime)
+                    && size <= crate::view_models_conversation::MAX_ATTACHMENT_PER_FILE)
+                    .then(|| {
+                        let revision = crate::workspace_files::revision_for_preview(path).ok()?;
+                        runtime
+                            .issue_attachment_preview(
+                                "attachment-picker".to_string(),
+                                path.to_path_buf(),
+                                revision,
+                                mime.to_string(),
+                                60 * 60,
+                            )
+                            .ok()
+                            .map(|grant| grant.token)
+                    })
+                    .flatten();
+                Some(AttachmentFileVm {
+                    path: p,
+                    name,
+                    size,
+                    preview_url,
+                    content_url,
+                })
+            })
+            .collect())
+    })
+    .await
+}
+
+#[tauri::command]
+pub fn materialize_conversation_attachments(
+    _state: State<'_, DesktopState>,
+    input: MaterializeConversationAttachmentsInput,
+) -> CommandResult<Vec<AttachmentFileVm>> {
+    let root = Utf8PathBuf::from_path_buf(
+        std::env::temp_dir()
+            .join("sasuke")
+            .join("conversation-attachments")
+            .join(Uuid::new_v4().to_string()),
+    )
+    .map_err(|path| {
+        CommandErrorVm::new(
+            "conversation.attachment-materialize-failed",
+            serde_json::json!({ "path": path.display().to_string() }),
+        )
+    })?;
+    materialize_attachment_files_to_dir(&root, &input.files)
+}
+
+#[tauri::command]
+pub fn show_conversation_attachment(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    task_id: String,
+    name: String,
+) -> CommandResult<ContentVm> {
+    let context = state.context().map_err(command_error)?;
+    let global_app = context.app();
+    let app_state = global_app.load_state().map_err(command_error)?;
+    let Some((workspace_path, _)) = workspace_entry_for_project(&app_state, &project_id) else {
+        return Err(CommandErrorVm::new(
+            "workspace.not-found",
+            serde_json::json!({ "projectId": project_id }),
+        ));
+    };
+    let app = app_for_workspace(&context, &workspace_path).map_err(command_error)?;
+    let path = app
+        .paths
+        .task_dir(&task_id)
+        .join("authoring")
+        .join("inputs")
+        .join(&name);
+    if !path.exists() {
+        return Err(CommandErrorVm::new(
+            "attachment.not-found",
+            serde_json::json!({ "name": name }),
+        ));
+    }
+    let ext = Path::new(&name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let is_image = matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
+    );
+    let mime = attachment_mime_for_ext(&ext);
+    let content = if is_image {
+        let bytes = fs::read(path.as_std_path()).map_err(|e| {
+            CommandErrorVm::new(
+                "attachment.unreadable",
+                serde_json::json!({ "message": e.to_string() }),
+            )
+        })?;
+        format!("data:{};base64,{}", mime, base64_encode(&bytes))
+    } else {
+        fs::read_to_string(path.as_std_path()).map_err(|e| {
+            CommandErrorVm::new(
+                "attachment.unreadable",
+                serde_json::json!({ "message": e.to_string() }),
+            )
+        })?
+    };
+    Ok(ContentVm {
+        title: name.clone(),
+        kind: "input-attachment".to_string(),
+        content,
+        metadata: serde_json::json!({
+            "name": name,
+            "mimeType": mime,
+            "isImage": is_image,
+            "encoding": if is_image { "data-url" } else { "text" },
+        }),
+    })
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn show_conversation_message_attachment(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    task_id: String,
+    run_id: String,
+    round_id: String,
+    node_id: String,
+    attempt_id: String,
+    name: String,
+    path: String,
+    outer_node_id: Option<String>,
+    outer_attempt_id: Option<String>,
+) -> CommandResult<ContentVm> {
+    let context = state.context().map_err(command_error)?;
+    let global_app = context.app();
+    let app_state = global_app.load_state().map_err(command_error)?;
+    let Some((workspace_path, _)) = workspace_entry_for_project(&app_state, &project_id) else {
+        return Err(CommandErrorVm::new(
+            "workspace.not-found",
+            serde_json::json!({ "projectId": project_id }),
+        ));
+    };
+    let app = app_for_workspace(&context, &workspace_path).map_err(command_error)?;
+    let attempt_dir = if let (Some(outer_node_id), Some(outer_attempt_id)) =
+        (outer_node_id.as_deref(), outer_attempt_id.as_deref())
+    {
+        app.paths.dynamic_node_attempt_dir(
+            &task_id,
+            &run_id,
+            &round_id,
+            outer_node_id,
+            outer_attempt_id,
+            &node_id,
+            &attempt_id,
+        )
+    } else {
+        app.paths
+            .attempt_dir(&task_id, &run_id, &round_id, &node_id, &attempt_id)
+    };
+    message_attachment_content_from_attempt_dir(&attempt_dir, &name, &path)
+}
+
+fn message_attachment_content_from_attempt_dir(
+    attempt_dir: &camino::Utf8Path,
+    name: &str,
+    attachment_path: &str,
+) -> CommandResult<ContentVm> {
+    let relative_path = sanitize_message_attachment_relative_path(attachment_path)?;
+    let path = attempt_dir.join(&relative_path);
+    if !path.exists() {
+        return Err(CommandErrorVm::new(
+            "attachment.not-found",
+            serde_json::json!({ "name": name, "path": attachment_path }),
+        ));
+    }
+    let ext = Path::new(&relative_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .or_else(|| Path::new(name).extension().and_then(|e| e.to_str()))
+        .unwrap_or("")
+        .to_lowercase();
+    let is_image = matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
+    );
+    let mime = attachment_mime_for_ext(&ext);
+    let content = if is_image {
+        let bytes = fs::read(path.as_std_path()).map_err(|e| {
+            CommandErrorVm::new(
+                "attachment.unreadable",
+                serde_json::json!({ "message": e.to_string() }),
+            )
+        })?;
+        format!("data:{};base64,{}", mime, base64_encode(&bytes))
+    } else {
+        fs::read_to_string(path.as_std_path()).map_err(|e| {
+            CommandErrorVm::new(
+                "attachment.unreadable",
+                serde_json::json!({ "message": e.to_string() }),
+            )
+        })?
+    };
+    Ok(ContentVm {
+        title: name.to_string(),
+        kind: "message-attachment".to_string(),
+        content,
+        metadata: serde_json::json!({
+            "name": name,
+            "path": relative_path,
+            "mimeType": mime,
+            "isImage": is_image,
+            "encoding": if is_image { "data-url" } else { "text" },
+        }),
+    })
+}
+
+fn sanitize_message_attachment_relative_path(path: &str) -> CommandResult<String> {
+    let normalized = path.trim().replace('\\', "/");
+    let components: Vec<&str> = normalized.split('/').collect();
+    if components.is_empty()
+        || normalized.starts_with('/')
+        || normalized.starts_with('~')
+        || components.iter().any(|part| {
+            part.is_empty()
+                || *part == "."
+                || *part == ".."
+                || part.contains(':')
+                || part.chars().any(char::is_control)
+        })
+    {
+        return Err(CommandErrorVm::new(
+            "attachment.invalid-path",
+            serde_json::json!({ "path": path }),
+        ));
+    }
+    Ok(components.join("/"))
+}
+
+fn attachment_mime_for_ext(ext: &str) -> &'static str {
+    match ext {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "txt" => "text/plain",
+        "md" | "markdown" => "text/markdown",
+        "json" | "jsonl" => "application/json",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" | "jsx" => "text/javascript",
+        "ts" | "tsx" => "text/typescript",
+        "rs" => "text/rust",
+        "py" => "text/python",
+        "go" => "text/go",
+        "java" => "text/java",
+        "c" | "h" => "text/c",
+        "cpp" | "hpp" => "text/cpp",
+        "yaml" | "yml" => "text/yaml",
+        "xml" => "text/xml",
+        "toml" => "text/toml",
+        "log" => "text/plain",
+        "sql" => "text/sql",
+        "sh" | "bash" | "zsh" => "text/x-shellscript",
+        _ => "application/octet-stream",
+    }
+}
+
+fn attachment_text_previewable_mime(mime: &str) -> bool {
+    mime.starts_with("text/") || matches!(mime, "application/json" | "application/xml")
+}
+
+fn materialize_attachment_files_to_dir(
+    dir: &camino::Utf8Path,
+    files: &[MaterializeAttachmentFileInput],
+) -> CommandResult<Vec<AttachmentFileVm>> {
+    if files.len() > crate::view_models_conversation::MAX_ATTACHMENT_COUNT {
+        return Err(CommandErrorVm::new(
+            "conversation.attachment-count-exceeded",
+            serde_json::json!({}),
+        ));
+    }
+
+    fs::create_dir_all(dir.as_std_path()).map_err(|error| {
+        CommandErrorVm::new(
+            "conversation.attachment-materialize-failed",
+            serde_json::json!({ "message": error.to_string() }),
+        )
+    })?;
+
+    let mut total_size = 0_u64;
+    let mut used_names = HashSet::new();
+    let mut materialized = Vec::with_capacity(files.len());
+
+    for file in files {
+        let _declared_mime = file.mime.as_deref().unwrap_or_default();
+        let name = sanitize_attachment_file_name(&file.name)?;
+        let ext = Path::new(&name)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if !crate::view_models_conversation::allowed_attachment_ext(&ext) {
+            return Err(CommandErrorVm::new(
+                "conversation.attachment-unsupported-type",
+                serde_json::json!({ "name": file.name }),
+            ));
+        }
+
+        let bytes = base64_decode(&file.data_base64).map_err(|message| {
+            CommandErrorVm::new(
+                "conversation.attachment-unreadable",
+                serde_json::json!({ "name": file.name, "message": message }),
+            )
+        })?;
+        let size = bytes.len() as u64;
+        if size == 0 {
+            return Err(CommandErrorVm::new(
+                "conversation.attachment-unreadable",
+                serde_json::json!({ "name": file.name }),
+            ));
+        }
+        if size > crate::view_models_conversation::MAX_ATTACHMENT_PER_FILE {
+            return Err(CommandErrorVm::new(
+                "conversation.attachment-too-large",
+                serde_json::json!({ "name": file.name }),
+            ));
+        }
+        total_size += size;
+        if total_size > crate::view_models_conversation::MAX_ATTACHMENT_TOTAL {
+            return Err(CommandErrorVm::new(
+                "conversation.attachment-total-too-large",
+                serde_json::json!({}),
+            ));
+        }
+
+        let name = unique_attachment_file_name(&name, &mut used_names);
+        let path = dir.join(&name);
+        fs::write(path.as_std_path(), bytes).map_err(|error| {
+            CommandErrorVm::new(
+                "conversation.attachment-materialize-failed",
+                serde_json::json!({ "name": name, "message": error.to_string() }),
+            )
+        })?;
+        materialized.push(AttachmentFileVm {
+            path: path.to_string(),
+            name,
+            size,
+            preview_url: None,
+            content_url: None,
+        });
+    }
+
+    Ok(materialized)
+}
+
+fn sanitize_attachment_file_name(name: &str) -> CommandResult<String> {
+    let normalized = name.trim().replace('\\', "/");
+    let file_name = normalized
+        .rsplit('/')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CommandErrorVm::new(
+                "conversation.attachment-unreadable",
+                serde_json::json!({ "name": name }),
+            )
+        })?;
+    if file_name == "." || file_name == ".." || file_name.chars().any(char::is_control) {
+        return Err(CommandErrorVm::new(
+            "conversation.attachment-unreadable",
+            serde_json::json!({ "name": name }),
+        ));
+    }
+    Ok(file_name.to_string())
+}
+
+fn unique_attachment_file_name(base_name: &str, used_names: &mut HashSet<String>) -> String {
+    let path = Path::new(base_name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(base_name);
+    let ext = path.extension().and_then(|value| value.to_str());
+    let mut index = 1_u32;
+    loop {
+        let candidate = if index == 1 {
+            base_name.to_string()
+        } else if let Some(ext) = ext {
+            format!("{stem}-{index}.{ext}")
+        } else {
+            format!("{stem}-{index}")
+        };
+        if used_names.insert(candidate.to_lowercase()) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(((bytes.len() + 2) / 3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 0x3F) as usize] as char
+        } else {
+            b'=' as char
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 0x3F) as usize] as char
+        } else {
+            b'=' as char
+        });
+    }
+    out
+}
+
+fn base64_decode(value: &str) -> Result<Vec<u8>, String> {
+    let normalized = value
+        .split_once(',')
+        .map(|(_, payload)| payload)
+        .unwrap_or(value)
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    if normalized.is_empty() || normalized.len() % 4 != 0 {
+        return Err("invalid base64 length".to_string());
+    }
+
+    let mut out = Vec::with_capacity((normalized.len() / 4) * 3);
+    let bytes = normalized.as_bytes();
+    for chunk in bytes.chunks(4) {
+        let mut values = [0_u8; 4];
+        let mut padding = 0;
+        for (index, byte) in chunk.iter().enumerate() {
+            if *byte == b'=' {
+                padding += 1;
+                values[index] = 0;
+            } else if padding > 0 {
+                return Err("invalid base64 padding".to_string());
+            } else {
+                values[index] =
+                    base64_value(*byte).ok_or_else(|| "invalid base64 character".to_string())?;
+            }
+        }
+        if padding > 2 {
+            return Err("invalid base64 padding".to_string());
+        }
+        let n = ((values[0] as u32) << 18)
+            | ((values[1] as u32) << 12)
+            | ((values[2] as u32) << 6)
+            | values[3] as u32;
+        out.push(((n >> 16) & 0xFF) as u8);
+        if padding < 2 {
+            out.push(((n >> 8) & 0xFF) as u8);
+        }
+        if padding < 1 {
+            out.push((n & 0xFF) as u8);
+        }
+    }
+    Ok(out)
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+#[tauri::command]
+pub fn get_supported_attachment_extensions() -> CommandResult<Vec<String>> {
+    Ok(sasuke::provider::supported_attachment_extensions()
+        .into_iter()
+        .map(str::to_string)
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MaterializeAttachmentFileInput, base64_encode, conversation_search_result_for_workspace,
+        conversation_search_task_roots, decode_occurrence_cursor, encode_occurrence_cursor,
+        materialize_attachment_files_to_dir, message_attachment_content_from_attempt_dir,
+        runtime_workspace_entry_for_project, scheduled_occurrence_vms_from_occurrences,
+        scheduled_runtime_settings_vm, scheduled_service_error,
+        validate_scheduled_runtime_settings_input,
+    };
+    use camino::Utf8PathBuf;
+    use sasuke::app::App;
+    use sasuke::config::{ConversationWorkspaceEntry, StateConfig};
+    use sasuke::domain::{RunOutcome, RunStatus, VERSION};
+    use sasuke::runtime::{RunState, RuntimeExecutionPhase, RuntimeExecutionState, TaskState};
+    use sasuke::scheduler::occurrence::ScheduledErrorCode;
+    use sasuke::storage::{sqlite::TaskSearchResult, write_json};
+    use uuid::Uuid;
+
+    use crate::view_models_conversation::ScheduledRuntimeSettingsInputVm;
+
+    #[test]
+    fn runtime_workspace_entry_rejects_an_unavailable_workspace_before_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_path = directory
+            .path()
+            .join("removed-workspace")
+            .to_string_lossy()
+            .into_owned();
+        let mut state = StateConfig::default();
+        state
+            .conversation_workspaces
+            .push(ConversationWorkspaceEntry {
+                project_id: "project-1".to_string(),
+                workspace_path: workspace_path.clone(),
+                name: "Removed workspace".to_string(),
+                added_at: "2026-08-27T00:00:00Z".to_string(),
+            });
+
+        let error = tauri::async_runtime::block_on(runtime_workspace_entry_for_project(
+            &state,
+            "project-1",
+        ))
+        .unwrap_err();
+
+        assert_eq!(error.code, "workspace.path-not-found");
+        assert_eq!(error.params["projectId"], "project-1");
+        assert_eq!(error.params["workspacePath"], workspace_path);
+    }
+
+    #[test]
+    fn occurrence_cursor_round_trips_and_rejects_invalid_input() {
+        use chrono::{TimeZone, Utc};
+
+        let cursor = sasuke::scheduler::db::OccurrencePageCursor {
+            scheduled_at: Utc.with_ymd_and_hms(2026, 8, 13, 9, 30, 0).unwrap(),
+            created_at: Utc.with_ymd_and_hms(2026, 8, 13, 9, 30, 1).unwrap(),
+            id: "occurrence-20".to_string(),
+        };
+
+        assert_eq!(
+            decode_occurrence_cursor(&encode_occurrence_cursor(&cursor)).unwrap(),
+            cursor
+        );
+        let error = decode_occurrence_cursor("not-a-cursor").unwrap_err();
+        assert_eq!(error.code, ScheduledErrorCode::ValidationFailed.to_string());
+        assert_eq!(error.params["field"], "cursor");
+    }
+
+    #[test]
+    fn scheduled_occurrence_list_keeps_skipped_and_missed_history() {
+        use chrono::{TimeZone, Utc};
+        use sasuke::scheduler::occurrence::{
+            OccurrenceStatus, OccurrenceTriggerKind, ScheduledOccurrence,
+        };
+
+        let now = Utc.with_ymd_and_hms(2026, 8, 7, 9, 0, 0).unwrap();
+        let make_occurrence = |id: &str, status| ScheduledOccurrence {
+            id: id.to_string(),
+            job_id: "scheduled-1".to_string(),
+            scheduled_at: now,
+            trigger_kind: OccurrenceTriggerKind::Scheduled,
+            status,
+            attempt: 1,
+            owner_id: None,
+            lease_until: None,
+            heartbeat_at: None,
+            task_id: None,
+            run_id: None,
+            round_id: None,
+            attempt_id: None,
+            error_code: None,
+            error_params: None,
+            started_at: None,
+            finished_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        let occurrences = vec![
+            make_occurrence("skipped", OccurrenceStatus::Skipped),
+            make_occurrence("missed", OccurrenceStatus::Missed),
+        ];
+
+        let statuses = scheduled_occurrence_vms_from_occurrences(&occurrences)
+            .into_iter()
+            .map(|occurrence| occurrence.status)
+            .collect::<Vec<_>>();
+
+        assert_eq!(statuses, vec!["skipped", "missed"]);
+    }
+
+    #[test]
+    fn scheduled_runtime_settings_reject_retention_below_minimum() {
+        let error = validate_scheduled_runtime_settings_input(&ScheduledRuntimeSettingsInputVm {
+            keep_awake_enabled: true,
+            completion_notifications_enabled: true,
+            occurrence_retention_days: 0,
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code, ScheduledErrorCode::ValidationFailed);
+        assert_eq!(
+            error.params,
+            serde_json::json!({
+                "field": "occurrenceRetentionDays",
+                "minimum": 1,
+                "maximum": 3650,
+                "actual": 0,
+            })
+        );
+    }
+
+    #[test]
+    fn scheduled_runtime_settings_reject_retention_above_maximum() {
+        let error = validate_scheduled_runtime_settings_input(&ScheduledRuntimeSettingsInputVm {
+            keep_awake_enabled: false,
+            completion_notifications_enabled: false,
+            occurrence_retention_days: 3651,
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code, ScheduledErrorCode::ValidationFailed);
+        assert_eq!(error.params["actual"], 3651);
+    }
+
+    #[test]
+    fn scheduled_runtime_settings_report_config_and_effective_power_separately() {
+        let config = sasuke::config::RuntimeConfig {
+            scheduled_keep_awake_enabled: true,
+            scheduled_completion_notifications_enabled: false,
+            scheduled_occurrence_retention_days: 90,
+            ..sasuke::config::RuntimeConfig::default()
+        };
+        let vm = scheduled_runtime_settings_vm(
+            &config,
+            crate::scheduled_runtime::power::ScheduledPowerStatus {
+                effective: false,
+                enabled_job_count: 4,
+                error: Some(sasuke::scheduler::occurrence::ScheduledError::new(
+                    ScheduledErrorCode::PowerInhibitorFailed,
+                )),
+            },
+        );
+
+        assert!(vm.keep_awake_enabled);
+        assert!(!vm.keep_awake_effective);
+        assert!(!vm.completion_notifications_enabled);
+        assert_eq!(vm.enabled_job_count, 4);
+        assert_eq!(vm.occurrence_retention_days, 90);
+        assert_eq!(
+            vm.power_error_code.as_deref(),
+            Some("SCHEDULED_POWER_INHIBITOR_FAILED")
+        );
+    }
+
+    #[test]
+    fn workspace_name_for_project_uses_registered_workspace_name() {
+        let mut state = StateConfig::default();
+        state
+            .conversation_workspaces
+            .push(ConversationWorkspaceEntry {
+                project_id: "project-a".to_string(),
+                workspace_path: "D:/ws-a".to_string(),
+                name: "Workspace A".to_string(),
+                added_at: "2026-07-30T00:00:00Z".to_string(),
+            });
+
+        assert_eq!(
+            super::workspace_name_for_project(&state, "project-a"),
+            "Workspace A"
+        );
+        assert_eq!(
+            super::workspace_name_for_project(&state, "project-b"),
+            "project-b"
+        );
+    }
+
+    #[test]
+    fn scheduled_service_errors_keep_structured_command_contract() {
+        let error = crate::scheduled_service::ScheduledServiceError {
+            code: ScheduledErrorCode::Conflict,
+            params: serde_json::json!({
+                "scheduledTaskId": "scheduled-a",
+                "revision": 3,
+            }),
+            trace_id: Some("trace-a".to_string()),
+        };
+
+        let mapped = scheduled_service_error(error);
+
+        assert_eq!(mapped.code, "SCHEDULED_CONFLICT");
+        assert_eq!(
+            mapped.params,
+            serde_json::json!({
+                "scheduledTaskId": "scheduled-a",
+                "revision": 3,
+                "traceId": "trace-a",
+            })
+        );
+    }
+
+    #[test]
+    fn scheduled_diagnostics_uses_the_persisted_deadline() {
+        let definition = sasuke::scheduler::ScheduledTaskDefinition::new(
+            "project-a",
+            "scheduled-a",
+            "direct",
+            sasuke::scheduler::ScheduleSpec::at(chrono::Utc::now() + chrono::Duration::hours(1)),
+            sasuke::scheduler::OverlapPolicy::SkipWhenRunning,
+        )
+        .unwrap();
+        let record = sasuke::scheduler::db::ScheduledJobRecord {
+            definition,
+            revision: 3,
+            next_run_at: None,
+        };
+
+        let diagnostics = super::scheduled_task_diagnostics_vm(
+            "project-a".to_string(),
+            "scheduled-a".to_string(),
+            record,
+            0,
+            Vec::new(),
+        );
+
+        assert_eq!(diagnostics.next_at, None);
+    }
+
+    #[test]
+    fn conversation_search_result_contains_latest_run_for_navigation() {
+        let root = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir()
+                .join("sasuke-conversation-search-test")
+                .join(Uuid::new_v4().to_string()),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.as_std_path()).unwrap();
+        let app = App::new(root.clone());
+        let task_id = "task-001";
+        let run_id = "run-001";
+        write_json(
+            &app.paths.task_file(task_id),
+            &TaskState {
+                version: VERSION.to_string(),
+                id: task_id.to_string(),
+                title: Some("Searchable conversation".to_string()),
+                description: None,
+                uuid: None,
+            },
+        )
+        .unwrap();
+        write_json(
+            &app.paths.run_file(task_id, run_id),
+            &RunState {
+                version: VERSION.to_string(),
+                id: run_id.to_string(),
+                task_id: task_id.to_string(),
+                task_uuid: None,
+                status: RunStatus::Completed,
+                outcome: Some(RunOutcome::Success),
+                started_at: "2026-07-24T00:00:00Z".to_string(),
+                updated_at: "2026-07-24T00:01:00Z".to_string(),
+                workflow_snapshot: "workflow.snapshot.json".to_string(),
+                current_round: Some("round-001".to_string()),
+                current_node: Some("direct-agent".to_string()),
+                current_attempt: Some("attempt-001".to_string()),
+                new_rounds_opened: 0,
+                pause_reason: None,
+                uuid: None,
+                last_executed_node: None,
+                worktree: None,
+                execution: RuntimeExecutionState::new(
+                    RuntimeExecutionPhase::Terminal,
+                    None,
+                    "2026-07-24T00:01:00Z",
+                ),
+            },
+        )
+        .unwrap();
+
+        let result = conversation_search_result_for_workspace(
+            &app,
+            "project-a".to_string(),
+            root.to_string(),
+            "Project A".to_string(),
+            TaskSearchResult {
+                task_id: task_id.to_string(),
+                task_path: app.paths.task_dir(task_id).to_string(),
+                title: "Searchable conversation".to_string(),
+                description: String::new(),
+                requirement_preview: "find a file".to_string(),
+                match_preview: "find a file".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.project_id, "project-a");
+        assert_eq!(result.workspace_path, root.as_str());
+        assert_eq!(result.latest_run.unwrap().run_id, run_id);
+        let _ = std::fs::remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn conversation_search_scope_contains_only_sidebar_workspaces() {
+        let app = make_test_app();
+        let mut state = sasuke::config::StateConfig::default();
+        state
+            .conversation_workspaces
+            .push(sasuke::config::ConversationWorkspaceEntry {
+                project_id: "sidebar-workspace".to_string(),
+                workspace_path: "/path/to/sidebar-workspace".to_string(),
+                name: "Sidebar workspace".to_string(),
+                added_at: "2026-07-24T00:00:00Z".to_string(),
+            });
+
+        let roots = conversation_search_task_roots(&app, &state);
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(
+            roots[0],
+            sasuke::storage::SasukePaths::new(Utf8PathBuf::from("/path/to/sidebar-workspace"))
+                .tasks_dir()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn materializes_memory_attachments_from_canonical_decoded_bytes() {
+        let root = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir()
+                .join("sasuke-materialize-test")
+                .join(Uuid::new_v4().to_string()),
+        )
+        .unwrap();
+        let files = vec![
+            MaterializeAttachmentFileInput {
+                name: "shot.png".to_string(),
+                mime: Some("image/png".to_string()),
+                data_base64: base64_encode(&[1, 2, 3, 4]),
+            },
+            MaterializeAttachmentFileInput {
+                name: "nested\\shot.png".to_string(),
+                mime: Some("image/png".to_string()),
+                data_base64: base64_encode(&[5, 6, 7]),
+            },
+        ];
+
+        let result = materialize_attachment_files_to_dir(&root, &files).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].name, "shot.png");
+        assert_eq!(result[1].name, "shot-2.png");
+        assert_eq!(result[0].size, 4);
+        assert_eq!(result[1].size, 3);
+        assert_eq!(std::fs::read(&result[0].path).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(std::fs::read(&result[1].path).unwrap(), vec![5, 6, 7]);
+
+        let _ = std::fs::remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn rejects_unsupported_materialized_attachment_types() {
+        let root = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir()
+                .join("sasuke-materialize-test")
+                .join(Uuid::new_v4().to_string()),
+        )
+        .unwrap();
+        let files = vec![MaterializeAttachmentFileInput {
+            name: "archive.exe".to_string(),
+            mime: None,
+            data_base64: base64_encode(&[1, 2]),
+        }];
+
+        let error = materialize_attachment_files_to_dir(&root, &files).unwrap_err();
+
+        assert_eq!(error.code, "conversation.attachment-unsupported-type");
+        let _ = std::fs::remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn shows_message_attachment_from_attempt_user_inputs() {
+        let root = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir()
+                .join("sasuke-message-attachment-test")
+                .join(Uuid::new_v4().to_string()),
+        )
+        .unwrap();
+        let user_inputs = root.join("user-inputs");
+        std::fs::create_dir_all(user_inputs.as_std_path()).unwrap();
+        std::fs::write(user_inputs.join("image.png").as_std_path(), [1_u8, 2, 3]).unwrap();
+        std::fs::write(user_inputs.join("notes.txt").as_std_path(), "runtime notes").unwrap();
+
+        let content = message_attachment_content_from_attempt_dir(
+            &root,
+            "image.png",
+            "user-inputs/image.png",
+        )
+        .unwrap();
+
+        assert_eq!(content.kind, "message-attachment");
+        assert_eq!(content.title, "image.png");
+        assert!(content.content.starts_with("data:image/png;base64,"));
+        assert_eq!(content.content, "data:image/png;base64,AQID");
+
+        let text_content = message_attachment_content_from_attempt_dir(
+            &root,
+            "notes.txt",
+            "user-inputs/notes.txt",
+        )
+        .unwrap();
+        assert_eq!(text_content.kind, "message-attachment");
+        assert_eq!(text_content.title, "notes.txt");
+        assert_eq!(text_content.content, "runtime notes");
+        let _ = std::fs::remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn rejects_message_attachment_path_traversal() {
+        let root = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir()
+                .join("sasuke-message-attachment-test")
+                .join(Uuid::new_v4().to_string()),
+        )
+        .unwrap();
+
+        let error = message_attachment_content_from_attempt_dir(&root, "image.png", "../image.png")
+            .unwrap_err();
+
+        assert_eq!(error.code, "attachment.invalid-path");
+        let _ = std::fs::remove_dir_all(root.as_std_path());
+    }
+
+    // ── Workspace resolution tests ──
+
+    fn temp_repo_root() -> Utf8PathBuf {
+        let mut root = std::env::temp_dir();
+        root.push(format!("sasuke-workspace-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        Utf8PathBuf::from_path_buf(root).unwrap()
+    }
+
+    fn make_test_app() -> sasuke::app::App {
+        sasuke::app::App::new(temp_repo_root())
+    }
+
+    #[test]
+    fn workspace_entry_does_not_implicitly_resolve_desktop_context() {
+        let state = sasuke::config::StateConfig::default();
+
+        let result = super::workspace_entry_for_project(&state, "desktop-workspace");
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn workspace_entry_resolves_non_default_from_state() {
+        let mut state = sasuke::config::StateConfig::default();
+        state
+            .conversation_workspaces
+            .push(sasuke::config::ConversationWorkspaceEntry {
+                project_id: "claude-code".to_string(),
+                workspace_path: "/path/to/claude-code".to_string(),
+                name: "claude-code".to_string(),
+                added_at: "2025-01-01T00:00:00Z".to_string(),
+            });
+
+        let result = super::workspace_entry_for_project(&state, "claude-code");
+        assert!(result.is_some());
+        let (path, id) = result.unwrap();
+        assert_eq!(path, "/path/to/claude-code");
+        assert_eq!(id, "claude-code");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn workspace_entry_rejects_noncanonical_project_id_case() {
+        let mut state = sasuke::config::StateConfig::default();
+        state
+            .conversation_workspaces
+            .push(sasuke::config::ConversationWorkspaceEntry {
+                project_id: "d--projects-code-ai-claude-code".to_string(),
+                workspace_path: "D:\\Projects\\code\\ai\\claude code".to_string(),
+                name: "claude code".to_string(),
+                added_at: "2025-01-01T00:00:00Z".to_string(),
+            });
+
+        let result = super::workspace_entry_for_project(&state, "D--Projects-code-ai-claude-code");
+
+        assert!(result.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn indexed_legacy_task_path_does_not_use_a_runtime_alias() {
+        let mut state = sasuke::config::StateConfig::default();
+        state
+            .conversation_workspaces
+            .push(sasuke::config::ConversationWorkspaceEntry {
+                project_id: "d--projects-code-ai-claude-code".to_string(),
+                workspace_path: "D:\\Projects\\code\\ai\\claude code".to_string(),
+                name: "claude code".to_string(),
+                added_at: "2025-01-01T00:00:00Z".to_string(),
+            });
+        let task_path = "C:\\Users\\user\\.sasuke\\projects\\D--Projects-code-ai-claude-code\\tasks\\task-053";
+
+        let (indexed_project_id, workspace_name) =
+            super::extract_project_from_task_path(task_path, &state);
+        let resolved = super::workspace_entry_for_project(&state, &indexed_project_id);
+
+        assert_eq!(indexed_project_id, "D--Projects-code-ai-claude-code");
+        assert_eq!(workspace_name, indexed_project_id);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn workspace_entry_returns_none_for_unknown_project() {
+        let state = sasuke::config::StateConfig::default();
+
+        let result = super::workspace_entry_for_project(&state, "no-such-workspace");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn remove_conversation_workspace_cleans_up_pins_and_run_modes() {
+        let mut state = sasuke::config::StateConfig::default();
+        state
+            .conversation_workspaces
+            .push(sasuke::config::ConversationWorkspaceEntry {
+                project_id: "ws-a".to_string(),
+                workspace_path: "/ws-a".to_string(),
+                name: "Workspace A".to_string(),
+                added_at: "2025-01-01T00:00:00Z".to_string(),
+            });
+        state
+            .conversation_workspaces
+            .push(sasuke::config::ConversationWorkspaceEntry {
+                project_id: "ws-b".to_string(),
+                workspace_path: "/ws-b".to_string(),
+                name: "Workspace B".to_string(),
+                added_at: "2025-01-01T00:00:00Z".to_string(),
+            });
+        state.last_conversation_workspace = Some("ws-a".to_string());
+        state
+            .conversation_pins
+            .push(sasuke::config::ConversationPin {
+                project_id: "ws-a".to_string(),
+                task_id: "task-1".to_string(),
+                order: 0,
+            });
+        state
+            .conversation_pins
+            .push(sasuke::config::ConversationPin {
+                project_id: "ws-b".to_string(),
+                task_id: "task-2".to_string(),
+                order: 1,
+            });
+        state.conversation_run_modes.insert(
+            "ws-a".to_string(),
+            sasuke::config::ConversationRunModeEntry {
+                mode: sasuke::config::ConversationRunMode::Auto,
+                workflow_template_id: None,
+                optional_entry_preferences: Default::default(),
+                direct_config: None,
+                direct_preferences: Default::default(),
+                auto_config: None,
+            },
+        );
+
+        let removed = super::remove_workspace_from_state(&mut state, "ws-a").unwrap();
+
+        assert_eq!(removed.name, "Workspace A");
+        assert_eq!(state.conversation_workspaces.len(), 1);
+        assert_eq!(state.conversation_workspaces[0].project_id, "ws-b");
+        assert_eq!(state.conversation_pins.len(), 1);
+        assert_eq!(state.conversation_pins[0].project_id, "ws-b");
+        assert!(state.conversation_run_modes.get("ws-a").is_none());
+        assert_eq!(state.last_conversation_workspace.as_deref(), Some("ws-b"));
+    }
+}
