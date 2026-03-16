@@ -1,0 +1,2522 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+};
+
+use anyhow::{Context, Result};
+use camino::{Utf8Path, Utf8PathBuf};
+use sasuke::acp::client::DoctorDeadline;
+use sasuke::acp::commands::{
+    AcpCommandCatalog, AcpCommandItem, catalog_key, merge_command_sources, project_id,
+    scan_native_skill_commands,
+};
+use sasuke::acp::events::current_timestamp;
+use sasuke::app::ActiveMetricTurn;
+use sasuke::app::observability::{ExecutionObservabilityState, RuntimeLifecycleBus};
+use sasuke::app::{
+    App, NotificationDedup, ProviderDoctorProbe, RuntimeLifecycleEvent, RuntimeRecoveryCoordinator,
+};
+use sasuke::config::{
+    ManagedAgentConfig, ManagedAgentId, ProviderDiagnosticSnapshot, RuntimeConfig, SettingsConfig,
+    StateConfig,
+};
+use sasuke::process::recover_persisted_process_group;
+use sasuke::provider::DoctorResult;
+use sasuke::storage::{
+    SasukePaths, active_storage_path_config, load_settings_file, read_json, write_json,
+};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, warn};
+
+use crate::avatar::{complete_legacy_avatar_personalization, legacy_avatar_personalization};
+use crate::conversation_workspace::WorkspaceIdentityMigrator;
+use crate::updater::{UpdateInfoVm, UpdateStatusVm, initial_update_status};
+use crate::wallpaper::reconcile_wallpaper_personalization;
+
+#[derive(Debug, Clone)]
+pub struct DesktopContext {
+    pub repo_root: Utf8PathBuf,
+    pub config: RuntimeConfig,
+    pub recent_workspaces: Vec<String>,
+    pub needs_workspace: bool,
+}
+
+static PROJECT_MANIFEST_IO_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn provision_project_manifest_for_desktop(paths: &SasukePaths) -> Result<()> {
+    let result = paths.provision_project_manifest().map(|_| ());
+    if let Err(error) = &result
+        && let Some(io_error) = project_manifest_io_error(error)
+    {
+        let failure_count = PROJECT_MANIFEST_IO_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+        if failure_count.is_power_of_two() {
+            warn!(
+                project_id = %paths.project_id,
+                manifest_path = %paths.project_manifest_file(),
+                failure_count,
+                os_error_kind = ?io_error.kind(),
+                raw_os_error = ?io_error.raw_os_error(),
+                error = %error,
+                "project manifest write or commit failed"
+            );
+        }
+    }
+    result
+}
+
+fn project_manifest_io_error(error: &anyhow::Error) -> Option<&std::io::Error> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+}
+
+impl DesktopContext {
+    pub fn from_current_dir() -> Result<Self> {
+        let cwd = std::env::current_dir().context("failed to read current directory")?;
+        let cwd = Utf8PathBuf::from_path_buf(cwd)
+            .map_err(|_| anyhow::anyhow!("working directory is not valid UTF-8"))?;
+        Self::from_workspace(resolve_initial_workspace(&cwd))
+    }
+
+    pub fn from_workspace(repo_root: Utf8PathBuf) -> Result<Self> {
+        let resolved_repo_root = find_workspace_root(&repo_root);
+        let needs_workspace = resolved_repo_root.is_none();
+        let repo_root = resolved_repo_root.unwrap_or(repo_root);
+        let paths = SasukePaths::new(repo_root.clone());
+        let (settings, mut state) = load_configs(&paths)?;
+        WorkspaceIdentityMigrator::new(&paths)
+            .execute(
+                (!needs_workspace).then_some(repo_root.as_path()),
+                &mut state,
+            )
+            .map_err(|error| anyhow::anyhow!("{}: {error}", error.code()))?;
+        if !needs_workspace {
+            provision_project_manifest_for_desktop(&paths)?;
+        }
+        let config = RuntimeConfig::default()
+            .apply_settings(&settings)
+            .apply_state(&state);
+        let mut recent_workspaces = recent_workspaces(&state, &repo_root);
+        if needs_workspace {
+            recent_workspaces.retain(|w| w != repo_root.as_str());
+        }
+        Ok(Self {
+            repo_root,
+            config,
+            recent_workspaces,
+            needs_workspace,
+        })
+    }
+
+    pub fn app(&self) -> App {
+        App::with_config(self.repo_root.clone(), self.config.clone())
+    }
+}
+
+pub type AgentDiagnosticState = ProviderDiagnosticSnapshot;
+
+#[derive(Debug, Default)]
+pub struct ConversationWorkspaceRecoveryReport {
+    pub workspace_count: usize,
+    pub candidate_count: usize,
+    pub recovered_run_count: usize,
+    pub consumed_candidate_count: usize,
+    pub recovered_runs: Vec<RecoveredConversationRun>,
+    pub blocked_project_ids: BTreeSet<String>,
+    pub failures: Vec<ConversationWorkspaceRecoveryFailure>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecoveredConversationRun {
+    pub project_id: String,
+    pub task_id: String,
+    pub task_uuid: Option<String>,
+    pub run_id: String,
+    pub round_id: String,
+    pub node_id: String,
+    pub attempt_id: String,
+    pub status: sasuke::domain::RunStatus,
+    pub outcome: Option<sasuke::domain::RunOutcome>,
+}
+
+#[derive(Debug)]
+pub struct ConversationWorkspaceRecoveryFailure {
+    pub workspace_path: String,
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorRetryPolicy {
+    NoRetry,
+    RetryOnce,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum UpdateBadgeSeenTarget {
+    SettingsEntry,
+    SettingsAdvanced,
+    Announcement,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationAttentionInput {
+    pub window_focused: bool,
+    pub window_minimized: bool,
+    pub window_visible: bool,
+    pub project_id: Option<String>,
+    pub task_id: Option<String>,
+    pub run_id: Option<String>,
+    pub round_id: Option<String>,
+    pub node_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub outer_node_id: Option<String>,
+    pub outer_attempt_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NotificationAttentionTarget<'a> {
+    pub project_id: &'a str,
+    pub task_id: &'a str,
+    pub run_id: &'a str,
+    pub round_id: &'a str,
+    pub node_id: &'a str,
+    pub attempt_id: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct NotificationAttentionState {
+    window_focused: bool,
+    window_minimized: bool,
+    window_visible: bool,
+    project_id: Option<String>,
+    task_id: Option<String>,
+    run_id: Option<String>,
+    round_id: Option<String>,
+    node_id: Option<String>,
+    attempt_id: Option<String>,
+    outer_node_id: Option<String>,
+    outer_attempt_id: Option<String>,
+}
+
+impl Default for NotificationAttentionState {
+    fn default() -> Self {
+        Self {
+            window_focused: false,
+            window_minimized: true,
+            window_visible: false,
+            project_id: None,
+            task_id: None,
+            run_id: None,
+            round_id: None,
+            node_id: None,
+            attempt_id: None,
+            outer_node_id: None,
+            outer_attempt_id: None,
+        }
+    }
+}
+
+impl NotificationAttentionState {
+    fn update(&mut self, input: NotificationAttentionInput) {
+        self.window_focused = input.window_focused;
+        self.window_minimized = input.window_minimized;
+        self.window_visible = input.window_visible;
+        self.project_id = input.project_id;
+        self.task_id = input.task_id;
+        self.run_id = input.run_id;
+        self.round_id = input.round_id;
+        self.node_id = input.node_id;
+        self.attempt_id = input.attempt_id;
+        self.outer_node_id = input.outer_node_id;
+        self.outer_attempt_id = input.outer_attempt_id;
+    }
+
+    pub fn should_notify(
+        &self,
+        target: &NotificationAttentionTarget<'_>,
+        require_session_match: bool,
+    ) -> bool {
+        if !self.window_focused || self.window_minimized || !self.window_visible {
+            return true;
+        }
+        if self.project_id.as_deref() != Some(target.project_id)
+            || self.task_id.as_deref() != Some(target.task_id)
+            || self.run_id.as_deref() != Some(target.run_id)
+        {
+            return true;
+        }
+        if !require_session_match {
+            return false;
+        }
+        self.round_id.as_deref() != Some(target.round_id)
+            || self.node_id.as_deref() != Some(target.node_id)
+            || self.attempt_id.as_deref() != Some(target.attempt_id)
+    }
+}
+
+const MAX_CONCURRENT_AGENT_DIAGNOSTICS: usize = 4;
+
+#[derive(Default)]
+struct AgentDiagnosticRuns {
+    active: Mutex<BTreeSet<ManagedAgentId>>,
+    available: Condvar,
+}
+
+struct AgentDiagnosticGuard<'a> {
+    runs: &'a AgentDiagnosticRuns,
+    agent_id: ManagedAgentId,
+}
+
+impl AgentDiagnosticRuns {
+    fn acquire(&self, agent_id: &ManagedAgentId) -> Result<AgentDiagnosticGuard<'_>> {
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| anyhow::anyhow!("agent diagnostic lock poisoned"))?;
+        let mut active = self
+            .available
+            .wait_while(active, |active| {
+                active.contains(agent_id) || active.len() >= MAX_CONCURRENT_AGENT_DIAGNOSTICS
+            })
+            .map_err(|_| anyhow::anyhow!("agent diagnostic lock poisoned"))?;
+        active.insert(agent_id.clone());
+        Ok(AgentDiagnosticGuard {
+            runs: self,
+            agent_id: agent_id.clone(),
+        })
+    }
+}
+
+impl Drop for AgentDiagnosticGuard<'_> {
+    fn drop(&mut self) {
+        let mut active = self
+            .runs
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        active.remove(&self.agent_id);
+        self.runs.available.notify_all();
+    }
+}
+
+fn for_each_diagnostic_agent(agent_ids: &[ManagedAgentId], probe: impl Fn(&ManagedAgentId) + Sync) {
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..agent_ids.len().min(MAX_CONCURRENT_AGENT_DIAGNOSTICS) {
+            scope.spawn(|| {
+                while let Some(agent_id) = agent_ids.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    probe(agent_id);
+                }
+            });
+        }
+    });
+}
+
+pub struct DesktopState {
+    context: Mutex<DesktopContext>,
+    scheduled_service: Mutex<Option<Arc<crate::scheduled_service::ScheduledTaskService>>>,
+    scheduler_coordinator: Mutex<Option<crate::scheduled_runtime::SchedulerCoordinatorHandle>>,
+    scheduled_power: Mutex<
+        crate::scheduled_runtime::power::ScheduledPowerManager<
+            crate::scheduled_runtime::power::PlatformSleepInhibitor,
+        >,
+    >,
+    agent_diagnostics: Arc<Mutex<BTreeMap<ManagedAgentId, AgentDiagnosticState>>>,
+    agent_diagnostic_runs: AgentDiagnosticRuns,
+    agent_config_diagnostic_commit_lock: Mutex<()>,
+    scheduled_agent_diagnostics: Mutex<BTreeMap<ManagedAgentId, u64>>,
+    agent_command_catalogs: Mutex<BTreeMap<String, AcpCommandCatalog>>,
+    agent_command_update: Mutex<Option<Arc<dyn Fn(&AcpCommandCatalog) + Send + Sync>>>,
+    update_status: Mutex<UpdateStatusVm>,
+    pending_critical_update: Mutex<Option<Utf8PathBuf>>,
+    notification_attention: Mutex<NotificationAttentionState>,
+    conversation_attention_write_lock: Arc<Mutex<()>>,
+    /// 干预通知去重表（弹窗层统一管理，路径 A/B 共享同一实例）。
+    notification_dedup: Arc<NotificationDedup>,
+    lifecycle_bus: RuntimeLifecycleBus,
+    observability_states:
+        Arc<Mutex<std::collections::HashMap<String, ExecutionObservabilityState>>>,
+    active_metric_turns: Arc<Mutex<std::collections::HashMap<String, ActiveMetricTurn>>>,
+    runtime_recovery: Arc<RuntimeRecoveryCoordinator>,
+    /// MCP 服务器健康状态缓存（启动后台线程 + 手动诊断共同写入，列表读取）。
+    mcp_health: Mutex<BTreeMap<String, sasuke::config::McpServerState>>,
+    /// 进程级心跳上报器（由生命周期总线驱动六类 reason）。
+    heartbeat_reporter: Arc<crate::metrics::heartbeat::HeartbeatReporter>,
+}
+
+impl DesktopState {
+    pub fn new(context: DesktopContext) -> Self {
+        let persisted_diagnostics = load_persisted_agent_diagnostics(&context);
+        let persisted_command_catalogs = load_persisted_agent_command_catalogs(&context);
+        let updater_last_checked_at = context.config.desktop_updater_last_checked_at.clone();
+        let runtime_recovery = RuntimeRecoveryCoordinator::new(
+            SasukePaths::new(context.repo_root.clone()).core_db_path(),
+        );
+        Self {
+            context: Mutex::new(context),
+            scheduled_service: Mutex::new(None),
+            scheduler_coordinator: Mutex::new(None),
+            scheduled_power: Mutex::new(
+                crate::scheduled_runtime::power::ScheduledPowerManager::new(
+                    crate::scheduled_runtime::power::PlatformSleepInhibitor::default(),
+                ),
+            ),
+            agent_diagnostics: Arc::new(Mutex::new(persisted_diagnostics)),
+            agent_diagnostic_runs: AgentDiagnosticRuns::default(),
+            agent_config_diagnostic_commit_lock: Mutex::new(()),
+            scheduled_agent_diagnostics: Mutex::new(BTreeMap::new()),
+            agent_command_catalogs: Mutex::new(persisted_command_catalogs),
+            agent_command_update: Mutex::new(None),
+            update_status: Mutex::new(initial_update_status(updater_last_checked_at)),
+            pending_critical_update: Mutex::new(None),
+            notification_attention: Mutex::new(NotificationAttentionState::default()),
+            conversation_attention_write_lock: Arc::new(Mutex::new(())),
+            notification_dedup: Arc::new(NotificationDedup::new()),
+            lifecycle_bus: RuntimeLifecycleBus::new(),
+            observability_states: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            active_metric_turns: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            runtime_recovery,
+            mcp_health: Mutex::new(BTreeMap::new()),
+            heartbeat_reporter: crate::metrics::heartbeat::HeartbeatReporter::new(
+                env!("CARGO_PKG_VERSION").to_string(),
+            ),
+        }
+    }
+
+    /// 发布真实用户活动事实；heartbeat 由异步 metrics subscriber 投影。
+    pub fn record_heartbeat_activity(&self) -> Result<()> {
+        self.lifecycle_bus
+            .emit(RuntimeLifecycleEvent::UserActivityObserved);
+        Ok(())
+    }
+
+    /// 发布应用启动/配置重评估事实；reporter 保证每进程只交付一次 appStarted。
+    pub fn reevaluate_heartbeat_config(&self) -> Result<()> {
+        self.lifecycle_bus
+            .emit(RuntimeLifecycleEvent::ApplicationStarted);
+        Ok(())
+    }
+
+    pub(crate) fn record_heartbeat_reason(
+        &self,
+        reason: crate::metrics::heartbeat::HeartbeatReason,
+    ) -> Result<()> {
+        let config = self.context()?;
+        let settings = crate::metrics::heartbeat_settings(&config.config);
+        self.heartbeat_reporter.record(&settings, reason);
+        Ok(())
+    }
+
+    pub(crate) fn lifecycle_bus(&self) -> RuntimeLifecycleBus {
+        self.lifecycle_bus.clone()
+    }
+
+    pub(crate) fn runtime_recovery(&self) -> Arc<RuntimeRecoveryCoordinator> {
+        self.runtime_recovery.clone()
+    }
+
+    /// 读取 MCP 健康状态缓存快照（供列表 VM 附加展示）。
+    pub fn mcp_health_snapshot(
+        &self,
+    ) -> Result<BTreeMap<String, sasuke::config::McpServerState>> {
+        Ok(self
+            .mcp_health
+            .lock()
+            .map_err(|_| anyhow::anyhow!("mcp health lock poisoned"))?
+            .clone())
+    }
+
+    /// 写入/更新单个 MCP 服务器的健康状态（启动后台线程与诊断命令共用）。
+    pub fn record_mcp_health(
+        &self,
+        id: String,
+        state: sasuke::config::McpServerState,
+    ) -> Result<()> {
+        self.mcp_health
+            .lock()
+            .map_err(|_| anyhow::anyhow!("mcp health lock poisoned"))?
+            .insert(id, state);
+        Ok(())
+    }
+
+    /// 干预通知去重表（共享实例）。路径 A/B 与 dismiss 命令均经此访问。
+    pub fn notification_dedup(&self) -> Arc<NotificationDedup> {
+        self.notification_dedup.clone()
+    }
+
+    pub fn update_notification_attention(&self, input: NotificationAttentionInput) -> Result<()> {
+        self.notification_attention
+            .lock()
+            .map_err(|_| anyhow::anyhow!("notification attention lock poisoned"))?
+            .update(input);
+        Ok(())
+    }
+
+    pub fn should_send_notification(
+        &self,
+        target: &NotificationAttentionTarget<'_>,
+        require_session_match: bool,
+    ) -> bool {
+        self.notification_attention
+            .lock()
+            .map(|state| state.should_notify(target, require_session_match))
+            .unwrap_or(true)
+    }
+
+    pub fn conversation_attention_write_guard(&self) -> Result<MutexGuard<'_, ()>> {
+        self.conversation_attention_write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("conversation attention write lock poisoned"))
+    }
+
+    pub fn conversation_attention_write_lock(&self) -> Arc<Mutex<()>> {
+        self.conversation_attention_write_lock.clone()
+    }
+
+    pub fn app(&self) -> Result<App> {
+        let context = self
+            .context
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?
+            .clone();
+        let diagnostics = self.agent_diagnostics.clone();
+        let metrics_enabled = crate::metrics::core_metrics_collection_enabled(&context.config);
+        Ok(App::with_config(context.repo_root, context.config)
+            .with_lifecycle_bus(self.lifecycle_bus.clone())
+            .with_observability_states(self.observability_states.clone())
+            .with_active_metric_turns(self.active_metric_turns.clone())
+            .with_runtime_recovery(self.runtime_recovery.clone())
+            .with_metrics_collection_enabled(metrics_enabled)
+            .with_provider_diagnostics_source(Arc::new(move || {
+                Ok(diagnostics
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?
+                    .iter()
+                    .map(|(agent_type, diagnostic)| {
+                        (agent_type.as_str().to_string(), diagnostic.clone())
+                    })
+                    .collect())
+            })))
+    }
+
+    pub fn recover_interrupted_conversation_workspaces(
+        &self,
+    ) -> Result<ConversationWorkspaceRecoveryReport> {
+        let base_app = self.app()?;
+        self.recover_interrupted_conversation_workspaces_with_app(&base_app)
+    }
+
+    #[cfg(test)]
+    fn recover_interrupted_conversation_workspaces_from_candidates(
+        &self,
+    ) -> Result<ConversationWorkspaceRecoveryReport> {
+        let base_app = self.app()?;
+        self.recover_interrupted_conversation_workspaces_with_app(&base_app)
+    }
+
+    fn recover_interrupted_conversation_workspaces_with_app(
+        &self,
+        base_app: &App,
+    ) -> Result<ConversationWorkspaceRecoveryReport> {
+        let mut seen_workspaces = BTreeSet::new();
+        let mut report = ConversationWorkspaceRecoveryReport::default();
+        let candidates = self.runtime_recovery.list_persisted_candidates()?;
+        report.candidate_count = candidates.len();
+
+        for candidate in candidates {
+            let workspace_path = candidate.workspace_path.trim();
+            let repo_root = Utf8PathBuf::from(workspace_path);
+            let paths = SasukePaths::new(repo_root.clone());
+            seen_workspaces.insert(candidate.project_id.clone());
+            if workspace_path.is_empty()
+                || paths.project_id != candidate.project_id
+                || !repo_root.is_dir()
+                || paths.validate_project_manifest().is_err()
+            {
+                report
+                    .blocked_project_ids
+                    .insert(candidate.project_id.clone());
+                report.failures.push(ConversationWorkspaceRecoveryFailure {
+                    workspace_path: candidate.workspace_path.clone(),
+                    code: "runtime.recovery-candidate-workspace-invalid",
+                    message: "runtime recovery candidate workspace identity is unavailable"
+                        .to_string(),
+                });
+                continue;
+            }
+
+            let workspace_app = base_app.with_repo_root(repo_root, base_app.config.clone());
+            let run_path = workspace_app
+                .paths
+                .run_file(&candidate.task_id, &candidate.run_id);
+            if !run_path.is_file() {
+                self.consume_runtime_recovery_candidate(&candidate, &mut report);
+                continue;
+            }
+            match workspace_app.run_status(&candidate.task_id, &candidate.run_id) {
+                Ok(run) if run.status != sasuke::domain::RunStatus::Running => {
+                    self.consume_runtime_recovery_candidate(&candidate, &mut report);
+                }
+                Ok(run)
+                    if run.execution.recovery_candidate_token.as_deref()
+                        != Some(candidate.candidate_token.as_str()) =>
+                {
+                    self.consume_runtime_recovery_candidate(&candidate, &mut report);
+                }
+                Ok(_) => match workspace_app.run_pause(
+                    &candidate.task_id,
+                    &candidate.run_id,
+                    sasuke::domain::PauseReason::ProcessInterrupted,
+                ) {
+                    Ok(recovered) => {
+                        report.recovered_run_count += 1;
+                        report.recovered_runs.push(RecoveredConversationRun {
+                            project_id: candidate.project_id.clone(),
+                            task_id: candidate.task_id.clone(),
+                            task_uuid: recovered.task_uuid.clone(),
+                            run_id: candidate.run_id.clone(),
+                            round_id: recovered.current_round.unwrap_or_default(),
+                            node_id: recovered.current_node.unwrap_or_default(),
+                            attempt_id: recovered.current_attempt.unwrap_or_default(),
+                            status: recovered.status,
+                            outcome: recovered.outcome,
+                        });
+                        self.consume_runtime_recovery_candidate(&candidate, &mut report);
+                    }
+                    Err(error) => {
+                        report
+                            .blocked_project_ids
+                            .insert(candidate.project_id.clone());
+                        report.failures.push(ConversationWorkspaceRecoveryFailure {
+                            workspace_path: candidate.workspace_path.clone(),
+                            code: "runtime.workspace-recovery-failed",
+                            message: format!("{error:#}"),
+                        });
+                    }
+                },
+                Err(error) => {
+                    report
+                        .blocked_project_ids
+                        .insert(candidate.project_id.clone());
+                    report.failures.push(ConversationWorkspaceRecoveryFailure {
+                        workspace_path: candidate.workspace_path.clone(),
+                        code: "runtime.workspace-recovery-failed",
+                        message: format!("{error:#}"),
+                    });
+                }
+            }
+        }
+
+        report.workspace_count = seen_workspaces.len();
+
+        Ok(report)
+    }
+
+    fn consume_runtime_recovery_candidate(
+        &self,
+        candidate: &sasuke::storage::core_state::RuntimeRecoveryCandidate,
+        report: &mut ConversationWorkspaceRecoveryReport,
+    ) {
+        match self.runtime_recovery.consume_persisted_candidate(candidate) {
+            Ok(true) => report.consumed_candidate_count += 1,
+            Ok(false) => {}
+            Err(error) => {
+                report
+                    .blocked_project_ids
+                    .insert(candidate.project_id.clone());
+                report.failures.push(ConversationWorkspaceRecoveryFailure {
+                    workspace_path: candidate.workspace_path.clone(),
+                    code: "runtime.recovery-candidate-consume-failed",
+                    message: format!("{error:#}"),
+                });
+            }
+        }
+    }
+
+    pub fn provider_diagnostic_snapshots(
+        &self,
+    ) -> Result<BTreeMap<String, ProviderDiagnosticSnapshot>> {
+        Ok(self
+            .agent_diagnostics
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?
+            .iter()
+            .map(|(agent_type, diagnostic)| (agent_type.as_str().to_string(), diagnostic.clone()))
+            .collect())
+    }
+
+    pub fn context(&self) -> Result<DesktopContext> {
+        Ok(self
+            .context
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?
+            .clone())
+    }
+
+    pub fn install_scheduled_service(
+        &self,
+        service: Arc<crate::scheduled_service::ScheduledTaskService>,
+    ) -> Result<()> {
+        *self
+            .scheduled_service
+            .lock()
+            .map_err(|_| anyhow::anyhow!("scheduled service lock poisoned"))? = Some(service);
+        Ok(())
+    }
+
+    pub fn scheduled_service(&self) -> Result<Arc<crate::scheduled_service::ScheduledTaskService>> {
+        self.scheduled_service
+            .lock()
+            .map_err(|_| anyhow::anyhow!("scheduled service lock poisoned"))?
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("scheduled service is not initialized"))
+    }
+
+    pub fn install_scheduler_coordinator(
+        &self,
+        coordinator: crate::scheduled_runtime::SchedulerCoordinatorHandle,
+    ) -> Result<()> {
+        *self
+            .scheduler_coordinator
+            .lock()
+            .map_err(|_| anyhow::anyhow!("scheduler coordinator lock poisoned"))? =
+            Some(coordinator);
+        Ok(())
+    }
+
+    pub fn scheduler_coordinator(
+        &self,
+    ) -> Result<crate::scheduled_runtime::SchedulerCoordinatorHandle> {
+        self.scheduler_coordinator
+            .lock()
+            .map_err(|_| anyhow::anyhow!("scheduler coordinator lock poisoned"))?
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("scheduler coordinator is not initialized"))
+    }
+
+    pub fn reconcile_scheduled_power(
+        &self,
+        enabled_job_count: usize,
+        app_is_running: bool,
+    ) -> Result<crate::scheduled_runtime::power::ScheduledPowerStatus> {
+        let keep_awake_enabled = self
+            .context
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?
+            .config
+            .scheduled_keep_awake_enabled;
+        Ok(self
+            .scheduled_power
+            .lock()
+            .map_err(|_| anyhow::anyhow!("scheduled power lock poisoned"))?
+            .reconcile(keep_awake_enabled, enabled_job_count, app_is_running))
+    }
+
+    pub fn reconcile_scheduled_power_setting(
+        &self,
+    ) -> Result<crate::scheduled_runtime::power::ScheduledPowerStatus> {
+        let enabled_job_count = self.scheduled_power_status()?.enabled_job_count;
+        self.reconcile_scheduled_power(enabled_job_count, true)
+    }
+
+    pub fn scheduled_power_status(
+        &self,
+    ) -> Result<crate::scheduled_runtime::power::ScheduledPowerStatus> {
+        Ok(self
+            .scheduled_power
+            .lock()
+            .map_err(|_| anyhow::anyhow!("scheduled power lock poisoned"))?
+            .status())
+    }
+
+    pub fn update_settings_config(&self, settings: &SettingsConfig) -> Result<()> {
+        let mut guard = self
+            .context
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?;
+        let state: StateConfig =
+            read_json(&SasukePaths::new(guard.repo_root.clone()).user_state_file())
+                .unwrap_or_default();
+        guard.config = RuntimeConfig::default()
+            .apply_settings(settings)
+            .apply_state(&state);
+        drop(guard);
+        self.prune_agent_diagnostics()?;
+        if let Ok(coordinator) = self.scheduler_coordinator() {
+            let _ = coordinator.send(crate::scheduled_runtime::SchedulerCommand::SettingsChanged);
+        }
+        Ok(())
+    }
+
+    pub fn agent_diagnostics(&self) -> Result<BTreeMap<ManagedAgentId, AgentDiagnosticState>> {
+        Ok(self
+            .agent_diagnostics
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?
+            .clone())
+    }
+
+    pub fn update_status(&self) -> Result<UpdateStatusVm> {
+        Ok(self
+            .update_status
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?
+            .clone())
+    }
+
+    pub fn set_update_status(&self, status: UpdateStatusVm) -> Result<()> {
+        *self
+            .update_status
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))? = status;
+        Ok(())
+    }
+
+    pub fn store_pending_update(&self, path: Utf8PathBuf) -> Result<()> {
+        self.pending_critical_update
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?
+            .replace(path);
+        Ok(())
+    }
+
+    pub fn pending_update_path(&self) -> Result<Option<Utf8PathBuf>> {
+        Ok(self
+            .pending_critical_update
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?
+            .clone())
+    }
+
+    pub fn take_pending_update(&self) -> Option<Utf8PathBuf> {
+        self.pending_critical_update
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+    }
+
+    pub fn persist_updater_last_checked_at(&self, checked_at: Option<String>) -> Result<()> {
+        let mut guard = self
+            .context
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?;
+        let app = guard.app();
+        let state = app.set_user_desktop_updater_last_checked_at(checked_at)?;
+        guard.config = guard.config.clone().apply_state(&state);
+        Ok(())
+    }
+
+    pub fn mark_update_badge_seen(
+        &self,
+        target: UpdateBadgeSeenTarget,
+        version: String,
+    ) -> Result<RuntimeConfig> {
+        let mut guard = self
+            .context
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?;
+        let app = guard.app();
+        let mut next_badges = guard.config.desktop_update_badges.clone();
+        match target {
+            UpdateBadgeSeenTarget::SettingsEntry => {
+                next_badges.settings_entry_seen_version = Some(version);
+            }
+            UpdateBadgeSeenTarget::SettingsAdvanced => {
+                next_badges.settings_advanced_seen_version = Some(version);
+            }
+            UpdateBadgeSeenTarget::Announcement => {
+                next_badges.announcement_closed_version = Some(version);
+            }
+        }
+        let state = app.set_user_desktop_update_badges(next_badges)?;
+        guard.config = guard.config.clone().apply_state(&state);
+        Ok(guard.config.clone())
+    }
+
+    pub fn persist_available_update(&self, update: Option<UpdateInfoVm>) -> Result<RuntimeConfig> {
+        let mut guard = self
+            .context
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?;
+        let app = guard.app();
+        let available_update = update.map(|update| sasuke::config::DesktopAvailableUpdate {
+            version: update.version,
+            current_version: update.current_version,
+            notes: update.notes,
+            pub_date: update.pub_date,
+        });
+        let state = app.set_user_desktop_available_update(available_update)?;
+        guard.config = guard.config.clone().apply_state(&state);
+        Ok(guard.config.clone())
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_agent_diagnostics(&self) -> Result<()> {
+        let snapshot = {
+            let mut diagnostics = self
+                .agent_diagnostics
+                .lock()
+                .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?;
+            diagnostics.clear();
+            diagnostics.clone()
+        };
+        self.persist_agent_diagnostics(&snapshot)
+    }
+
+    pub fn clear_agent_diagnostic(&self, agent_id: &ManagedAgentId) -> Result<()> {
+        let snapshot = {
+            let mut diagnostics = self
+                .agent_diagnostics
+                .lock()
+                .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?;
+            diagnostics.remove(agent_id);
+            diagnostics.clone()
+        };
+        self.persist_agent_diagnostics(&snapshot)
+    }
+
+    pub fn prune_agent_diagnostics(&self) -> Result<()> {
+        let managed_agent_ids = self
+            .app()?
+            .managed_agents()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let snapshot = {
+            let mut diagnostics = self
+                .agent_diagnostics
+                .lock()
+                .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?;
+            diagnostics.retain(|agent_id, _| managed_agent_ids.contains(agent_id));
+            diagnostics.clone()
+        };
+        self.persist_agent_diagnostics(&snapshot)?;
+        let catalogs = {
+            let mut catalogs = self
+                .agent_command_catalogs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?;
+            catalogs.retain(|_, catalog| {
+                ManagedAgentId::from_str(&catalog.agent_type)
+                    .ok()
+                    .is_some_and(|agent_id| managed_agent_ids.contains(&agent_id))
+            });
+            catalogs.clone()
+        };
+        self.persist_agent_command_catalogs(&catalogs)
+    }
+
+    pub fn cleanup_agent_diagnostic_processes(&self) -> Result<()> {
+        let repo_root = self.context()?.repo_root;
+        let doctor_acp_root = SasukePaths::new(repo_root).doctor_acp_root_dir();
+        for pid_path in doctor_provider_pid_files(&doctor_acp_root) {
+            if let Some(pid) = std::fs::read_to_string(pid_path.as_std_path())
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+            {
+                let _ = recover_persisted_process_group(pid);
+            }
+            let _ = std::fs::remove_file(pid_path.as_std_path());
+        }
+        Ok(())
+    }
+
+    fn agent_diagnostic_guard(
+        &self,
+        agent_id: &ManagedAgentId,
+    ) -> Result<AgentDiagnosticGuard<'_>> {
+        self.agent_diagnostic_runs.acquire(agent_id)
+    }
+
+    pub fn agent_config_diagnostic_commit_guard(&self) -> Result<MutexGuard<'_, ()>> {
+        self.agent_config_diagnostic_commit_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("agent config/diagnostic commit lock poisoned"))
+    }
+
+    pub fn queue_agent_diagnostic(&self, agent_id: &ManagedAgentId) -> Result<bool> {
+        let mut scheduled = self
+            .scheduled_agent_diagnostics
+            .lock()
+            .map_err(|_| anyhow::anyhow!("agent diagnostic schedule lock poisoned"))?;
+        if let Some(generation) = scheduled.get_mut(agent_id) {
+            *generation = generation.saturating_add(1);
+            Ok(false)
+        } else {
+            scheduled.insert(agent_id.clone(), 1);
+            Ok(true)
+        }
+    }
+
+    pub fn cancel_queued_agent_diagnostic(&self, agent_id: &ManagedAgentId) -> Result<()> {
+        self.scheduled_agent_diagnostics
+            .lock()
+            .map_err(|_| anyhow::anyhow!("agent diagnostic schedule lock poisoned"))?
+            .remove(agent_id);
+        Ok(())
+    }
+
+    pub fn run_queued_agent_diagnostic(
+        &self,
+        agent_id: &ManagedAgentId,
+    ) -> Result<AgentDiagnosticState> {
+        loop {
+            let requested_generation = self
+                .scheduled_agent_diagnostics
+                .lock()
+                .map_err(|_| anyhow::anyhow!("agent diagnostic schedule lock poisoned"))?
+                .get(agent_id)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("agent diagnostic request was cancelled"))?;
+            let result = self.refresh_agent_diagnostic(agent_id);
+            let should_retry = {
+                let mut scheduled = self
+                    .scheduled_agent_diagnostics
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("agent diagnostic schedule lock poisoned"))?;
+                match scheduled.get(agent_id).copied() {
+                    Some(current_generation) if current_generation != requested_generation => true,
+                    Some(_) => {
+                        scheduled.remove(agent_id);
+                        false
+                    }
+                    None => false,
+                }
+            };
+            if should_retry {
+                continue;
+            }
+            return result;
+        }
+    }
+
+    pub fn refresh_agent_diagnostic(
+        &self,
+        agent_id: &ManagedAgentId,
+    ) -> Result<AgentDiagnosticState> {
+        self.refresh_agent_diagnostic_with_probe(agent_id, |app, agent_id| {
+            doctor_probe_with_retry(DoctorRetryPolicy::NoRetry, |deadline| {
+                app.provider_doctor_probe_with_deadline(agent_id.as_str(), deadline)
+            })
+        })
+    }
+
+    fn refresh_background_agent_diagnostic(
+        &self,
+        agent_id: &ManagedAgentId,
+    ) -> Result<AgentDiagnosticState> {
+        self.refresh_agent_diagnostic_with_probe(agent_id, |app, agent_id| {
+            doctor_probe_with_retry(DoctorRetryPolicy::RetryOnce, |deadline| {
+                app.provider_doctor_probe_with_deadline(agent_id.as_str(), deadline)
+            })
+        })
+    }
+
+    fn refresh_agent_diagnostic_with_probe(
+        &self,
+        agent_id: &ManagedAgentId,
+        probe: impl FnOnce(&App, &ManagedAgentId) -> Result<ProviderDoctorProbe>,
+    ) -> Result<AgentDiagnosticState> {
+        let _run_guard = self.agent_diagnostic_guard(agent_id)?;
+        let expected_config = self.managed_agent_config_revision(agent_id)?;
+        let app = self.app()?;
+        let probe = probe(&app, agent_id)?;
+        let _commit_guard = self.agent_config_diagnostic_commit_guard()?;
+        if self.managed_agent_config_revision(agent_id)? != expected_config {
+            anyhow::bail!("agent configuration changed during diagnostic");
+        }
+        if probe.doctor.available {
+            self.record_agent_commands(agent_id, &app.paths.repo_root, probe.commands.clone())?;
+        }
+        let diagnostic = diagnostic_state_from_result(probe.doctor);
+        let snapshot = {
+            let mut diagnostics = self
+                .agent_diagnostics
+                .lock()
+                .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?;
+            diagnostics.insert(agent_id.clone(), diagnostic.clone());
+            diagnostics.clone()
+        };
+        self.persist_agent_diagnostics(&snapshot)?;
+        Ok(diagnostic)
+    }
+
+    pub fn refresh_all_agent_diagnostics(
+        &self,
+        on_completed: impl Fn(&ManagedAgentId) + Sync,
+    ) -> Result<()> {
+        let app = self.app()?;
+        let agent_ids = app.managed_agents().keys().cloned().collect::<Vec<_>>();
+        let scheduled = self
+            .scheduled_agent_diagnostics
+            .lock()
+            .map_err(|_| anyhow::anyhow!("agent diagnostic schedule lock poisoned"))?
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let to_probe = agent_ids
+            .into_iter()
+            .filter(|agent_id| !scheduled.contains(agent_id))
+            .collect::<Vec<_>>();
+        debug!(
+            agent_count = to_probe.len(),
+            scheduled_count = scheduled.len(),
+            "periodic agent diagnostics started"
+        );
+        if to_probe.is_empty() {
+            let _commit_guard = self.agent_config_diagnostic_commit_guard()?;
+            return self.prune_agent_diagnostics();
+        }
+        for_each_diagnostic_agent(&to_probe, |agent_id| {
+            match self.refresh_background_agent_diagnostic(agent_id) {
+                Ok(diagnostic) => {
+                    on_completed(agent_id);
+                    debug!(
+                        agent_type = agent_id.as_str(),
+                        available = diagnostic.available,
+                        "periodic agent diagnostic completed"
+                    );
+                }
+                Err(error) => warn!(
+                    agent_type = agent_id.as_str(),
+                    %error,
+                    "periodic agent diagnostic infrastructure failed"
+                ),
+            }
+        });
+        let _commit_guard = self.agent_config_diagnostic_commit_guard()?;
+        self.prune_agent_diagnostics()
+    }
+
+    fn managed_agent_config_revision(&self, agent_id: &ManagedAgentId) -> Result<Option<Vec<u8>>> {
+        self.context()?
+            .config
+            .agents
+            .get(agent_id)
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub fn agent_command_catalog(
+        &self,
+        agent_id: &ManagedAgentId,
+        workspace: &Utf8Path,
+    ) -> Result<Option<AcpCommandCatalog>> {
+        let project_id = project_id(workspace);
+        let key = catalog_key(agent_id.as_str(), &project_id);
+        let policy = self
+            .context()?
+            .config
+            .agents
+            .get(agent_id)
+            .map(ManagedAgentConfig::skill_directory_policy);
+        // The persisted catalog is an ACP-command cache, not the authority for
+        // filesystem-visible Skills. A provider can run in a fresh worktree
+        // that has never been probed, so a cache miss must still project the
+        // Skills visible from that physical workspace. Clone under the lock
+        // and perform the directory scan after releasing it.
+        let cached = self
+            .agent_command_catalogs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?
+            .get(&key)
+            .cloned();
+        let raw_commands = cached
+            .as_ref()
+            .map(|catalog| {
+                // Old persisted catalogs without acp_commands can only use the
+                // merged command list until the next Doctor refresh.
+                catalog
+                    .acp_commands
+                    .as_ref()
+                    .unwrap_or(&catalog.commands)
+                    .clone()
+            })
+            .unwrap_or_default();
+        if policy.is_none() && cached.is_none() {
+            return Ok(None);
+        }
+        let skill_commands = policy
+            .as_ref()
+            .map(|policy| scan_native_skill_commands(policy, workspace))
+            .unwrap_or_default();
+        let commands = merge_command_sources(raw_commands.clone(), skill_commands.clone());
+        let catalog = AcpCommandCatalog {
+            agent_type: agent_id.as_str().to_string(),
+            project_id,
+            acp_commands: Some(raw_commands),
+            skill_commands: Some(skill_commands),
+            commands,
+            updated_at: cached
+                .map(|catalog| catalog.updated_at)
+                .unwrap_or_else(current_timestamp),
+        };
+        Ok(Some(catalog))
+    }
+
+    pub fn set_agent_command_update(
+        &self,
+        callback: impl Fn(&AcpCommandCatalog) + Send + Sync + 'static,
+    ) {
+        *self.agent_command_update.lock().unwrap() = Some(Arc::new(callback));
+    }
+
+    pub fn record_agent_commands(
+        &self,
+        agent_id: &ManagedAgentId,
+        workspace: &Utf8Path,
+        commands: Vec<AcpCommandItem>,
+    ) -> Result<AcpCommandCatalog> {
+        let acp_commands = commands;
+        let skill_commands = self
+            .context()?
+            .config
+            .agents
+            .get(agent_id)
+            .map(|config| scan_native_skill_commands(&config.skill_directory_policy(), workspace))
+            .unwrap_or_default();
+        let commands = merge_command_sources(acp_commands.clone(), skill_commands.clone());
+        let project_id = project_id(workspace);
+        let catalog = AcpCommandCatalog {
+            agent_type: agent_id.as_str().to_string(),
+            project_id: project_id.clone(),
+            acp_commands: Some(acp_commands),
+            skill_commands: Some(skill_commands),
+            commands,
+            updated_at: current_timestamp(),
+        };
+        let mut catalogs = self
+            .agent_command_catalogs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?;
+        let key = catalog_key(agent_id.as_str(), &project_id);
+        if let Some(previous) = catalogs.get(&key)
+            && previous.acp_commands == catalog.acp_commands
+            && previous.skill_commands == catalog.skill_commands
+            && previous.commands == catalog.commands
+        {
+            return Ok(previous.clone());
+        }
+        let mut next = catalogs.clone();
+        next.insert(key, catalog.clone());
+        while next.len() > 256 {
+            let oldest = next
+                .iter()
+                .min_by_key(|(_, catalog)| catalog.updated_at.as_str())
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else {
+                break;
+            };
+            next.remove(&oldest);
+        }
+        self.persist_agent_command_catalogs(&next)?;
+        *catalogs = next;
+        drop(catalogs);
+        let callback = self.agent_command_update.lock().unwrap().clone();
+        if let Some(callback) = callback {
+            callback(&catalog);
+        }
+        Ok(catalog)
+    }
+
+    pub fn refresh_agent_command_catalog_for_workspace(
+        &self,
+        agent_id: &ManagedAgentId,
+        workspace: Utf8PathBuf,
+    ) -> Result<()> {
+        let _run_guard = self.agent_diagnostic_guard(agent_id)?;
+        let expected_config = self.managed_agent_config_revision(agent_id)?;
+        let config = self.context()?.config;
+        let app = App::with_config(workspace, config);
+        let probe = app.provider_doctor_probe(agent_id.as_str())?;
+        let _commit_guard = self.agent_config_diagnostic_commit_guard()?;
+        if self.managed_agent_config_revision(agent_id)? != expected_config {
+            anyhow::bail!("agent configuration changed during command catalog refresh");
+        }
+        if probe.doctor.available {
+            self.record_agent_commands(agent_id, &app.paths.repo_root, probe.commands)?;
+        }
+        Ok(())
+    }
+
+    pub fn refresh_all_agent_command_catalogs_for_workspace(
+        &self,
+        workspace: Utf8PathBuf,
+    ) -> Result<()> {
+        let config = self.context()?.config;
+        let app = App::with_config(workspace.clone(), config);
+        let agent_ids = app.managed_agents().keys().cloned().collect::<Vec<_>>();
+        for_each_diagnostic_agent(&agent_ids, |agent_id| {
+            if let Err(error) =
+                self.refresh_agent_command_catalog_for_workspace(agent_id, workspace.clone())
+            {
+                warn!(
+                    agent_type = agent_id.as_str(),
+                    %workspace,
+                    %error,
+                    "periodic agent command catalog refresh failed"
+                );
+            }
+        });
+        Ok(())
+    }
+
+    pub fn refresh_agent_command_catalogs_for_active_workspaces(&self) -> Result<()> {
+        let context = self.context()?;
+        let app = context.app();
+        let persisted_state = app.load_state()?;
+        let current_project_id = project_id(&context.repo_root);
+        let mut workspaces = std::collections::BTreeSet::new();
+        if let Some(active_project_id) = persisted_state.last_conversation_workspace.as_deref() {
+            if let Some(active_workspace) = persisted_state
+                .conversation_workspaces
+                .iter()
+                .find(|workspace| workspace.project_id == active_project_id)
+            {
+                let active_workspace = Utf8PathBuf::from(&active_workspace.workspace_path);
+                if project_id(&active_workspace) != current_project_id {
+                    workspaces.insert(active_workspace);
+                }
+            }
+        }
+        for workspace in workspaces {
+            self.refresh_all_agent_command_catalogs_for_workspace(workspace)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_workspace(&self, repo_root: Utf8PathBuf) -> Result<DesktopContext> {
+        let repo_root = find_workspace_root(&repo_root).unwrap_or(repo_root);
+        provision_project_manifest_for_desktop(&SasukePaths::new(repo_root.clone()))?;
+        let next_context = {
+            let mut guard = self
+                .context
+                .lock()
+                .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?;
+            let app = App::with_config(repo_root.clone(), guard.config.clone());
+            let workspace = repo_root.to_string();
+            let state = app.record_user_recent_desktop_workspace(&workspace)?;
+            let settings = app.load_settings()?;
+            guard.repo_root = repo_root;
+            guard.config = RuntimeConfig::default()
+                .apply_settings(&settings)
+                .apply_state(&state);
+            guard.recent_workspaces = recent_workspaces(&state, &guard.repo_root);
+            guard.needs_workspace = false;
+            guard.clone()
+        };
+        let persisted_diagnostics = load_persisted_agent_diagnostics(&next_context);
+        *self
+            .agent_diagnostics
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))? = persisted_diagnostics;
+        *self
+            .update_status
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))? =
+            initial_update_status(next_context.config.desktop_updater_last_checked_at.clone());
+        Ok(next_context)
+    }
+
+    pub fn remove_recent_workspace(&self, workspace: &str) -> Result<DesktopContext> {
+        let mut guard = self
+            .context
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop state lock poisoned"))?;
+        let app = guard.app();
+        let state = app.remove_user_recent_desktop_workspace(workspace)?;
+        guard.config = guard.config.clone().apply_state(&state);
+        guard.recent_workspaces = recent_workspaces(&state, &guard.repo_root);
+        if guard.needs_workspace {
+            let current = guard.repo_root.to_string();
+            guard.recent_workspaces.retain(|w| w != &current);
+        }
+        Ok(guard.clone())
+    }
+
+    fn persist_agent_diagnostics(
+        &self,
+        diagnostics: &BTreeMap<ManagedAgentId, AgentDiagnosticState>,
+    ) -> Result<()> {
+        let repo_root = self.context()?.repo_root;
+        let path = SasukePaths::new(repo_root).agent_diagnostics_file();
+        write_json(&path, diagnostics)
+    }
+
+    fn persist_agent_command_catalogs(
+        &self,
+        catalogs: &BTreeMap<String, AcpCommandCatalog>,
+    ) -> Result<()> {
+        let repo_root = self.context()?.repo_root;
+        let path = SasukePaths::new(repo_root).agent_command_catalogs_file();
+        let persisted = catalogs
+            .values()
+            .map(|catalog| {
+                let mut catalog = catalog.clone();
+                catalog.skill_commands = None;
+                catalog
+            })
+            .collect::<Vec<_>>();
+        write_json(&path, &persisted)
+    }
+}
+
+fn diagnostic_state_from_result(result: DoctorResult) -> AgentDiagnosticState {
+    ProviderDiagnosticSnapshot {
+        available: result.available,
+        reason: result.reason,
+        checked_at: current_timestamp(),
+        capabilities: result.capabilities,
+    }
+}
+
+fn doctor_probe_with_retry(
+    retry_policy: DoctorRetryPolicy,
+    probe: impl FnMut(DoctorDeadline) -> Result<ProviderDoctorProbe>,
+) -> Result<ProviderDoctorProbe> {
+    doctor_probe_with_retry_until(retry_policy, DoctorDeadline::default(), probe)
+}
+
+fn doctor_probe_with_retry_until(
+    retry_policy: DoctorRetryPolicy,
+    deadline: DoctorDeadline,
+    mut probe: impl FnMut(DoctorDeadline) -> Result<ProviderDoctorProbe>,
+) -> Result<ProviderDoctorProbe> {
+    let first = probe(deadline)?;
+    if first.doctor.available || retry_policy == DoctorRetryPolicy::NoRetry || deadline.is_expired()
+    {
+        return Ok(first);
+    }
+    probe(deadline)
+}
+
+fn doctor_provider_pid_files(doctor_acp_root: &Utf8Path) -> Vec<Utf8PathBuf> {
+    let mut pid_files = Vec::new();
+    let legacy_pid = doctor_acp_root.join("provider.pid");
+    if legacy_pid.is_file() {
+        pid_files.push(legacy_pid);
+    }
+    let Ok(entries) = std::fs::read_dir(doctor_acp_root.as_std_path()) else {
+        return pid_files;
+    };
+    for entry in entries.flatten() {
+        let Ok(path) = Utf8PathBuf::from_path_buf(entry.path()) else {
+            continue;
+        };
+        let pid_path = path.join("provider.pid");
+        if pid_path.is_file() {
+            pid_files.push(pid_path);
+        }
+    }
+    pid_files.sort();
+    pid_files
+}
+
+fn load_persisted_agent_diagnostics(
+    context: &DesktopContext,
+) -> BTreeMap<ManagedAgentId, AgentDiagnosticState> {
+    read_json(&SasukePaths::new(context.repo_root.clone()).agent_diagnostics_file())
+        .unwrap_or_default()
+}
+
+fn load_persisted_agent_command_catalogs(
+    context: &DesktopContext,
+) -> BTreeMap<String, AcpCommandCatalog> {
+    read_json::<Vec<AcpCommandCatalog>>(
+        &SasukePaths::new(context.repo_root.clone()).agent_command_catalogs_file(),
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .map(|catalog| {
+        (
+            catalog_key(&catalog.agent_type, &catalog.project_id),
+            catalog,
+        )
+    })
+    .collect()
+}
+
+fn resolve_initial_workspace(cwd: &Utf8Path) -> Utf8PathBuf {
+    find_workspace_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
+}
+
+fn find_workspace_root(start: &Utf8Path) -> Option<Utf8PathBuf> {
+    nearest_parent_containing(start, ".git")
+        .or_else(|| nearest_parent_containing(start, active_storage_path_config().config_dir_name))
+}
+
+fn nearest_parent_containing(start: &Utf8Path, marker: &str) -> Option<Utf8PathBuf> {
+    let mut current = start;
+    loop {
+        if current.join(marker).is_dir() {
+            return Some(current.to_path_buf());
+        }
+        current = current.parent()?;
+    }
+}
+
+fn load_configs(paths: &SasukePaths) -> Result<(SettingsConfig, StateConfig)> {
+    let mut settings = load_settings_file(&paths.user_settings_file())?;
+    let mut settings_changed = false;
+    let mut avatar_migrated = false;
+    if let Some(personalization) = settings.personalization.as_mut() {
+        avatar_migrated =
+            legacy_avatar_personalization(&paths.user_sasuke_dir(), personalization)
+                .map_err(|error| anyhow::anyhow!(error.code))?;
+        settings_changed |= avatar_migrated;
+        match reconcile_wallpaper_personalization(&paths.user_sasuke_dir(), personalization) {
+            Ok(changed) => settings_changed |= changed,
+            Err(error) => warn!(
+                error_code = error.code,
+                "wallpaper personalization reconciliation skipped"
+            ),
+        }
+    }
+    if settings_changed {
+        write_json(&paths.user_settings_file(), &settings)?;
+    }
+    if avatar_migrated {
+        complete_legacy_avatar_personalization(&paths.user_sasuke_dir())
+            .map_err(|error| anyhow::anyhow!(error.code))?;
+    }
+    let state: StateConfig = read_json(&paths.user_state_file()).unwrap_or_default();
+    Ok((settings, state))
+}
+
+fn recent_workspaces(state: &StateConfig, repo_root: &Utf8Path) -> Vec<String> {
+    let current = repo_root.to_string();
+    let mut workspaces = vec![current.clone()];
+    for workspace in &state.recent_desktop_workspaces {
+        let workspace = workspace.trim();
+        if !workspace.is_empty() && workspace != current && Utf8Path::new(workspace).is_dir() {
+            workspaces.push(workspace.to_string());
+        }
+    }
+    workspaces
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sasuke::domain::{NodeOutcome, NodeType, PauseReason, RoundTrigger, RunStatus, VERSION};
+    use sasuke::runtime::{
+        NodeState, RoundState, RunState, RuntimeAttemptLocator, RuntimeExecutionPhase,
+        RuntimeExecutionState, TaskState,
+    };
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    fn doctor_probe(available: bool, reason: Option<&str>) -> ProviderDoctorProbe {
+        ProviderDoctorProbe {
+            doctor: DoctorResult {
+                available,
+                reason: reason.map(str::to_string),
+                capabilities: None,
+            },
+            commands: Vec::new(),
+        }
+    }
+
+    fn desktop_state() -> (tempfile::TempDir, DesktopState) {
+        let root = tempfile::tempdir().unwrap();
+        let repo_root = Utf8PathBuf::from_path_buf(root.path().to_path_buf()).unwrap();
+        let context = DesktopContext {
+            repo_root,
+            config: RuntimeConfig::default(),
+            recent_workspaces: Vec::new(),
+            needs_workspace: false,
+        };
+        (root, DesktopState::new(context))
+    }
+
+    #[test]
+    fn desktop_manifest_io_failure_blocks_workspace_provision() {
+        let root = tempfile::tempdir().unwrap();
+        let repo_root = Utf8PathBuf::from_path_buf(root.path().join("workspace")).unwrap();
+        std::fs::create_dir_all(repo_root.as_std_path()).unwrap();
+        let paths = SasukePaths::new(repo_root.clone());
+        let projects_dir = paths.runtime_root.parent().unwrap();
+        std::fs::create_dir_all(projects_dir.parent().unwrap().as_std_path()).unwrap();
+        std::fs::write(projects_dir.as_std_path(), "blocking file").unwrap();
+
+        let result = provision_project_manifest_for_desktop(&paths);
+
+        assert!(result.is_err());
+        assert!(projects_dir.is_file());
+        assert!(!paths.project_manifest_file().exists());
+    }
+
+    #[test]
+    fn desktop_manifest_integrity_failure_blocks_workspace_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let repo_root = Utf8PathBuf::from_path_buf(root.path().join("workspace")).unwrap();
+        std::fs::create_dir_all(repo_root.as_std_path()).unwrap();
+        let paths = SasukePaths::new(repo_root);
+        paths.provision_project_manifest().unwrap();
+        std::fs::write(paths.project_manifest_file().as_std_path(), "not json").unwrap();
+
+        let result = provision_project_manifest_for_desktop(&paths);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pending_update_path_reads_without_consuming_install_work() {
+        let (_root, state) = desktop_state();
+        let path = Utf8PathBuf::from("D:/Temp/sasuke-update/update-0.13.2.pkg");
+        state.store_pending_update(path.clone()).unwrap();
+
+        assert_eq!(state.pending_update_path().unwrap(), Some(path.clone()));
+        assert_eq!(state.take_pending_update(), Some(path));
+    }
+
+    #[test]
+    fn command_catalog_cache_miss_scans_skills_visible_in_a_worktree() {
+        let (root, state) = desktop_state();
+        let workspace = Utf8PathBuf::from_path_buf(root.path().join("fresh-worktree")).unwrap();
+        let skill_dir = workspace.join(".claude/skills/worktree-skill");
+        std::fs::create_dir_all(skill_dir.as_std_path()).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md").as_std_path(),
+            "---\nname: worktree-skill\ndescription: Visible from the worktree\n---\n",
+        )
+        .unwrap();
+        let agent_id = ManagedAgentId::from_str("claude-acp").unwrap();
+        let key = catalog_key(agent_id.as_str(), &project_id(&workspace));
+        assert!(
+            !state
+                .agent_command_catalogs
+                .lock()
+                .unwrap()
+                .contains_key(&key)
+        );
+
+        let catalog = state
+            .agent_command_catalog(&agent_id, &workspace)
+            .unwrap()
+            .unwrap();
+
+        assert!(catalog.commands.iter().any(|command| {
+            command.name == "worktree-skill" && command.description == "Visible from the worktree"
+        }));
+        assert!(catalog.acp_commands.as_ref().unwrap().is_empty());
+        assert!(
+            !state
+                .agent_command_catalogs
+                .lock()
+                .unwrap()
+                .contains_key(&key)
+        );
+    }
+
+    #[test]
+    fn command_catalog_keeps_acp_commands_ahead_of_same_named_worktree_skills() {
+        let (root, state) = desktop_state();
+        let workspace = Utf8PathBuf::from_path_buf(root.path().join("active-worktree")).unwrap();
+        let skill_dir = workspace.join(".claude/skills/review");
+        std::fs::create_dir_all(skill_dir.as_std_path()).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md").as_std_path(),
+            "---\nname: review\ndescription: Skill metadata\n---\n",
+        )
+        .unwrap();
+        let agent_id = ManagedAgentId::from_str("claude-acp").unwrap();
+        state
+            .record_agent_commands(
+                &agent_id,
+                &workspace,
+                vec![AcpCommandItem {
+                    name: "review".to_string(),
+                    description: "ACP metadata".to_string(),
+                    input_hint: Some("target".to_string()),
+                }],
+            )
+            .unwrap();
+
+        let catalog = state
+            .agent_command_catalog(&agent_id, &workspace)
+            .unwrap()
+            .unwrap();
+
+        let review_commands = catalog
+            .commands
+            .iter()
+            .filter(|command| command.name == "review")
+            .collect::<Vec<_>>();
+        assert_eq!(review_commands.len(), 1);
+        assert_eq!(review_commands[0].description, "ACP metadata");
+        assert_eq!(review_commands[0].input_hint.as_deref(), Some("target"));
+        let skill_review = catalog
+            .skill_commands
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|command| command.name == "review")
+            .unwrap();
+        assert_eq!(skill_review.description, "Skill metadata");
+    }
+
+    #[test]
+    fn command_catalog_emits_only_for_changed_content_in_its_project() {
+        let (root, state) = desktop_state();
+        let workspace = Utf8PathBuf::from_path_buf(root.path().join("command-events")).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let received = notifications.clone();
+        state.set_agent_command_update(move |catalog| {
+            received
+                .lock()
+                .unwrap()
+                .push((catalog.agent_type.clone(), catalog.project_id.clone()));
+        });
+        let agent_id = ManagedAgentId::from_str("claude-acp").unwrap();
+        let first = state
+            .record_agent_commands(&agent_id, &workspace, vec![])
+            .unwrap();
+        let second = state
+            .record_agent_commands(&agent_id, &workspace, vec![])
+            .unwrap();
+        assert_eq!(first.updated_at, second.updated_at);
+        assert_eq!(
+            *notifications.lock().unwrap(),
+            vec![(agent_id.as_str().to_string(), project_id(&workspace))]
+        );
+        state
+            .record_agent_commands(
+                &agent_id,
+                &workspace,
+                vec![AcpCommandItem {
+                    name: "changed".into(),
+                    description: "changed".into(),
+                    input_hint: None,
+                }],
+            )
+            .unwrap();
+        assert_eq!(notifications.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn command_catalog_failed_persist_remains_retryable() {
+        let (_root, state) = desktop_state();
+        let workspace = state.context().unwrap().repo_root;
+        let path = SasukePaths::new(workspace.clone()).agent_command_catalogs_file();
+        std::fs::create_dir_all(&path).unwrap();
+        let agent_id = ManagedAgentId::from_str("claude-acp").unwrap();
+        assert!(
+            state
+                .record_agent_commands(&agent_id, &workspace, vec![])
+                .is_err()
+        );
+        assert!(
+            !state
+                .agent_command_catalogs
+                .lock()
+                .unwrap()
+                .contains_key(&catalog_key(agent_id.as_str(), &project_id(&workspace)))
+        );
+        std::fs::remove_dir(&path).unwrap();
+        state
+            .record_agent_commands(&agent_id, &workspace, vec![])
+            .unwrap();
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn command_catalog_notifies_when_shadowed_skill_metadata_changes() {
+        let (root, state) = desktop_state();
+        let workspace = Utf8PathBuf::from_path_buf(root.path().join("skill-change")).unwrap();
+        let skill = workspace.join(".claude/skills/review/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, "---\nname: review\ndescription: first\n---\n").unwrap();
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let received = notifications.clone();
+        state.set_agent_command_update(move |_| {
+            received.fetch_add(1, Ordering::SeqCst);
+        });
+        let agent_id = ManagedAgentId::from_str("claude-acp").unwrap();
+        let commands = vec![AcpCommandItem {
+            name: "review".into(),
+            description: "ACP wins".into(),
+            input_hint: None,
+        }];
+        let first = state
+            .record_agent_commands(&agent_id, &workspace, commands.clone())
+            .unwrap();
+        std::fs::write(&skill, "---\nname: review\ndescription: updated\n---\n").unwrap();
+        let second = state
+            .record_agent_commands(&agent_id, &workspace, commands)
+            .unwrap();
+        assert_eq!(first.commands, second.commands);
+        assert_eq!(notifications.load(Ordering::SeqCst), 2);
+    }
+
+    fn write_completed_attempt_with_running_run(app: &App, candidate_token: Option<String>) {
+        app.paths.provision_project_manifest().unwrap();
+        let mut execution = RuntimeExecutionState::new(
+            RuntimeExecutionPhase::StartingNode,
+            Some(RuntimeAttemptLocator {
+                round_id: "round-001".to_string(),
+                node_id: "worker".to_string(),
+                attempt_id: "attempt-001".to_string(),
+                outer_node_id: None,
+                outer_attempt_id: None,
+            }),
+            "2026-08-14T00:00:01Z",
+        );
+        execution.recovery_candidate_token = candidate_token;
+        let run = RunState {
+            version: VERSION.to_string(),
+            id: "run-001".to_string(),
+            task_id: "task-001".to_string(),
+            task_uuid: None,
+            status: RunStatus::Running,
+            outcome: None,
+            started_at: "2026-08-14T00:00:00Z".to_string(),
+            updated_at: "2026-08-14T00:00:01Z".to_string(),
+            workflow_snapshot: "workflow.snapshot.json".to_string(),
+            current_round: Some("round-001".to_string()),
+            current_node: Some("worker".to_string()),
+            current_attempt: Some("attempt-001".to_string()),
+            new_rounds_opened: 0,
+            pause_reason: None,
+            uuid: None,
+            last_executed_node: None,
+            worktree: None,
+            execution,
+        };
+        let round = RoundState {
+            version: VERSION.to_string(),
+            id: "round-001".to_string(),
+            run_id: "run-001".to_string(),
+            index: 1,
+            status: RunStatus::Running,
+            outcome: None,
+            trigger: RoundTrigger::Initial,
+            started_at: "2026-08-14T00:00:00Z".to_string(),
+            trace: Vec::new(),
+            uuid: None,
+        };
+        let node = NodeState {
+            version: VERSION.to_string(),
+            acp_storage_schema_version: sasuke::runtime::CURRENT_ACP_STORAGE_SCHEMA_VERSION,
+            node_id: "worker".to_string(),
+            node_type: NodeType::Worker,
+            run_id: "run-001".to_string(),
+            round_id: "round-001".to_string(),
+            attempt_id: "attempt-001".to_string(),
+            status: RunStatus::Completed,
+            outcome: Some(NodeOutcome::Success),
+            started_at: "2026-08-14T00:00:00Z".to_string(),
+            finished_at: Some("2026-08-14T00:00:01Z".to_string()),
+            manual_check_pending: false,
+            runtime_execution_id: None,
+            resolved_config: Default::default(),
+            uuid: None,
+        };
+        write_json(
+            &app.paths.task_file("task-001"),
+            &TaskState::new("task-001"),
+        )
+        .unwrap();
+        write_json(&app.paths.run_file("task-001", "run-001"), &run).unwrap();
+        write_json(
+            &app.paths.round_file("task-001", "run-001", "round-001"),
+            &round,
+        )
+        .unwrap();
+        write_json(
+            &app.paths
+                .node_file("task-001", "run-001", "round-001", "worker", "attempt-001"),
+            &node,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn startup_recovery_reads_only_cross_workspace_candidates() {
+        let (root, state) = desktop_state();
+        let workspace_a = Utf8PathBuf::from_path_buf(root.path().join("workspace-a")).unwrap();
+        let workspace_b = Utf8PathBuf::from_path_buf(root.path().join("workspace-b")).unwrap();
+        std::fs::create_dir_all(workspace_a.as_std_path()).unwrap();
+        std::fs::create_dir_all(workspace_b.as_std_path()).unwrap();
+        let base_app = state.app().unwrap();
+        let workspace_b_app =
+            base_app.with_repo_root(workspace_b.clone(), RuntimeConfig::default());
+        state
+            .runtime_recovery()
+            .complete_startup_recovery(std::collections::HashSet::new())
+            .unwrap();
+        let registration = state
+            .runtime_recovery()
+            .begin(&workspace_b_app.paths, "task-001", "run-001")
+            .unwrap();
+        let candidate_token = registration.token().to_string();
+        registration.commit();
+        write_completed_attempt_with_running_run(&workspace_b_app, Some(candidate_token.clone()));
+        let before = workspace_b_app.run_status("task-001", "run-001").unwrap();
+        assert_eq!(before.status, RunStatus::Running);
+        assert_eq!(
+            before.execution.recovery_candidate_token.as_deref(),
+            Some(candidate_token.as_str())
+        );
+        assert_eq!(
+            state
+                .runtime_recovery()
+                .list_persisted_candidates()
+                .unwrap()[0]
+                .candidate_token,
+            candidate_token
+        );
+
+        let report = state
+            .recover_interrupted_conversation_workspaces_from_candidates()
+            .unwrap();
+
+        assert_eq!(report.workspace_count, 1);
+        assert_eq!(report.candidate_count, 1);
+        assert_eq!(report.recovered_run_count, 1, "{report:?}");
+        assert!(report.failures.is_empty());
+        let run = workspace_b_app.run_status("task-001", "run-001").unwrap();
+        let node: NodeState = read_json(&workspace_b_app.paths.node_file(
+            "task-001",
+            "run-001",
+            "round-001",
+            "worker",
+            "attempt-001",
+        ))
+        .unwrap();
+        assert_eq!(run.status, RunStatus::Paused);
+        assert_eq!(run.pause_reason, Some(PauseReason::ProcessInterrupted));
+        assert_eq!(run.execution.phase, RuntimeExecutionPhase::Paused);
+        assert_eq!(node.status, RunStatus::Completed);
+        assert_eq!(node.outcome, Some(NodeOutcome::Success));
+        assert!(
+            state
+                .runtime_recovery()
+                .list_persisted_candidates()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn startup_recovery_consumes_core_db_candidate_once_across_desktop_state_instances() {
+        let root = tempfile::tempdir().unwrap();
+        let repo_root = Utf8PathBuf::from_path_buf(root.path().to_path_buf()).unwrap();
+        let context = DesktopContext {
+            repo_root,
+            config: RuntimeConfig::default(),
+            recent_workspaces: Vec::new(),
+            needs_workspace: false,
+        };
+
+        let persisted_candidate = {
+            let first_state = DesktopState::new(context.clone());
+            let first_app = first_state.app().unwrap();
+            first_state
+                .runtime_recovery()
+                .complete_startup_recovery(std::collections::HashSet::new())
+                .unwrap();
+            let registration = first_state
+                .runtime_recovery()
+                .begin(&first_app.paths, "task-001", "run-001")
+                .unwrap();
+            let candidate_token = registration.token().to_string();
+            registration.commit();
+            write_completed_attempt_with_running_run(&first_app, Some(candidate_token));
+
+            assert!(first_app.paths.core_db_path().is_file());
+            let candidates = first_state
+                .runtime_recovery()
+                .list_persisted_candidates()
+                .unwrap();
+            assert_eq!(candidates.len(), 1);
+            candidates[0].clone()
+        };
+
+        let recovered_run = {
+            let second_state = DesktopState::new(context.clone());
+            assert_eq!(
+                second_state
+                    .runtime_recovery()
+                    .list_persisted_candidates()
+                    .unwrap(),
+                vec![persisted_candidate]
+            );
+
+            let report = second_state
+                .recover_interrupted_conversation_workspaces()
+                .unwrap();
+            assert_eq!(report.candidate_count, 1);
+            assert_eq!(report.recovered_run_count, 1, "{report:?}");
+            assert!(report.failures.is_empty());
+            second_state
+                .runtime_recovery()
+                .complete_startup_recovery(report.blocked_project_ids.iter().cloned().collect())
+                .unwrap();
+            assert!(
+                second_state
+                    .runtime_recovery()
+                    .list_persisted_candidates()
+                    .unwrap()
+                    .is_empty()
+            );
+
+            let run = second_state
+                .app()
+                .unwrap()
+                .run_status("task-001", "run-001")
+                .unwrap();
+            assert_eq!(run.status, RunStatus::Paused);
+            assert_eq!(run.pause_reason, Some(PauseReason::ProcessInterrupted));
+            assert_eq!(run.execution.phase, RuntimeExecutionPhase::Paused);
+            run
+        };
+
+        let third_state = DesktopState::new(context);
+        let report = third_state
+            .recover_interrupted_conversation_workspaces()
+            .unwrap();
+        assert_eq!(report.candidate_count, 0);
+        assert_eq!(report.recovered_run_count, 0);
+        assert_eq!(report.consumed_candidate_count, 0);
+        let unchanged = third_state
+            .app()
+            .unwrap()
+            .run_status("task-001", "run-001")
+            .unwrap();
+        assert_eq!(unchanged.status, recovered_run.status);
+        assert_eq!(unchanged.pause_reason, recovered_run.pause_reason);
+        assert_eq!(unchanged.execution.phase, recovered_run.execution.phase);
+        assert_eq!(unchanged.updated_at, recovered_run.updated_at);
+    }
+
+    #[test]
+    fn startup_recovery_isolates_a_broken_candidate_workspace() {
+        let (root, state) = desktop_state();
+        let broken = Utf8PathBuf::from_path_buf(root.path().join("broken-workspace")).unwrap();
+        let healthy = Utf8PathBuf::from_path_buf(root.path().join("healthy-workspace")).unwrap();
+        std::fs::create_dir_all(broken.as_std_path()).unwrap();
+        std::fs::create_dir_all(healthy.as_std_path()).unwrap();
+        let base_app = state.app().unwrap();
+        let broken_app = base_app.with_repo_root(broken, RuntimeConfig::default());
+        let healthy_app = base_app.with_repo_root(healthy, RuntimeConfig::default());
+        broken_app.paths.provision_project_manifest().unwrap();
+        state
+            .runtime_recovery()
+            .complete_startup_recovery(std::collections::HashSet::new())
+            .unwrap();
+        let broken_registration = state
+            .runtime_recovery()
+            .begin(&broken_app.paths, "task-broken", "run-broken")
+            .unwrap();
+        broken_registration.commit();
+        let broken_run = broken_app.paths.run_file("task-broken", "run-broken");
+        std::fs::create_dir_all(broken_run.parent().unwrap().as_std_path()).unwrap();
+        std::fs::write(broken_run.as_std_path(), "not json").unwrap();
+        let healthy_registration = state
+            .runtime_recovery()
+            .begin(&healthy_app.paths, "task-001", "run-001")
+            .unwrap();
+        let healthy_candidate_token = healthy_registration.token().to_string();
+        healthy_registration.commit();
+        write_completed_attempt_with_running_run(&healthy_app, Some(healthy_candidate_token));
+
+        let report = state
+            .recover_interrupted_conversation_workspaces_from_candidates()
+            .unwrap();
+
+        assert_eq!(report.workspace_count, 2);
+        assert_eq!(report.candidate_count, 2);
+        assert_eq!(report.recovered_run_count, 1, "{report:?}");
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.blocked_project_ids.len(), 1);
+        assert_eq!(report.failures[0].code, "runtime.workspace-recovery-failed");
+        assert_eq!(
+            healthy_app
+                .run_status("task-001", "run-001")
+                .unwrap()
+                .status,
+            RunStatus::Paused
+        );
+        let remaining = state
+            .runtime_recovery()
+            .list_persisted_candidates()
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].task_id, "task-broken");
+    }
+
+    #[test]
+    fn consumed_paused_candidate_does_not_affect_the_next_startup() {
+        let (_root, state) = desktop_state();
+        let app = state.app().unwrap();
+        state
+            .runtime_recovery()
+            .complete_startup_recovery(std::collections::HashSet::new())
+            .unwrap();
+        let registration = state
+            .runtime_recovery()
+            .begin(&app.paths, "task-001", "run-001")
+            .unwrap();
+        let candidate_token = registration.token().to_string();
+        registration.commit();
+        write_completed_attempt_with_running_run(&app, Some(candidate_token));
+        let mut paused = app.run_status("task-001", "run-001").unwrap();
+        paused.status = RunStatus::Paused;
+        paused.pause_reason = Some(PauseReason::WaitingForUserInput);
+        paused.updated_at = "2026-08-14T00:00:02Z".to_string();
+        paused
+            .transition_current_execution(RuntimeExecutionPhase::Paused, paused.updated_at.clone())
+            .unwrap();
+        write_json(&app.paths.run_file("task-001", "run-001"), &paused).unwrap();
+
+        let first = state
+            .recover_interrupted_conversation_workspaces_from_candidates()
+            .unwrap();
+        let second = state
+            .recover_interrupted_conversation_workspaces_from_candidates()
+            .unwrap();
+
+        assert_eq!(first.candidate_count, 1);
+        assert_eq!(first.consumed_candidate_count, 1);
+        assert_eq!(first.recovered_run_count, 0);
+        assert_eq!(second.candidate_count, 0);
+        let unchanged = app.run_status("task-001", "run-001").unwrap();
+        assert_eq!(unchanged.status, RunStatus::Paused);
+        assert_eq!(
+            unchanged.pause_reason,
+            Some(PauseReason::WaitingForUserInput)
+        );
+        assert_eq!(unchanged.execution.phase, RuntimeExecutionPhase::Paused);
+    }
+
+    #[test]
+    fn stale_candidate_token_does_not_pause_a_newer_running_execution() {
+        let (_root, state) = desktop_state();
+        let app = state.app().unwrap();
+        state
+            .runtime_recovery()
+            .complete_startup_recovery(std::collections::HashSet::new())
+            .unwrap();
+        let registration = state
+            .runtime_recovery()
+            .begin(&app.paths, "task-001", "run-001")
+            .unwrap();
+        registration.commit();
+        write_completed_attempt_with_running_run(&app, Some("newer-candidate".to_string()));
+
+        let report = state
+            .recover_interrupted_conversation_workspaces_from_candidates()
+            .unwrap();
+
+        assert_eq!(report.candidate_count, 1);
+        assert_eq!(report.recovered_run_count, 0);
+        assert_eq!(report.consumed_candidate_count, 1);
+        assert!(report.blocked_project_ids.is_empty());
+        let run = app.run_status("task-001", "run-001").unwrap();
+        assert_eq!(run.status, RunStatus::Running);
+        assert_eq!(
+            run.execution.recovery_candidate_token.as_deref(),
+            Some("newer-candidate")
+        );
+        assert!(
+            state
+                .runtime_recovery()
+                .list_persisted_candidates()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn startup_recovery_does_not_fallback_to_desktop_context_workspace() {
+        let (_root, state) = desktop_state();
+        let base_app = state.app().unwrap();
+        write_completed_attempt_with_running_run(&base_app, None);
+
+        let report = state
+            .recover_interrupted_conversation_workspaces_from_candidates()
+            .unwrap();
+
+        assert_eq!(report.workspace_count, 0);
+        assert_eq!(report.recovered_run_count, 0);
+        assert_eq!(
+            base_app.run_status("task-001", "run-001").unwrap().status,
+            RunStatus::Running
+        );
+    }
+
+    fn target() -> NotificationAttentionTarget<'static> {
+        NotificationAttentionTarget {
+            project_id: "project-1",
+            task_id: "task-1",
+            run_id: "run-1",
+            round_id: "round-1",
+            node_id: "node-1",
+            attempt_id: "attempt-1",
+        }
+    }
+
+    fn input() -> NotificationAttentionInput {
+        NotificationAttentionInput {
+            window_focused: true,
+            window_minimized: false,
+            window_visible: true,
+            project_id: Some("project-1".to_string()),
+            task_id: Some("task-1".to_string()),
+            run_id: Some("run-1".to_string()),
+            round_id: Some("round-1".to_string()),
+            node_id: Some("node-1".to_string()),
+            attempt_id: Some("attempt-1".to_string()),
+            outer_node_id: None,
+            outer_attempt_id: None,
+        }
+    }
+
+    #[test]
+    fn notification_attention_suppresses_visible_selected_session() {
+        let mut state = NotificationAttentionState::default();
+        state.update(input());
+        assert!(!state.should_notify(&target(), true));
+    }
+
+    #[test]
+    fn notification_attention_notifies_when_minimized_or_different_session() {
+        let mut state = NotificationAttentionState::default();
+        let mut minimized = input();
+        minimized.window_minimized = true;
+        state.update(minimized);
+        assert!(state.should_notify(&target(), true));
+
+        let mut other_project = target();
+        other_project.project_id = "project-2";
+        state.update(input());
+        assert!(state.should_notify(&other_project, true));
+
+        let mut other = input();
+        other.attempt_id = Some("attempt-2".to_string());
+        state.update(other);
+        assert!(state.should_notify(&target(), true));
+    }
+
+    #[test]
+    fn agent_diagnostic_queue_coalesces_duplicate_save_requests() {
+        let (_root, state) = desktop_state();
+        let agent_id = ManagedAgentId::from_str("claude-acp").unwrap();
+
+        assert!(state.queue_agent_diagnostic(&agent_id).unwrap());
+        assert!(!state.queue_agent_diagnostic(&agent_id).unwrap());
+
+        state.cancel_queued_agent_diagnostic(&agent_id).unwrap();
+        assert!(state.queue_agent_diagnostic(&agent_id).unwrap());
+    }
+
+    #[test]
+    fn background_doctor_retries_once_after_an_unavailable_result() {
+        let mut attempts = 0;
+        let result = doctor_probe_with_retry(DoctorRetryPolicy::RetryOnce, |_| {
+            attempts += 1;
+            Ok(if attempts == 1 {
+                doctor_probe(false, Some("transient failure"))
+            } else {
+                doctor_probe(true, None)
+            })
+        })
+        .unwrap();
+
+        assert_eq!(attempts, 2);
+        assert!(result.doctor.available);
+    }
+
+    #[test]
+    fn background_doctor_retry_reuses_deadline_and_does_not_retry_expired_budget() {
+        let deadline = DoctorDeadline::default();
+        let mut deadlines = Vec::new();
+        doctor_probe_with_retry_until(DoctorRetryPolicy::RetryOnce, deadline, |observed| {
+            deadlines.push(observed);
+            Ok(doctor_probe(false, Some("unavailable")))
+        })
+        .unwrap();
+        assert_eq!(deadlines, vec![deadline, deadline]);
+        let mut calls = 0;
+        let result = doctor_probe_with_retry_until(
+            DoctorRetryPolicy::RetryOnce,
+            DoctorDeadline::new(std::time::Duration::ZERO),
+            |_| {
+                calls += 1;
+                Ok(doctor_probe(false, Some("deadline expired")))
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(result.doctor.reason.as_deref(), Some("deadline expired"));
+    }
+
+    #[test]
+    fn background_doctor_persists_the_second_failure_without_more_retries() {
+        let mut attempts = 0;
+        let result = doctor_probe_with_retry(DoctorRetryPolicy::RetryOnce, |_| {
+            attempts += 1;
+            Ok(doctor_probe(
+                false,
+                Some(if attempts == 1 { "first" } else { "second" }),
+            ))
+        })
+        .unwrap();
+
+        assert_eq!(attempts, 2);
+        assert!(!result.doctor.available);
+        assert_eq!(result.doctor.reason.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn background_doctor_does_not_retry_a_successful_result() {
+        let mut attempts = 0;
+        let result = doctor_probe_with_retry(DoctorRetryPolicy::RetryOnce, |_| {
+            attempts += 1;
+            Ok(doctor_probe(true, None))
+        })
+        .unwrap();
+
+        assert_eq!(attempts, 1);
+        assert!(result.doctor.available);
+    }
+
+    #[test]
+    fn manual_doctor_does_not_retry_an_unavailable_result() {
+        let mut attempts = 0;
+        let result = doctor_probe_with_retry(DoctorRetryPolicy::NoRetry, |_| {
+            attempts += 1;
+            Ok(doctor_probe(false, Some("manual failure")))
+        })
+        .unwrap();
+
+        assert_eq!(attempts, 1);
+        assert!(!result.doctor.available);
+        assert_eq!(result.doctor.reason.as_deref(), Some("manual failure"));
+    }
+
+    #[test]
+    fn doctor_process_cleanup_discovers_each_agent_pid_file() {
+        let root = tempfile::tempdir().unwrap();
+        let doctor_root = Utf8PathBuf::from_path_buf(root.path().join("doctor/acp")).unwrap();
+        let cursor_dir = doctor_root.join("cursor");
+        let opencode_dir = doctor_root.join("opencode");
+        std::fs::create_dir_all(cursor_dir.as_std_path()).unwrap();
+        std::fs::create_dir_all(opencode_dir.as_std_path()).unwrap();
+        std::fs::write(cursor_dir.join("provider.pid").as_std_path(), "101").unwrap();
+        std::fs::write(opencode_dir.join("provider.pid").as_std_path(), "202").unwrap();
+
+        assert_eq!(
+            doctor_provider_pid_files(&doctor_root),
+            vec![
+                cursor_dir.join("provider.pid"),
+                opencode_dir.join("provider.pid"),
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_diagnostic_other_agent_does_not_wait_for_running_doctor() {
+        let (_root, state) = desktop_state();
+        let state = Arc::new(state);
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first = state.clone();
+        let first_thread = std::thread::spawn(move || {
+            let _guard = first
+                .agent_diagnostic_guard(&"codex-acp".parse().unwrap())
+                .unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let second = state.clone();
+        let second_thread = std::thread::spawn(move || {
+            let _guard = second
+                .agent_diagnostic_guard(&"codebuddy-code".parse().unwrap())
+                .unwrap();
+            finished_tx.send(()).unwrap();
+        });
+        let independent = finished_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        release_tx.send(()).unwrap();
+        first_thread.join().unwrap();
+        second_thread.join().unwrap();
+        assert!(
+            independent,
+            "another Agent must start while the first probe is held open"
+        );
+    }
+
+    #[test]
+    fn agent_config_commit_does_not_wait_for_running_doctor() {
+        let (_root, state) = desktop_state();
+        let state = Arc::new(state);
+        let (doctor_locked_tx, doctor_locked_rx) = mpsc::channel();
+        let (release_doctor_tx, release_doctor_rx) = mpsc::channel();
+        let doctor_state = state.clone();
+        let doctor_thread = std::thread::spawn(move || {
+            let _guard = doctor_state
+                .agent_diagnostic_guard(&"codex-acp".parse().unwrap())
+                .unwrap();
+            doctor_locked_tx.send(()).unwrap();
+            release_doctor_rx.recv().unwrap();
+        });
+        doctor_locked_rx.recv().unwrap();
+
+        let (commit_acquired_tx, commit_acquired_rx) = mpsc::channel();
+        let commit_state = state.clone();
+        let commit_thread = std::thread::spawn(move || {
+            let _guard = commit_state.agent_config_diagnostic_commit_guard().unwrap();
+            commit_acquired_tx.send(()).unwrap();
+        });
+
+        let acquired_without_waiting = commit_acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .is_ok();
+        release_doctor_tx.send(()).unwrap();
+        doctor_thread.join().unwrap();
+        commit_thread.join().unwrap();
+        assert!(acquired_without_waiting);
+    }
+
+    #[test]
+    fn agent_diagnostic_same_agent_waits_without_consuming_another_slot() {
+        let runs = Arc::new(AgentDiagnosticRuns::default());
+        let agent_id: ManagedAgentId = "codex-acp".parse().unwrap();
+        let first = runs.acquire(&agent_id).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let other = runs.clone();
+        let second = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _guard = other.acquire(&agent_id).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        let duplicate_started = acquired_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+        let independent = runs.acquire(&"codebuddy-code".parse().unwrap()).unwrap();
+        assert_eq!(runs.active.lock().unwrap().len(), 2);
+        drop(first);
+        second.join().unwrap();
+        drop(independent);
+        assert!(!duplicate_started);
+        assert!(runs.active.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_diagnostic_admission_caps_adapters_and_releases_slots() {
+        let runs = Arc::new(AgentDiagnosticRuns::default());
+        let mut guards = (0..MAX_CONCURRENT_AGENT_DIAGNOSTICS)
+            .map(|index| {
+                runs.acquire(&format!("agent-{index}").parse().unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let other = runs.clone();
+        let waiting = std::thread::spawn(move || {
+            let _guard = other.acquire(&"waiting-agent".parse().unwrap()).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+        let exceeded_limit = acquired_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+        guards.pop();
+        waiting.join().unwrap();
+        drop(guards);
+        assert!(!exceeded_limit);
+        assert!(runs.active.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_diagnostic_batch_finishes_other_agent_before_stalled_probe() {
+        let agent_ids = [
+            "codex-acp".parse().unwrap(),
+            "codebuddy-code".parse().unwrap(),
+        ];
+        let (started_tx, started_rx) = mpsc::channel();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let batch = std::thread::spawn(move || {
+            for_each_diagnostic_agent(&agent_ids, |agent_id| {
+                if agent_id.as_str() == "codex-acp" {
+                    started_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                } else {
+                    completed_tx.send(agent_id.clone()).unwrap();
+                }
+            });
+        });
+        started_rx.recv().unwrap();
+        let completed = completed_rx.recv_timeout(Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        batch.join().unwrap();
+        assert_eq!(completed.unwrap().as_str(), "codebuddy-code");
+    }
+
+    #[test]
+    fn agent_diagnostic_probe_commits_other_agent_while_first_is_stalled() {
+        let (_root, state) = desktop_state();
+        let state = Arc::new(state);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first = state.clone();
+        let stalled = std::thread::spawn(move || {
+            first
+                .refresh_agent_diagnostic_with_probe(&"codex-acp".parse().unwrap(), |_, _| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(doctor_probe(false, Some("acp.doctor-timeout")))
+                })
+                .unwrap()
+        });
+        started_rx.recv().unwrap();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let second = state.clone();
+        let healthy = std::thread::spawn(move || {
+            let diagnostic = second
+                .refresh_agent_diagnostic_with_probe(&"codebuddy-code".parse().unwrap(), |_, _| {
+                    Ok(doctor_probe(true, None))
+                })
+                .unwrap();
+            completed_tx.send(diagnostic).unwrap();
+        });
+        let completed = completed_rx.recv_timeout(Duration::from_secs(2));
+        release_tx.send(()).unwrap();
+        stalled.join().unwrap();
+        healthy.join().unwrap();
+        assert!(completed.unwrap().available);
+        let diagnostics: BTreeMap<ManagedAgentId, AgentDiagnosticState> =
+            read_json(&state.app().unwrap().paths.agent_diagnostics_file()).unwrap();
+        assert!(diagnostics[&"codebuddy-code".parse().unwrap()].available);
+        assert_eq!(
+            diagnostics[&"codex-acp".parse().unwrap()].reason.as_deref(),
+            Some("acp.doctor-timeout")
+        );
+    }
+
+    #[test]
+    fn agent_diagnostic_large_batch_uses_bounded_workers() {
+        let ids = (0..1000)
+            .map(|index| format!("agent-{index}").parse().unwrap())
+            .collect::<Vec<_>>();
+        let observed = Mutex::new((BTreeSet::new(), std::collections::HashSet::new()));
+        for_each_diagnostic_agent(&ids, |agent_id| {
+            let mut observed = observed.lock().unwrap();
+            assert!(observed.0.insert(agent_id.clone()));
+            observed.1.insert(std::thread::current().id());
+        });
+        let observed = observed.into_inner().unwrap();
+        assert_eq!(observed.0.len(), ids.len());
+        assert!(observed.1.len() <= MAX_CONCURRENT_AGENT_DIAGNOSTICS);
+    }
+}
