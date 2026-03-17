@@ -1,0 +1,9038 @@
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+
+use camino::Utf8Path;
+use serde::{Deserialize, Serialize};
+
+use sasuke::scheduler::{LocalTimeDisambiguation, RepeatPreset, ScheduleError, ScheduleSpec};
+
+use crate::view_models::{
+    AssetItemVm, GraphVm, RuntimeDisplayVm, acp_session_status, dynamic_acp_session_status,
+    dynamic_runtime_graph_vm, latest_control_failure_vm, round_detail_vm, runtime_display_vm,
+    session_worktree_projection, workflow_graph_vm,
+};
+use sasuke::acp::client::{PromptActivity, prompt_activity, prompt_activity_under};
+use sasuke::acp::control::load_runtime_control_cursor;
+use sasuke::acp::prompt_queue::{MAX_QUEUED_PROMPTS, QueuedPromptState, load_prompt_queue};
+use sasuke::app::{
+    App, CreateTaskInput, DEFAULT_WORKFLOW_TEMPLATE_ID, apply_optional_entry_preference,
+    is_run_continuable,
+};
+use sasuke::config::ConversationRunMode;
+use sasuke::config::StateConfig;
+use sasuke::domain::{
+    NodeOutcome, NodeType, PauseReason, RunStatus, SessionMode, TurnControlMode,
+    TurnControlTransitionCause,
+};
+use sasuke::dsl::{
+    AiDynamicAgentStrategy, AiDynamicNode, DynamicAgentRef, DynamicControlDsl, END_NODE, EdgeDsl,
+    EdgeOutcome, NodeDsl, PromptEnvelopeMode, WorkerNode, WorkflowDsl,
+};
+use sasuke::dynamic::{DynamicRunPhase, DynamicRunStatus};
+use sasuke::dynamic_store::load_dynamic_graph;
+use sasuke::runtime::{
+    RoundState, RunState, RuntimeExecutionPhase, RuntimeExecutionState, TaskState, WorkerRefState,
+};
+use sasuke::runtime_error::RuntimeErrorInfo;
+use sasuke::storage::{read_json, write_json};
+use sasuke::workflow_model_binding::{
+    TaskAuthoringWorkflow, WorkflowModelBindings, migrate_authoring_workflow, validate_and_inject,
+};
+
+use crate::conversation_attention::{ConversationTerminalResultVm, unread_terminal_results};
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledTaskVm {
+    pub id: String,
+    pub project_id: String,
+    pub workspace_name: String,
+    pub title: String,
+    pub enabled: bool,
+    pub mode: String,
+    pub session_policy: String,
+    pub schedule: sasuke::scheduler::ScheduleSpec,
+    pub next_at: Option<String>,
+    pub status: String,
+    pub last_trigger_at: Option<String>,
+    pub last_trigger_status: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledOccurrenceVm {
+    pub id: String,
+    pub scheduled_task_id: String,
+    pub scheduled_at: String,
+    pub trigger_kind: String,
+    pub status: String,
+    pub attempt: u32,
+    pub error_code: Option<String>,
+    pub error_params: Option<serde_json::Value>,
+    pub task_id: Option<String>,
+    pub run_id: Option<String>,
+    pub round_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledOccurrencePageVm {
+    pub items: Vec<ScheduledOccurrenceVm>,
+    pub next_cursor: Option<String>,
+}
+
+impl ScheduledOccurrenceVm {
+    pub fn from_occurrence(
+        occurrence: &sasuke::scheduler::occurrence::ScheduledOccurrence,
+    ) -> Self {
+        Self {
+            id: occurrence.id.clone(),
+            scheduled_task_id: occurrence.job_id.clone(),
+            scheduled_at: occurrence.scheduled_at.to_rfc3339(),
+            trigger_kind: occurrence.trigger_kind.to_string(),
+            status: occurrence.status.to_string(),
+            attempt: occurrence.attempt,
+            error_code: occurrence.error_code.map(|value| value.to_string()),
+            error_params: occurrence.error_params.clone(),
+            task_id: occurrence.task_id.clone(),
+            run_id: occurrence.run_id.clone(),
+            round_id: occurrence.round_id.clone(),
+            attempt_id: occurrence.attempt_id.clone(),
+            started_at: occurrence.started_at.map(|value| value.to_rfc3339()),
+            finished_at: occurrence.finished_at.map(|value| value.to_rfc3339()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledTaskDiagnosticsVm {
+    pub scheduled_task_id: String,
+    pub project_id: String,
+    pub next_at: Option<String>,
+    pub last_status: Option<String>,
+    pub last_error: Option<String>,
+    pub run_count: u64,
+    pub retry_count: u8,
+    pub occurrences: Vec<ScheduledOccurrenceVm>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledRuntimeSettingsVm {
+    pub keep_awake_enabled: bool,
+    pub keep_awake_effective: bool,
+    pub completion_notifications_enabled: bool,
+    pub enabled_job_count: usize,
+    pub occurrence_retention_days: u16,
+    pub power_error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledRuntimeSettingsInputVm {
+    pub keep_awake_enabled: bool,
+    pub completion_notifications_enabled: bool,
+    pub occurrence_retention_days: u16,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunScheduledTaskResultVm {
+    pub occurrence: ScheduledOccurrenceVm,
+    pub task_id: Option<String>,
+    pub run_id: Option<String>,
+    pub round_id: Option<String>,
+    pub attempt_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateScheduledTaskInputVm {
+    pub project_id: String,
+    pub content: String,
+    pub run_mode: String,
+    pub workflow_template_id: Option<String>,
+    pub include_optional_entry: Option<bool>,
+    pub direct_config: Option<ConversationDirectConfigVm>,
+    pub auto_config: Option<ConversationAutoConfigVm>,
+    pub attachment_paths: Option<Vec<String>>,
+    pub schedule: ScheduledScheduleInputVm,
+    pub overlap_policy: sasuke::scheduler::OverlapPolicy,
+    pub session_policy: Option<sasuke::scheduler::SessionPolicy>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind")]
+#[serde(rename_all_fields = "camelCase")]
+pub enum ScheduledScheduleInputVm {
+    At {
+        local_date: String,
+        local_time: String,
+        timezone: String,
+        disambiguation: LocalTimeDisambiguation,
+    },
+    Repeat {
+        preset: RepeatPreset,
+        hour: u32,
+        minute: u32,
+        timezone: String,
+    },
+    Every {
+        every: ScheduledEveryInputVm,
+        anchor_at: chrono::DateTime<chrono::Utc>,
+        timezone: String,
+    },
+    Cron {
+        expression: String,
+        timezone: String,
+    },
+}
+
+impl ScheduledScheduleInputVm {
+    pub fn try_into_schedule_spec(self) -> Result<ScheduleSpec, ScheduleError> {
+        match self {
+            Self::At {
+                local_date,
+                local_time,
+                timezone,
+                disambiguation,
+            } => ScheduleSpec::at_local(&local_date, &local_time, &timezone, disambiguation),
+            Self::Repeat {
+                preset,
+                hour,
+                minute,
+                timezone,
+            } => ScheduleSpec::repeat(preset, hour, minute, &timezone),
+            Self::Every {
+                every,
+                anchor_at,
+                timezone,
+            } => ScheduleSpec::every_in_timezone(every.value, &every.unit, anchor_at, &timezone),
+            Self::Cron {
+                expression,
+                timezone,
+            } => ScheduleSpec::cron(&expression, &timezone),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledEveryInputVm {
+    pub value: u64,
+    pub unit: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledTaskEditVm {
+    pub scheduled_task_id: String,
+    pub project_id: String,
+    pub content: String,
+    pub attachment_names: Vec<String>,
+    pub run_mode: String,
+    pub workflow_template_id: Option<String>,
+    pub include_optional_entry: Option<bool>,
+    pub direct_config: Option<ConversationDirectConfigVm>,
+    pub auto_config: Option<ConversationAutoConfigVm>,
+    pub schedule: sasuke::scheduler::ScheduleSpec,
+    pub overlap_policy: sasuke::scheduler::OverlapPolicy,
+    pub session_policy: sasuke::scheduler::SessionPolicy,
+    pub direct_agent_type: Option<String>,
+    pub expected_updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateScheduledTaskInputVm {
+    pub scheduled_task_id: String,
+    pub project_id: String,
+    pub expected_updated_at: String,
+    pub content: String,
+    pub run_mode: String,
+    pub workflow_template_id: Option<String>,
+    pub include_optional_entry: Option<bool>,
+    pub direct_config: Option<ConversationDirectConfigVm>,
+    pub auto_config: Option<ConversationAutoConfigVm>,
+    pub attachment_paths: Option<Vec<String>>,
+    pub schedule: ScheduledScheduleInputVm,
+    pub overlap_policy: sasuke::scheduler::OverlapPolicy,
+    pub session_policy: sasuke::scheduler::SessionPolicy,
+}
+
+impl ScheduledTaskVm {
+    pub fn from_definition(
+        definition: &sasuke::scheduler::ScheduledTaskDefinition,
+        next_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        Self::from_definition_in_workspace(definition, &definition.project_id, next_run_at)
+    }
+
+    pub fn from_definition_in_workspace(
+        definition: &sasuke::scheduler::ScheduledTaskDefinition,
+        workspace_name: &str,
+        next_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        Self {
+            id: definition.id.clone(),
+            project_id: definition.project_id.clone(),
+            workspace_name: workspace_name.to_string(),
+            title: scheduled_task_title(&definition.instruction),
+            enabled: definition.enabled,
+            mode: serde_json::to_value(definition.mode)
+                .ok()
+                .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                .unwrap_or_default(),
+            session_policy: serde_json::to_value(definition.session_policy)
+                .ok()
+                .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                .unwrap_or_default(),
+            schedule: definition.schedule.clone(),
+            next_at: next_run_at.map(|value| value.to_rfc3339()),
+            status: scheduled_task_status(definition),
+            last_trigger_at: definition.last_trigger_at.map(|value| value.to_rfc3339()),
+            last_trigger_status: definition.last_trigger_status.clone(),
+            created_at: definition.created_at.to_rfc3339(),
+            updated_at: definition.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+impl ScheduledTaskEditVm {
+    pub fn from_definition(definition: &sasuke::scheduler::ScheduledTaskDefinition) -> Self {
+        let run_mode = definition
+            .execution_config
+            .get("runMode")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| match definition.mode {
+                sasuke::scheduler::ScheduledMode::Direct => "direct".to_string(),
+                sasuke::scheduler::ScheduledMode::Workflow => "workflow".to_string(),
+                sasuke::scheduler::ScheduledMode::Auto => "auto".to_string(),
+            });
+        let workflow_template_id = definition
+            .execution_config
+            .get("workflowTemplateId")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        let include_optional_entry = definition
+            .execution_config
+            .get("includeOptionalEntry")
+            .and_then(serde_json::Value::as_bool);
+        let direct_config = definition
+            .execution_config
+            .get("directConfig")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok());
+        let auto_config = definition
+            .execution_config
+            .get("autoConfig")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok());
+        Self {
+            scheduled_task_id: definition.id.clone(),
+            project_id: definition.project_id.clone(),
+            content: definition.instruction.clone(),
+            attachment_names: definition.attachment_names.clone(),
+            run_mode,
+            workflow_template_id,
+            include_optional_entry,
+            direct_config,
+            auto_config,
+            schedule: definition.schedule.clone(),
+            overlap_policy: definition.overlap_policy,
+            session_policy: definition.session_policy,
+            direct_agent_type: definition.content_snapshot.direct_agent_id.clone(),
+            expected_updated_at: definition.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+pub fn scheduled_task_vms_from_sources(
+    sources: &[ConversationWorkspaceSource],
+    project_id: Option<&str>,
+) -> anyhow::Result<Vec<ScheduledTaskVm>> {
+    let mut tasks = Vec::new();
+    for source in sources {
+        if project_id.is_some_and(|value| value != source.workspace.project_id) {
+            continue;
+        }
+        let database = sasuke::scheduler::db::ScheduledTaskDatabase::open(
+            source.app.paths.scheduler_db_path(),
+        )?;
+        tasks.extend(
+            database
+                .list_job_records_for_project(&source.workspace.project_id)?
+                .iter()
+                .map(|record| {
+                    ScheduledTaskVm::from_definition_in_workspace(
+                        &record.definition,
+                        &source.workspace.name,
+                        record.next_run_at,
+                    )
+                }),
+        );
+    }
+    tasks.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    Ok(tasks)
+}
+
+pub fn scheduled_task_title(instruction: &str) -> String {
+    let first_line = instruction
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    let normalized = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut title = normalized.chars().take(48).collect::<String>();
+    if normalized.chars().count() > 48 {
+        title.push('…');
+    }
+    title
+}
+
+fn scheduled_task_status(definition: &sasuke::scheduler::ScheduledTaskDefinition) -> String {
+    if !definition.enabled {
+        return "paused".to_string();
+    }
+    if definition.last_trigger_status.as_deref() == Some("failed") {
+        return "failed".to_string();
+    }
+    if definition
+        .schedule
+        .next_occurrence_after(chrono::Utc::now())
+        .is_none()
+    {
+        return "completed".to_string();
+    }
+    "enabled".to_string()
+}
+
+// ── Conversation View Models ──
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationWorkspaceVm {
+    pub project_id: String,
+    pub workspace_path: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationPinRefVm {
+    pub project_id: String,
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationSidebarBootstrapVm {
+    pub workspaces: Vec<ConversationWorkspaceVm>,
+    pub pin_refs: Vec<ConversationPinRefVm>,
+    pub last_active_workspace_id: Option<String>,
+    pub preferences: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationListItemErrorVm {
+    pub code: String,
+    pub params: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationTaskPageVm {
+    pub project_id: String,
+    pub tasks: Vec<ConversationTaskRowVm>,
+    pub next_cursor: Option<String>,
+    pub errors: Vec<ConversationListItemErrorVm>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationPinnedTaskPageVm {
+    pub tasks: Vec<ConversationTaskRowVm>,
+    pub next_cursor: Option<String>,
+    pub errors: Vec<ConversationListItemErrorVm>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationRunSummaryPageVm {
+    pub project_id: String,
+    pub task_id: String,
+    pub task_uuid: Option<String>,
+    pub runs: Vec<ConversationRunSummaryVm>,
+    pub next_cursor: Option<String>,
+    pub errors: Vec<ConversationListItemErrorVm>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationSidebarVm {
+    pub workspaces: Vec<ConversationWorkspaceVm>,
+    pub pinned_tasks: Vec<ConversationTaskRowVm>,
+    pub tasks_by_workspace: std::collections::HashMap<String, Vec<ConversationTaskRowVm>>,
+    pub last_active_workspace_id: Option<String>,
+    pub preferences: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationTaskRowVm {
+    pub project_id: String,
+    pub task_id: String,
+    pub task_uuid: Option<String>,
+    pub title: String,
+    pub auto_title: bool,
+    pub run_mode: String,
+    pub workflow_template_id: Option<String>,
+    pub agent_identity: Option<ConversationAgentIdentityVm>,
+    pub last_activity_at: Option<String>,
+    pub activity: Option<ConversationTaskActivityVm>,
+    pub unread_terminal_result: Option<ConversationTerminalResultVm>,
+    pub latest_run: Option<ConversationRunSummaryVm>,
+    pub runs: Vec<ConversationRunSummaryVm>,
+    pub run_history_status: String,
+    pub runs_next_cursor: Option<String>,
+    pub pinned: bool,
+    pub pinned_order: Option<usize>,
+    pub scheduled_task_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationTaskActivityVm {
+    pub phase: String,
+    pub stopping: bool,
+}
+
+pub struct ConversationWorkspaceSource {
+    pub workspace: ConversationWorkspaceVm,
+    pub app: App,
+}
+
+pub fn conversation_workspace_vms(state: &StateConfig) -> Vec<ConversationWorkspaceVm> {
+    let mut workspaces = state
+        .conversation_workspaces
+        .iter()
+        .map(|workspace| ConversationWorkspaceVm {
+            project_id: workspace.project_id.clone(),
+            workspace_path: workspace.workspace_path.clone(),
+            name: workspace.name.clone(),
+        })
+        .collect::<Vec<_>>();
+    if let Some(last_workspace) = &state.last_conversation_workspace {
+        workspaces.sort_by_key(|workspace| usize::from(workspace.project_id != *last_workspace));
+    }
+    workspaces
+}
+
+pub fn conversation_sidebar_bootstrap_vm(state: &StateConfig) -> ConversationSidebarBootstrapVm {
+    let workspaces = conversation_workspace_vms(state);
+    let last_active_workspace_id = state.last_conversation_workspace.clone().or_else(|| {
+        workspaces
+            .first()
+            .map(|workspace| workspace.project_id.clone())
+    });
+    let mut pins = state.conversation_pins.clone();
+    pins.sort_by_key(|pin| pin.order);
+    ConversationSidebarBootstrapVm {
+        workspaces,
+        pin_refs: pins
+            .into_iter()
+            .map(|pin| ConversationPinRefVm {
+                project_id: pin.project_id,
+                task_id: pin.task_id,
+            })
+            .collect(),
+        last_active_workspace_id,
+        preferences: state.preferences.clone(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationRunSummaryVm {
+    pub run_id: String,
+    pub status: String,
+    pub outcome: Option<String>,
+    pub started_at: String,
+    pub updated_at: String,
+    pub current_round: Option<String>,
+    pub current_node: Option<String>,
+    pub resumable: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationRunVm {
+    pub project_id: String,
+    pub task_id: String,
+    pub task_uuid: Option<String>,
+    pub run_id: String,
+    pub run_mode: String,
+    pub workflow_template_id: Option<String>,
+    pub direct_config: Option<ConversationDirectConfigVm>,
+    pub agent_identity: Option<ConversationAgentIdentityVm>,
+    pub last_activity_at: Option<String>,
+    pub run_status: String,
+    pub run_outcome: Option<String>,
+    pub session_tree: ConversationSessionTreeVm,
+    pub selected_session: Option<crate::view_models::AcpSessionVm>,
+    pub active_sessions: Vec<ConversationActiveSessionVm>,
+    pub input_attachments: Vec<crate::view_models::AssetItemVm>,
+    pub workflow_status: String,
+    pub workflow_valid: bool,
+    pub workflow_error: Option<crate::view_models::WorkflowErrorVm>,
+    pub workflow_json: Option<String>,
+    pub workflow_graph: GraphVm,
+    pub resumable: bool,
+    pub pause_reason: Option<String>,
+    pub runtime_error_message: Option<String>,
+    pub runtime_error: Option<RuntimeErrorInfo>,
+    pub scheduled_task_id: Option<String>,
+    pub worktree: Option<ConversationRunWorktreeVm>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationCreateResultVm {
+    pub task: ConversationTaskRowVm,
+    pub run: ConversationRunVm,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationRunWorktreeVm {
+    pub path: String,
+    pub branch: String,
+    pub fork_commit: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationSessionTreeVm {
+    pub rounds: Vec<ConversationRoundNodeVm>,
+    pub selected_session_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationRoundNodeVm {
+    pub round_id: String,
+    pub index: u32,
+    pub label: String,
+    pub status: String,
+    pub runtime_display: RuntimeDisplayVm,
+    pub nodes: Vec<ConversationTreeNodeVm>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationTreeNodeVm {
+    pub node_id: String,
+    pub label: String,
+    pub node_type: String,
+    pub status: String,
+    pub runtime_display: RuntimeDisplayVm,
+    pub attempts: Vec<ConversationSessionLeafVm>,
+    pub outer_nodes: Option<Vec<ConversationTreeNodeVm>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationSessionLeafVm {
+    pub round_id: String,
+    pub node_id: String,
+    pub attempt_id: String,
+    pub outer_node_id: Option<String>,
+    pub outer_attempt_id: Option<String>,
+    pub path_label: String,
+    pub status: String,
+    pub outcome: Option<String>,
+    pub runtime_display: RuntimeDisplayVm,
+    pub lifecycle: ConversationAttemptLifecycleVm,
+    pub current: bool,
+    pub manual_check_pending: bool,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub session_id: Option<String>,
+    pub session_established: bool,
+    pub worktree_path: Option<String>,
+    pub worktree_branch: Option<String>,
+    pub artifact_count: usize,
+    pub attachment_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationAttemptLifecycleVm {
+    pub runtime: ConversationRuntimeFacetVm,
+    pub control: ConversationControlFacetVm,
+    pub acp: ConversationAcpFacetVm,
+    pub display_status: String,
+    pub runtime_display: RuntimeDisplayVm,
+    pub continue_kind: Option<String>,
+    pub composer: ConversationComposerVm,
+    pub prompt_queue: Option<ConversationPromptQueueVm>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationPromptQueueVm {
+    pub revision: u64,
+    pub items: Vec<ConversationQueuedPromptVm>,
+    pub max_items: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationQueuedPromptVm {
+    pub id: String,
+    pub content: String,
+    pub attachment_count: usize,
+    pub quote_count: usize,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationRuntimeFacetVm {
+    pub status: String,
+    pub outcome: Option<String>,
+    pub pause_reason: Option<String>,
+    pub resumable: bool,
+    pub current: bool,
+    pub active: bool,
+    pub continuable: bool,
+    pub phase: String,
+    pub revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationControlFacetVm {
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transition_cause: Option<TurnControlTransitionCause>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationAcpFacetVm {
+    pub revision: u64,
+    pub turn_id: Option<String>,
+    pub prompt_event_id: Option<String>,
+    pub session_availability: String,
+    pub live_turn_activity: String,
+    pub latest_turn_status: String,
+    pub stopping: bool,
+    pub stop_reason: Option<String>,
+    pub turn_error: Option<sasuke::runtime_error::RuntimeErrorInfo>,
+    pub operation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationComposerVm {
+    pub mode: String,
+    pub submit_target: String,
+    pub processing_kind: String,
+    pub status_key: Option<String>,
+    pub can_stop: bool,
+    pub lock_input: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<ConversationSessionTargetVm>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationSessionTargetVm {
+    pub round_id: String,
+    pub node_id: String,
+    pub attempt_id: String,
+    pub outer_node_id: Option<String>,
+    pub outer_attempt_id: Option<String>,
+    pub path_label: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationActiveSessionVm {
+    pub round_id: String,
+    pub node_id: String,
+    pub attempt_id: String,
+    pub outer_node_id: Option<String>,
+    pub outer_attempt_id: Option<String>,
+    pub path_label: String,
+    pub status: String,
+    pub runtime_display: RuntimeDisplayVm,
+    pub lifecycle: ConversationAttemptLifecycleVm,
+    pub manual_check_pending: bool,
+    pub session_id: Option<String>,
+    pub session_established: bool,
+    pub started_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationRunModeVm {
+    pub mode: String,
+    pub workflow_template_id: Option<String>,
+    pub optional_entry_preferences: HashMap<String, bool>,
+    pub direct_config: Option<ConversationDirectConfigVm>,
+    pub direct_preferences: HashMap<String, ConversationDirectConfigVm>,
+    pub auto_config: Option<ConversationAutoConfigVm>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationDirectConfigVm {
+    pub agent_type: String,
+    pub model_id: Option<String>,
+    pub permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config_options: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationAgentIdentityVm {
+    pub agent_type: String,
+    pub display_name: String,
+    pub icon_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationAutoConfigVm {
+    pub agent_strategy: Option<String>,
+    pub agent_type: String,
+    pub bootstrap_agent_type: Option<String>,
+    pub bootstrap_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bootstrap_config_options: BTreeMap<String, String>,
+    pub acceptance_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub acceptance_config_options: BTreeMap<String, String>,
+    pub model_id: Option<String>,
+    pub permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config_options: BTreeMap<String, String>,
+    pub available_agents: Option<Vec<ConversationDynamicAgentRefVm>>,
+    pub routing_prompt: Option<String>,
+    pub allowed_workflows: Option<Vec<ConversationAllowedWorkflowRefVm>>,
+    pub allowed_profiles: Option<Vec<String>>,
+    pub global_goal: Option<String>,
+    pub control: Option<ConversationDynamicControlVm>,
+    pub active_template_id: Option<String>,
+    pub active_template_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationDynamicAgentRefVm {
+    pub provider: String,
+    pub model: Option<String>,
+    pub permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config_options: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationAllowedWorkflowRefVm {
+    pub workflow_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationDynamicControlVm {
+    pub max_dynamic_nodes: u32,
+    pub max_fanout: u32,
+    pub max_depth: u32,
+    pub max_parallel: u32,
+    pub max_group_depth: u32,
+    pub max_workflow_invocations: u32,
+    pub allow_nested_dynamic: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConversationWorkLocationVm {
+    #[default]
+    Main,
+    Worktree,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationCreateInputVm {
+    pub project_id: String,
+    pub content: String,
+    pub run_mode: String,
+    pub workflow_template_id: Option<String>,
+    pub include_optional_entry: Option<bool>,
+    pub direct_config: Option<ConversationDirectConfigVm>,
+    pub auto_config: Option<ConversationAutoConfigVm>,
+    pub attachment_paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub work_location: ConversationWorkLocationVm,
+    #[serde(default)]
+    pub selected_branch: Option<String>,
+    #[serde(default)]
+    pub scheduled_task_id: Option<String>,
+    #[serde(default)]
+    pub scheduled_content_fingerprint: Option<String>,
+    #[serde(default)]
+    pub workflow_authoring: Option<TaskAuthoringWorkflow>,
+}
+
+pub fn scheduled_content_snapshot(
+    app: &App,
+    input: &ConversationCreateInputVm,
+) -> anyhow::Result<sasuke::scheduler::ScheduledTaskContentSnapshot> {
+    use sasuke::scheduler::{AutoAuthoringIdentity, ScheduledMode};
+
+    let mode = match input.run_mode.as_str() {
+        "direct" => ScheduledMode::Direct,
+        "workflow" => ScheduledMode::Workflow,
+        "auto" => ScheduledMode::Auto,
+        other => anyhow::bail!("unsupported scheduled task mode: {other}"),
+    };
+    let attachment_hashes = input
+        .attachment_paths
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|path| sasuke::scheduler::fingerprint::attachment_file_hash(Path::new(path)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut snapshot = sasuke::scheduler::ScheduledTaskContentInput::new(
+        mode,
+        input.content.clone(),
+        attachment_hashes,
+        input.project_id.clone(),
+    );
+
+    match mode {
+        ScheduledMode::Direct => {
+            snapshot.direct_agent_id = Some(
+                input
+                    .direct_config
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("direct config is required"))?
+                    .agent_type
+                    .trim()
+                    .to_string(),
+            );
+        }
+        ScheduledMode::Workflow => {
+            let store = app.workflow_templates()?;
+            let template_id = input
+                .workflow_template_id
+                .as_deref()
+                .unwrap_or(DEFAULT_WORKFLOW_TEMPLATE_ID);
+            let template = store
+                .templates
+                .iter()
+                .find(|template| template.id == template_id)
+                .ok_or_else(|| anyhow::anyhow!("workflow template not found: {template_id}"))?;
+            let mut workflow = template.workflow.clone();
+            apply_optional_entry_preference(template, input.include_optional_entry, &mut workflow)?;
+            let mut model_bindings = template.model_bindings.clone();
+            migrate_authoring_workflow(&mut workflow, &mut model_bindings, None)?;
+            snapshot.workflow_authoring = Some(serde_json::to_value(TaskAuthoringWorkflow {
+                workflow,
+                model_bindings,
+            })?);
+        }
+        ScheduledMode::Auto => {
+            let config = input
+                .auto_config
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("auto config is required"))?;
+            let available_agent_types = config
+                .available_agents
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|agent| agent.provider.clone());
+            let allowed_workflow_ids = config
+                .allowed_workflows
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|workflow| workflow.workflow_id.clone());
+            snapshot.auto_authoring = Some(AutoAuthoringIdentity::new(
+                config.agent_type.clone(),
+                config
+                    .agent_strategy
+                    .clone()
+                    .unwrap_or_else(|| "fixed".to_string()),
+                config.bootstrap_agent_type.clone(),
+                available_agent_types,
+                config.global_goal.clone(),
+                allowed_workflow_ids,
+            ));
+        }
+    }
+
+    Ok(snapshot)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationValidationResultVm {
+    pub valid: bool,
+    pub missing_items: Vec<ConversationMissingItemVm>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationMissingItemVm {
+    pub code: String,
+    pub label: String,
+    pub recovery_path: String,
+    pub params: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationSearchResultVm {
+    pub project_id: String,
+    pub workspace_path: String,
+    pub workspace_name: String,
+    pub task_id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub requirement_preview: String,
+    pub match_preview: String,
+    pub latest_run: Option<ConversationRunSummaryVm>,
+    pub run_mode: String,
+    pub agent_identity: Option<ConversationAgentIdentityVm>,
+    pub last_activity_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConversationMetadata {
+    pub(crate) version: String,
+    pub(crate) source: String,
+    pub(crate) run_mode: String,
+    pub(crate) workflow_template_id: Option<String>,
+    pub(crate) include_optional_entry: Option<bool>,
+    pub(crate) direct_config: Option<ConversationDirectConfigVm>,
+    pub(crate) agent_identity: Option<ConversationAgentIdentityVm>,
+    pub(crate) title_auto_generated: bool,
+    pub(crate) initial_attachment_names: Option<Vec<String>>,
+    pub(crate) created_at: String,
+    pub(crate) last_activity_at: Option<String>,
+    #[serde(default)]
+    pub(crate) work_location: ConversationWorkLocationVm,
+    #[serde(default)]
+    pub(crate) scheduled_task_id: Option<String>,
+    #[serde(default)]
+    pub(crate) scheduled_content_fingerprint: Option<String>,
+}
+
+fn read_conversation_metadata(app: &App, task_id: &str) -> Option<ConversationMetadata> {
+    read_json::<ConversationMetadata>(
+        &app.paths
+            .task_dir(task_id)
+            .join("authoring")
+            .join("conversation.json"),
+    )
+    .ok()
+}
+
+pub(crate) fn conversation_task_last_activity_at(app: &App, task_id: &str) -> Option<String> {
+    let metadata = read_conversation_metadata(app, task_id)?;
+    latest_conversation_activity_at(Some(&metadata))
+}
+
+pub(crate) fn scheduled_content_fingerprint_for_task(app: &App, task_id: &str) -> Option<String> {
+    read_conversation_metadata(app, task_id)
+        .and_then(|metadata| metadata.scheduled_content_fingerprint)
+}
+
+fn conversation_run_mode_from_label(value: &str) -> Option<ConversationRunMode> {
+    match value {
+        "direct" => Some(ConversationRunMode::Direct),
+        "workflow" => Some(ConversationRunMode::Workflow),
+        "auto" => Some(ConversationRunMode::Auto),
+        _ => None,
+    }
+}
+
+pub(crate) fn conversation_run_mode(app: &App, task_id: &str) -> Option<ConversationRunMode> {
+    read_conversation_metadata(app, task_id)
+        .and_then(|metadata| conversation_run_mode_from_label(&metadata.run_mode))
+}
+
+pub(crate) fn conversation_is_orchestrated(app: &App, task_id: &str) -> bool {
+    conversation_run_mode(app, task_id)
+        .unwrap_or(ConversationRunMode::Workflow)
+        .is_orchestrated()
+}
+
+fn direct_prompt_queue_vm(
+    app: &App,
+    task_id: &str,
+    attempt_dir: &Utf8Path,
+) -> Option<ConversationPromptQueueVm> {
+    if conversation_run_mode(app, task_id) != Some(ConversationRunMode::Direct) {
+        return None;
+    }
+    let queue = load_prompt_queue(attempt_dir).unwrap_or_default();
+    Some(ConversationPromptQueueVm {
+        revision: queue.revision,
+        items: queue
+            .items
+            .into_iter()
+            .filter(|item| item.state == QueuedPromptState::Queued)
+            .map(|item| ConversationQueuedPromptVm {
+                id: item.id,
+                content: item.content,
+                attachment_count: item.attachment_paths.len(),
+                quote_count: item.quotes.len(),
+                created_at: item.created_at,
+            })
+            .collect(),
+        max_items: MAX_QUEUED_PROMPTS,
+    })
+}
+
+fn attach_direct_prompt_queue(
+    app: &App,
+    task_id: &str,
+    attempt_dir: &Utf8Path,
+    lifecycle: &mut ConversationAttemptLifecycleVm,
+) {
+    lifecycle.prompt_queue = direct_prompt_queue_vm(app, task_id, attempt_dir);
+    if lifecycle.prompt_queue.is_some()
+        && lifecycle.composer.mode == "runtime-active"
+        && !lifecycle.acp.stopping
+    {
+        lifecycle.composer.submit_target = "queue-prompt".to_string();
+        lifecycle.composer.lock_input = false;
+    }
+}
+
+fn direct_agent_identity(app: &App, agent_type: &str) -> Option<ConversationAgentIdentityVm> {
+    let (_, config) = app.managed_agent(agent_type).ok()?;
+    Some(ConversationAgentIdentityVm {
+        agent_type: agent_type.to_string(),
+        display_name: config.adapter.display_name.clone(),
+        icon_key: config.icon.clone(),
+    })
+}
+
+pub fn touch_conversation_activity_at(
+    app: &App,
+    task_id: &str,
+    activity_at: &str,
+) -> anyhow::Result<()> {
+    let metadata_path = app
+        .paths
+        .task_dir(task_id)
+        .join("authoring")
+        .join("conversation.json");
+    let mut metadata: ConversationMetadata = read_json(&metadata_path)?;
+    let should_advance = metadata
+        .last_activity_at
+        .as_deref()
+        .is_none_or(|current| compare_conversation_timestamps(current, activity_at).is_lt());
+    if should_advance {
+        metadata.last_activity_at = Some(activity_at.to_string());
+        write_json(&metadata_path, &metadata)?;
+    }
+    app.record_task_activity_index(task_id, activity_at);
+    Ok(())
+}
+
+fn conversation_timestamp_millis(value: &str) -> Option<i64> {
+    let trimmed = value.trim();
+    let epoch = trimmed.strip_suffix('Z').unwrap_or(trimmed);
+    if let Ok(seconds) = epoch.parse::<f64>() {
+        return Some((seconds * 1_000.0) as i64);
+    }
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return Some(timestamp.timestamp_millis());
+    }
+    chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|timestamp| timestamp.and_utc().timestamp_millis())
+}
+
+fn compare_conversation_timestamps(left: &str, right: &str) -> Ordering {
+    match (
+        conversation_timestamp_millis(left),
+        conversation_timestamp_millis(right),
+    ) {
+        (Some(left_millis), Some(right_millis)) => {
+            left_millis.cmp(&right_millis).then_with(|| left.cmp(right))
+        }
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => left.cmp(right),
+    }
+}
+
+fn latest_conversation_activity_at(metadata: Option<&ConversationMetadata>) -> Option<String> {
+    [
+        metadata.and_then(|metadata| metadata.last_activity_at.as_deref()),
+        metadata.map(|metadata| metadata.created_at.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .max_by(|left, right| compare_conversation_timestamps(left, right))
+    .map(str::to_owned)
+}
+
+fn conversation_task_activity(
+    task_dir: &Utf8Path,
+    latest_run: Option<&ConversationRunSummaryVm>,
+) -> Option<ConversationTaskActivityVm> {
+    if let Some(activity) = prompt_activity_under(task_dir) {
+        return Some(conversation_task_activity_from_prompt(activity));
+    }
+    latest_run
+        .filter(|run| normalize_lifecycle_code(&run.status) == "running")
+        .map(|_| ConversationTaskActivityVm {
+            phase: "runtime-active".to_string(),
+            stopping: false,
+        })
+}
+
+pub(crate) fn conversation_task_activity_from_prompt(
+    activity: PromptActivity,
+) -> ConversationTaskActivityVm {
+    ConversationTaskActivityVm {
+        phase: match activity {
+            PromptActivity::Starting => "starting",
+            PromptActivity::Accepted => "accepted",
+            PromptActivity::Running => "running",
+            PromptActivity::CancelRequested => "cancel-requested",
+        }
+        .to_string(),
+        stopping: activity == PromptActivity::CancelRequested,
+    }
+}
+
+// ── Builder functions (stubs — full implementation in later phases) ──
+
+fn conversation_task_row_vm_from_task(
+    app: &App,
+    project_id: &str,
+    task: &TaskState,
+    pinned: bool,
+    pin_order: Option<usize>,
+    unread_terminal_result: Option<&ConversationTerminalResultVm>,
+) -> ConversationTaskRowVm {
+    let task_id = &task.id;
+    let metadata = read_conversation_metadata(app, task_id);
+    let run_mode = metadata
+        .as_ref()
+        .map(|metadata| metadata.run_mode.clone())
+        .unwrap_or_else(|| "workflow".to_string());
+    let run_list = app.run_list(task_id).unwrap_or_default();
+    let mut runs: Vec<ConversationRunSummaryVm> =
+        run_list.iter().map(conversation_run_summary_vm).collect();
+    runs.sort_by(|left, right| {
+        compare_conversation_timestamps(&right.updated_at, &left.updated_at)
+            .then_with(|| compare_conversation_timestamps(&right.started_at, &left.started_at))
+            .then_with(|| right.run_id.cmp(&left.run_id))
+    });
+    let latest_run = runs.first().cloned();
+    let last_activity_at = latest_conversation_activity_at(metadata.as_ref());
+    let activity = conversation_task_activity(&app.paths.task_dir(task_id), latest_run.as_ref());
+    let unread_terminal_result = (run_mode == "direct")
+        .then(|| unread_terminal_result.cloned())
+        .flatten();
+
+    ConversationTaskRowVm {
+        project_id: project_id.to_string(),
+        task_id: task_id.clone(),
+        task_uuid: task.uuid.clone(),
+        title: task.title.clone().unwrap_or_else(|| task_id.clone()),
+        auto_title: metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.title_auto_generated),
+        run_mode,
+        workflow_template_id: None,
+        agent_identity: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.agent_identity.clone()),
+        last_activity_at,
+        activity,
+        unread_terminal_result,
+        latest_run,
+        runs,
+        run_history_status: if run_list.is_empty() {
+            "ready-empty".to_string()
+        } else {
+            "ready".to_string()
+        },
+        runs_next_cursor: None,
+        pinned,
+        pinned_order: pin_order,
+        scheduled_task_id: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.scheduled_task_id.clone()),
+    }
+}
+
+pub fn conversation_task_row_vm(
+    app: &App,
+    project_id: &str,
+    task_id: &str,
+    pinned: bool,
+    pin_order: Option<usize>,
+) -> anyhow::Result<ConversationTaskRowVm> {
+    let task = app
+        .task_show(task_id)
+        .map_err(|error| anyhow::anyhow!("task not found: {task_id}: {error}"))?;
+    let unread_terminal_results = unread_terminal_results(app).unwrap_or_default();
+    Ok(conversation_task_summary_vm_from_task(
+        app,
+        project_id,
+        &task,
+        pinned,
+        pin_order,
+        unread_terminal_results.get(task_id),
+    ))
+}
+
+pub const CONVERSATION_TASK_PAGE_DEFAULT_LIMIT: usize = 24;
+pub const CONVERSATION_RUN_PAGE_DEFAULT_LIMIT: usize = 20;
+pub const CONVERSATION_SIDEBAR_PAGE_MAX_LIMIT: usize = 100;
+
+fn entity_sequence(id: &str, prefix: &str) -> Option<u32> {
+    id.strip_prefix(prefix)?.parse::<u32>().ok()
+}
+
+fn canonical_entity_ids(
+    dir: &Utf8Path,
+    prefix: &str,
+    state_file_name: &str,
+) -> anyhow::Result<Vec<(u32, String)>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entities = Vec::new();
+    for entry in fs::read_dir(dir.as_std_path())? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(id) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        let Some(sequence) = entity_sequence(&id, prefix) else {
+            continue;
+        };
+        if dir.join(&id).join(state_file_name).exists() {
+            entities.push((sequence, id));
+        }
+    }
+    Ok(entities)
+}
+
+fn paged_entity_ids(
+    dir: &Utf8Path,
+    prefix: &str,
+    state_file_name: &str,
+    cursor: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<(Vec<String>, Option<String>)> {
+    let limit = limit.clamp(1, CONVERSATION_SIDEBAR_PAGE_MAX_LIMIT);
+    let before_sequence = cursor
+        .map(|cursor| {
+            entity_sequence(cursor, prefix)
+                .ok_or_else(|| anyhow::anyhow!("invalid {prefix} cursor"))
+        })
+        .transpose()?;
+    let mut entities = canonical_entity_ids(dir, prefix, state_file_name)?;
+    entities.retain(|(sequence, _)| before_sequence.is_none_or(|cursor| *sequence < cursor));
+    entities.sort_unstable_by(|(left_sequence, left_id), (right_sequence, right_id)| {
+        right_sequence
+            .cmp(left_sequence)
+            .then_with(|| right_id.cmp(left_id))
+    });
+
+    let has_more = entities.len() > limit;
+    let ids = entities
+        .into_iter()
+        .take(limit)
+        .map(|(_, id)| id)
+        .collect::<Vec<_>>();
+    let next_cursor = has_more.then(|| ids.last().cloned()).flatten();
+    Ok((ids, next_cursor))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConversationTaskPageCursor {
+    activity_millis: i64,
+    sequence: u32,
+    task_id: String,
+}
+
+fn paged_task_ids_by_activity(
+    task_ids: Vec<String>,
+    activities: &HashMap<String, String>,
+    cursor: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<(Vec<String>, Option<String>)> {
+    let limit = limit.clamp(1, CONVERSATION_SIDEBAR_PAGE_MAX_LIMIT);
+    let cursor = cursor
+        .map(serde_json::from_str::<ConversationTaskPageCursor>)
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("invalid task activity cursor"))?;
+    let mut tasks = task_ids
+        .into_iter()
+        .filter_map(|task_id| {
+            let sequence = entity_sequence(&task_id, "task-")?;
+            let activity_millis = activities
+                .get(&task_id)
+                .and_then(|value| conversation_timestamp_millis(value))
+                .unwrap_or(i64::MIN);
+            Some(ConversationTaskPageCursor {
+                activity_millis,
+                sequence,
+                task_id,
+            })
+        })
+        .filter(|task| {
+            cursor.as_ref().is_none_or(|cursor| {
+                task.activity_millis < cursor.activity_millis
+                    || (task.activity_millis == cursor.activity_millis
+                        && (task.sequence < cursor.sequence
+                            || (task.sequence == cursor.sequence && task.task_id < cursor.task_id)))
+            })
+        })
+        .collect::<Vec<_>>();
+    tasks.sort_unstable_by(|left, right| {
+        right
+            .activity_millis
+            .cmp(&left.activity_millis)
+            .then_with(|| right.sequence.cmp(&left.sequence))
+            .then_with(|| right.task_id.cmp(&left.task_id))
+    });
+
+    let has_more = tasks.len() > limit;
+    tasks.truncate(limit);
+    let next_cursor = has_more
+        .then(|| tasks.last())
+        .flatten()
+        .map(serde_json::to_string)
+        .transpose()?;
+    Ok((
+        tasks.into_iter().map(|task| task.task_id).collect(),
+        next_cursor,
+    ))
+}
+
+fn latest_conversation_run_summary(app: &App, task_id: &str) -> Option<ConversationRunSummaryVm> {
+    let runs_dir = app.paths.runs_dir(task_id);
+    let (ids, _) = paged_entity_ids(&runs_dir, "run-", "run.json", None, 1).ok()?;
+    ids.first()
+        .and_then(|run_id| read_json::<RunState>(&app.paths.run_file(task_id, run_id)).ok())
+        .map(|run| conversation_run_summary_vm(&run))
+}
+
+fn conversation_task_summary_vm_from_task(
+    app: &App,
+    project_id: &str,
+    task: &TaskState,
+    pinned: bool,
+    pin_order: Option<usize>,
+    unread_terminal_result: Option<&ConversationTerminalResultVm>,
+) -> ConversationTaskRowVm {
+    let task_id = &task.id;
+    let metadata = read_conversation_metadata(app, task_id);
+    let run_mode = metadata
+        .as_ref()
+        .map(|metadata| metadata.run_mode.clone())
+        .unwrap_or_else(|| "workflow".to_string());
+    let latest_run = latest_conversation_run_summary(app, task_id);
+    let last_activity_at = latest_conversation_activity_at(metadata.as_ref());
+    let activity = conversation_task_activity(&app.paths.task_dir(task_id), latest_run.as_ref());
+    let unread_terminal_result = (run_mode == "direct")
+        .then(|| unread_terminal_result.cloned())
+        .flatten();
+
+    ConversationTaskRowVm {
+        project_id: project_id.to_string(),
+        task_id: task_id.clone(),
+        task_uuid: task.uuid.clone(),
+        title: task.title.clone().unwrap_or_else(|| task_id.clone()),
+        auto_title: metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.title_auto_generated),
+        run_mode,
+        workflow_template_id: None,
+        agent_identity: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.agent_identity.clone()),
+        last_activity_at,
+        activity,
+        unread_terminal_result,
+        latest_run,
+        runs: Vec::new(),
+        run_history_status: "not-loaded".to_string(),
+        runs_next_cursor: None,
+        pinned,
+        pinned_order: pin_order,
+        scheduled_task_id: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.scheduled_task_id.clone()),
+    }
+}
+
+pub fn conversation_task_page_vm(
+    app: &App,
+    state: &StateConfig,
+    project_id: &str,
+    cursor: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<ConversationTaskPageVm> {
+    let tasks_dir = app.paths.tasks_dir();
+    let canonical_task_ids = canonical_entity_ids(&tasks_dir, "task-", "task.json")?
+        .into_iter()
+        .map(|(_, task_id)| task_id)
+        .collect::<Vec<_>>();
+    let activity_by_task = sasuke::storage::sqlite::task_activities_in_task_root(&tasks_dir)
+        .into_iter()
+        .map(|entry| (entry.task_id, entry.updated_at))
+        .collect::<HashMap<_, _>>();
+    let (task_ids, next_cursor) =
+        paged_task_ids_by_activity(canonical_task_ids, &activity_by_task, cursor, limit)?;
+    let unread_terminal_results = unread_terminal_results(app).unwrap_or_default();
+    let mut tasks = Vec::with_capacity(task_ids.len());
+    let mut errors = Vec::new();
+    for task_id in task_ids {
+        match app.task_show(&task_id) {
+            Ok(task) => {
+                let pin_order = state
+                    .conversation_pins
+                    .iter()
+                    .find(|pin| pin.project_id == project_id && pin.task_id == task_id)
+                    .map(|pin| pin.order);
+                tasks.push(conversation_task_summary_vm_from_task(
+                    app,
+                    project_id,
+                    &task,
+                    pin_order.is_some(),
+                    pin_order,
+                    unread_terminal_results.get(&task_id),
+                ));
+            }
+            Err(_) => errors.push(ConversationListItemErrorVm {
+                code: "conversation.task-summary-unavailable".to_string(),
+                params: serde_json::json!({ "projectId": project_id, "taskId": task_id }),
+            }),
+        }
+    }
+    Ok(ConversationTaskPageVm {
+        project_id: project_id.to_string(),
+        tasks,
+        next_cursor,
+        errors,
+    })
+}
+
+fn conversation_pin_cursor(project_id: &str, task_id: &str) -> String {
+    serde_json::to_string(&(project_id, task_id)).expect("pin cursor serialization cannot fail")
+}
+
+pub fn conversation_pinned_task_page_vm(
+    state: &StateConfig,
+    sources: &[ConversationWorkspaceSource],
+    cursor: Option<&str>,
+    limit: usize,
+) -> ConversationPinnedTaskPageVm {
+    let limit = limit.clamp(1, CONVERSATION_SIDEBAR_PAGE_MAX_LIMIT);
+    let mut pins = state.conversation_pins.iter().collect::<Vec<_>>();
+    pins.sort_by_key(|pin| pin.order);
+    let start = cursor
+        .and_then(|cursor| {
+            pins.iter()
+                .position(|pin| conversation_pin_cursor(&pin.project_id, &pin.task_id) == cursor)
+        })
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let page_pins = pins
+        .iter()
+        .skip(start)
+        .take(limit + 1)
+        .copied()
+        .collect::<Vec<_>>();
+    let has_more = page_pins.len() > limit;
+    let mut tasks = Vec::new();
+    let mut errors = Vec::new();
+    let mut unread_by_project = HashMap::new();
+    for pin in page_pins.iter().take(limit) {
+        let Some(source) = sources
+            .iter()
+            .find(|source| source.workspace.project_id == pin.project_id)
+        else {
+            errors.push(ConversationListItemErrorVm {
+                code: "workspace.not-found".to_string(),
+                params: serde_json::json!({ "projectId": pin.project_id }),
+            });
+            continue;
+        };
+        match source.app.task_show(&pin.task_id) {
+            Ok(task) => {
+                let unread = unread_by_project
+                    .entry(pin.project_id.clone())
+                    .or_insert_with(|| unread_terminal_results(&source.app).unwrap_or_default());
+                tasks.push(conversation_task_summary_vm_from_task(
+                    &source.app,
+                    &pin.project_id,
+                    &task,
+                    true,
+                    Some(pin.order),
+                    unread.get(&pin.task_id),
+                ));
+            }
+            Err(_) => errors.push(ConversationListItemErrorVm {
+                code: "conversation.task-summary-unavailable".to_string(),
+                params: serde_json::json!({ "projectId": pin.project_id, "taskId": pin.task_id }),
+            }),
+        }
+    }
+    let next_cursor = has_more
+        .then(|| page_pins.get(limit.saturating_sub(1)))
+        .flatten()
+        .map(|pin| conversation_pin_cursor(&pin.project_id, &pin.task_id));
+    ConversationPinnedTaskPageVm {
+        tasks,
+        next_cursor,
+        errors,
+    }
+}
+
+pub fn conversation_run_summary_page_vm(
+    app: &App,
+    project_id: &str,
+    task_id: &str,
+    cursor: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<ConversationRunSummaryPageVm> {
+    let task = app.task_show(task_id)?;
+    let (run_ids, next_cursor) = paged_entity_ids(
+        &app.paths.runs_dir(task_id),
+        "run-",
+        "run.json",
+        cursor,
+        limit,
+    )?;
+    let mut runs = Vec::with_capacity(run_ids.len());
+    let mut errors = Vec::new();
+    for run_id in run_ids {
+        match read_json::<RunState>(&app.paths.run_file(task_id, &run_id)) {
+            Ok(run) => runs.push(conversation_run_summary_vm(&run)),
+            Err(_) => errors.push(ConversationListItemErrorVm {
+                code: "conversation.run-summary-unavailable".to_string(),
+                params: serde_json::json!({
+                    "projectId": project_id,
+                    "taskId": task_id,
+                    "runId": run_id,
+                }),
+            }),
+        }
+    }
+    Ok(ConversationRunSummaryPageVm {
+        project_id: project_id.to_string(),
+        task_id: task_id.to_string(),
+        task_uuid: task.uuid,
+        runs,
+        next_cursor,
+        errors,
+    })
+}
+
+pub fn conversation_sidebar_vm_from_sources(
+    state: &StateConfig,
+    sources: &[ConversationWorkspaceSource],
+) -> ConversationSidebarVm {
+    let mut workspaces = sources
+        .iter()
+        .map(|source| source.workspace.clone())
+        .collect::<Vec<_>>();
+    if let Some(last_workspace) = &state.last_conversation_workspace {
+        workspaces.sort_by_key(|workspace| usize::from(workspace.project_id != *last_workspace));
+    }
+    let mut pinned_tasks: Vec<ConversationTaskRowVm> = Vec::new();
+    let mut tasks_by_workspace: HashMap<String, Vec<ConversationTaskRowVm>> = HashMap::new();
+    let pinned_set: std::collections::HashSet<(String, String)> = state
+        .conversation_pins
+        .iter()
+        .map(|p| (p.project_id.clone(), p.task_id.clone()))
+        .collect();
+
+    for ws in &workspaces {
+        tasks_by_workspace.entry(ws.project_id.clone()).or_default();
+    }
+
+    for source in sources {
+        let unread_terminal_results = unread_terminal_results(&source.app).unwrap_or_default();
+        if let Ok(tasks) = source.app.task_list() {
+            for task in tasks {
+                let task_id = &task.id;
+                let project_id = &source.workspace.project_id;
+                let pinned = pinned_set.contains(&(project_id.clone(), task_id.clone()));
+                let pin_order = state
+                    .conversation_pins
+                    .iter()
+                    .find(|p| p.project_id == *project_id && p.task_id == *task_id)
+                    .map(|p| p.order);
+
+                let row = conversation_task_row_vm_from_task(
+                    &source.app,
+                    project_id,
+                    &task,
+                    pinned,
+                    pin_order,
+                    unread_terminal_results.get(task_id),
+                );
+
+                if pinned {
+                    pinned_tasks.push(row.clone());
+                }
+                tasks_by_workspace
+                    .entry(project_id.clone())
+                    .or_default()
+                    .push(row);
+            }
+        }
+    }
+
+    pinned_tasks.sort_by_key(|t| t.pinned_order.unwrap_or(usize::MAX));
+    for tasks in tasks_by_workspace.values_mut() {
+        tasks.sort_by(|a, b| {
+            match (a.last_activity_at.as_deref(), b.last_activity_at.as_deref()) {
+                (Some(a_time), Some(b_time)) => compare_conversation_timestamps(b_time, a_time),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            }
+            .then_with(|| b.task_id.cmp(&a.task_id))
+        });
+    }
+
+    let last_active_workspace_id = state
+        .last_conversation_workspace
+        .clone()
+        .or_else(|| workspaces.first().map(|w| w.project_id.clone()));
+
+    ConversationSidebarVm {
+        workspaces,
+        pinned_tasks,
+        tasks_by_workspace,
+        last_active_workspace_id,
+        preferences: state.preferences.clone(),
+    }
+}
+
+fn enum_label<T: Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(label)) => label,
+        Ok(value) => value.to_string(),
+        Err(_) => "unknown".to_string(),
+    }
+}
+
+pub(crate) fn conversation_run_summary_vm(run: &RunState) -> ConversationRunSummaryVm {
+    ConversationRunSummaryVm {
+        run_id: run.id.clone(),
+        status: enum_label(&run.status),
+        outcome: run.outcome.map(|outcome| enum_label(&outcome)),
+        started_at: run.started_at.clone(),
+        updated_at: run.updated_at.clone(),
+        current_round: run.current_round.clone(),
+        current_node: run.current_node.clone(),
+        resumable: is_run_continuable(run),
+    }
+}
+
+fn display_pause_reason_for_attempt(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    round_id: &str,
+    node_id: &str,
+    attempt_id: &str,
+    run_pause_reason: Option<&str>,
+) -> Option<String> {
+    if run_pause_reason.is_some_and(|reason| {
+        normalize_lifecycle_code(reason) == "error-blocked"
+            || is_runtime_continue_pause_reason(Some(reason))
+    }) {
+        return run_pause_reason.map(str::to_string);
+    }
+    let snapshot_path = app
+        .paths
+        .acp_snapshot_file(task_id, run_id, round_id, node_id, attempt_id);
+    let session_path = app
+        .paths
+        .acp_session_file(task_id, run_id, round_id, node_id, attempt_id);
+    if acp_session_file_is_cancelled(&snapshot_path) || acp_session_file_is_cancelled(&session_path)
+    {
+        return Some("process-interrupted".to_string());
+    }
+    run_pause_reason.map(str::to_string)
+}
+
+fn display_pause_reason_for_dynamic_attempt(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    round_id: &str,
+    outer_node_id: &str,
+    outer_attempt_id: &str,
+    node_id: &str,
+    attempt_id: &str,
+    dynamic_node: &sasuke::dynamic::DynamicNodeState,
+    run_pause_reason: Option<&str>,
+) -> Option<String> {
+    if let Some(pause_reason) = dynamic_node.pause_reason.as_ref() {
+        return Some(enum_label(pause_reason));
+    }
+    if run_pause_reason.is_some_and(|reason| {
+        normalize_lifecycle_code(reason) == "error-blocked"
+            || is_runtime_continue_pause_reason(Some(reason))
+    }) {
+        return run_pause_reason.map(str::to_string);
+    }
+    let attempt_dir = app.paths.dynamic_node_attempt_dir(
+        task_id,
+        run_id,
+        round_id,
+        outer_node_id,
+        outer_attempt_id,
+        node_id,
+        attempt_id,
+    );
+    if acp_session_file_is_cancelled(&attempt_dir.join("acp.snapshot.json"))
+        || acp_session_file_is_cancelled(&attempt_dir.join("acp.session.json"))
+    {
+        return Some("process-interrupted".to_string());
+    }
+    run_pause_reason.map(str::to_string)
+}
+
+fn acp_session_file_is_cancelled(path: &camino::Utf8Path) -> bool {
+    sasuke::acp::events::read_session_metadata_value(path, None)
+        .ok()
+        .and_then(|session| {
+            let stop_reason = session
+                .get("stopReason")
+                .or_else(|| session.get("stop_reason"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            (session
+                .get("latestTurnStatus")
+                .and_then(serde_json::Value::as_str)
+                == Some("cancelled")
+                || stop_reason.eq_ignore_ascii_case("cancelled")
+                || stop_reason.eq_ignore_ascii_case("canceled"))
+            .then_some(())
+        })
+        .is_some()
+}
+
+#[derive(Debug, Default)]
+struct AcpSessionPresence {
+    session_id: Option<String>,
+    established: bool,
+}
+
+fn acp_session_presence(attempt_dir: &Utf8Path) -> AcpSessionPresence {
+    let worker_ref = read_json::<serde_json::Value>(&attempt_dir.join("worker-ref.json")).ok();
+    let session_id = worker_ref
+        .as_ref()
+        .and_then(|value| {
+            value
+                .get("continue_ref")
+                .or_else(|| value.get("continueRef"))
+        })
+        .and_then(|value| value.get("acpSessionId").or_else(|| value.get("sessionId")))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let metadata_session_id = ["acp.snapshot.json", "acp.session.json"]
+        .iter()
+        .find_map(|name| read_json::<serde_json::Value>(&attempt_dir.join(name)).ok())
+        .and_then(|value| {
+            value
+                .get("sessionId")
+                .or_else(|| value.get("acpSessionId"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+    let session_id = session_id.or(metadata_session_id);
+    let established = session_id.is_some();
+    AcpSessionPresence {
+        session_id,
+        established,
+    }
+}
+
+fn asset_item_vm(
+    kind: &str,
+    round_id: &str,
+    node_id: &str,
+    attempt_id: &str,
+    name: String,
+) -> AssetItemVm {
+    AssetItemVm {
+        kind: kind.to_string(),
+        title: name.clone(),
+        preview: name.clone(),
+        tone: if kind == "artifact" {
+            "accent"
+        } else {
+            "neutral"
+        }
+        .to_string(),
+        round_id: round_id.to_string(),
+        node_id: node_id.to_string(),
+        attempt_id: attempt_id.to_string(),
+        name,
+    }
+}
+
+fn default_dynamic_attempt_id() -> String {
+    "attempt-001".to_string()
+}
+
+fn list_file_names_from_dir(
+    dir: &camino::Utf8Path,
+    logical_json_name: bool,
+) -> anyhow::Result<Vec<String>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut names = std::fs::read_dir(dir.as_std_path())?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().map(|ty| ty.is_file()).unwrap_or(false))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .map(|name| {
+            if logical_json_name {
+                name.strip_suffix(".json").unwrap_or(&name).to_string()
+            } else {
+                name
+            }
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    Ok(names)
+}
+
+fn conversation_session_assets(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    round_id: &str,
+    node_id: &str,
+    attempt_id: &str,
+    outer_node_id: Option<&str>,
+    outer_attempt_id: Option<&str>,
+) -> anyhow::Result<(Vec<AssetItemVm>, Vec<AssetItemVm>)> {
+    let (artifact_names, attachment_names) =
+        if let (Some(outer_node_id), Some(outer_attempt_id)) = (outer_node_id, outer_attempt_id) {
+            let artifacts_dir = app.paths.dynamic_node_artifacts_dir(
+                task_id,
+                run_id,
+                round_id,
+                outer_node_id,
+                outer_attempt_id,
+                node_id,
+                attempt_id,
+            );
+            let attachments_dir = app.paths.dynamic_node_attachments_dir(
+                task_id,
+                run_id,
+                round_id,
+                outer_node_id,
+                outer_attempt_id,
+                node_id,
+                attempt_id,
+            );
+            (
+                list_file_names_from_dir(&artifacts_dir, true)?,
+                list_file_names_from_dir(&attachments_dir, false)?,
+            )
+        } else {
+            (
+                app.artifact_list(task_id, run_id, round_id, node_id, attempt_id)?,
+                app.attachment_list(task_id, run_id, round_id, node_id, attempt_id)?,
+            )
+        };
+
+    let artifacts = artifact_names
+        .into_iter()
+        .map(|name| asset_item_vm("artifact", round_id, node_id, attempt_id, name))
+        .collect::<Vec<_>>();
+    let attachments = attachment_names
+        .into_iter()
+        .map(|name| asset_item_vm("attachment", round_id, node_id, attempt_id, name))
+        .collect::<Vec<_>>();
+    Ok((artifacts, attachments))
+}
+
+fn find_leaf_by_key(
+    rounds: &[ConversationRoundNodeVm],
+    key: &str,
+) -> Option<ConversationSessionLeafVm> {
+    for round in rounds {
+        for node in &round.nodes {
+            // Check top-level attempts
+            for leaf in &node.attempts {
+                if format!("{}/{}/{}", leaf.round_id, leaf.node_id, leaf.attempt_id) == key {
+                    return Some(leaf.clone());
+                }
+                if leaf.outer_node_id.is_some() {
+                    let outer_key = format!(
+                        "{}/{}/{}/{}/{}",
+                        leaf.round_id,
+                        leaf.outer_node_id.as_deref().unwrap_or(""),
+                        leaf.outer_attempt_id.as_deref().unwrap_or(""),
+                        leaf.node_id,
+                        leaf.attempt_id,
+                    );
+                    if outer_key == key {
+                        return Some(leaf.clone());
+                    }
+                }
+            }
+            // Check dynamic child nodes
+            if let Some(ref outer_nodes) = node.outer_nodes {
+                for on in outer_nodes {
+                    for leaf in &on.attempts {
+                        if let (Some(outer_id), Some(outer_attempt)) = (
+                            leaf.outer_node_id.as_deref(),
+                            leaf.outer_attempt_id.as_deref(),
+                        ) {
+                            let dyn_key = format!(
+                                "{}/{}/{}/{}/{}",
+                                leaf.round_id,
+                                outer_id,
+                                outer_attempt,
+                                leaf.node_id,
+                                leaf.attempt_id,
+                            );
+                            if dyn_key == key {
+                                return Some(leaf.clone());
+                            }
+                        }
+                        if format!("{}/{}/{}", leaf.round_id, leaf.node_id, leaf.attempt_id) == key
+                        {
+                            return Some(leaf.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn latest_session_leaf(rounds: &[ConversationRoundNodeVm]) -> Option<ConversationSessionLeafVm> {
+    let mut latest: Option<ConversationSessionLeafVm> = None;
+    for round in rounds {
+        for node in &round.nodes {
+            for leaf in &node.attempts {
+                if is_leaf_newer(leaf, latest.as_ref()) {
+                    latest = Some(leaf.clone());
+                }
+            }
+            if let Some(ref outer_nodes) = node.outer_nodes {
+                for outer_node in outer_nodes {
+                    for leaf in &outer_node.attempts {
+                        if is_leaf_newer(leaf, latest.as_ref()) {
+                            latest = Some(leaf.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    latest
+}
+
+fn current_session_leaf(rounds: &[ConversationRoundNodeVm]) -> Option<ConversationSessionLeafVm> {
+    for round in rounds {
+        for node in &round.nodes {
+            for leaf in &node.attempts {
+                if leaf.current {
+                    return Some(leaf.clone());
+                }
+            }
+            if let Some(ref outer_nodes) = node.outer_nodes {
+                for outer_node in outer_nodes {
+                    for leaf in &outer_node.attempts {
+                        if leaf.current {
+                            return Some(leaf.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn active_session_leaf(rounds: &[ConversationRoundNodeVm]) -> Option<ConversationSessionLeafVm> {
+    for round in rounds {
+        for node in &round.nodes {
+            for leaf in &node.attempts {
+                if is_active_session_status(&leaf.status) {
+                    return Some(leaf.clone());
+                }
+            }
+            if let Some(ref outer_nodes) = node.outer_nodes {
+                for outer_node in outer_nodes {
+                    for leaf in &outer_node.attempts {
+                        if is_active_session_status(&leaf.status) {
+                            return Some(leaf.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn default_session_leaf(rounds: &[ConversationRoundNodeVm]) -> Option<ConversationSessionLeafVm> {
+    if let Some(leaf) = current_session_leaf(rounds) {
+        return Some(leaf);
+    }
+    if let Some(leaf) = active_session_leaf(rounds) {
+        return Some(leaf);
+    }
+    latest_session_leaf(rounds)
+}
+
+fn normalize_lifecycle_code(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace('_', "-")
+}
+
+fn runtime_error_message(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    pause_reason: Option<&str>,
+    run_outcome: Option<&str>,
+    paused_runtime_error: Option<&RuntimeErrorInfo>,
+) -> Option<String> {
+    if pause_reason.map(normalize_lifecycle_code).as_deref() == Some("error-blocked") {
+        return latest_control_failure_vm(app, task_id, run_id)
+            .ok()
+            .flatten()
+            .map(|failure| failure.message);
+    }
+
+    if pause_reason.map(normalize_lifecycle_code).as_deref() == Some("runtime-abnormal") {
+        return paused_runtime_error
+            .map(|error| error.diagnostic.trim())
+            .filter(|diagnostic| !diagnostic.is_empty())
+            .map(str::to_string);
+    }
+
+    if !matches!(
+        run_outcome.map(normalize_lifecycle_code).as_deref(),
+        Some("failure" | "failed" | "error")
+    ) {
+        return None;
+    }
+
+    latest_control_failure_vm(app, task_id, run_id)
+        .ok()
+        .flatten()
+        .map(|failure| {
+            if failure.title.trim().is_empty() || failure.message.trim().is_empty() {
+                failure.message
+            } else {
+                format!("{}：{}", failure.title, failure.message)
+            }
+        })
+}
+
+const RUN_PAUSED_EVENT_TAIL_BYTES: u64 = 256 * 1024;
+
+/// Reads a bounded tail of an append-only JSONL event file.
+///
+/// The leading partial line is discarded so JSON parsing never consumes a
+/// truncated event. An individual event larger than the bound is omitted
+/// instead of forcing the conversation summary path to load the whole log.
+fn run_event_tail(path: &Utf8Path) -> Option<String> {
+    let mut file = fs::File::open(path.as_std_path()).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    let start = file_len.saturating_sub(RUN_PAUSED_EVENT_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::with_capacity((file_len - start) as usize);
+    file.read_to_end(&mut bytes).ok()?;
+    if start > 0 {
+        let newline = bytes.iter().position(|byte| *byte == b'\n')?;
+        bytes.drain(..=newline);
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Reads the structured error for the current `runtime-abnormal` pause only.
+///
+/// `run.json` is the lifecycle authority. Events remain audit records, and can
+/// provide diagnostics only after their pause timestamp matches that authority.
+fn current_run_paused_runtime_error(
+    app: &App,
+    task_id: &str,
+    run: &RunState,
+) -> Option<RuntimeErrorInfo> {
+    if run.status != RunStatus::Paused || run.pause_reason != Some(PauseReason::RuntimeAbnormal) {
+        return None;
+    }
+
+    let events = run_event_tail(&app.paths.run_events_file(task_id, &run.id))?;
+    for line in events.lines().rev().filter(|line| !line.trim().is_empty()) {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if event.get("type").and_then(|value| value.as_str()) != Some("run_paused") {
+            continue;
+        }
+        if event.get("timestamp").and_then(|value| value.as_str()) != Some(&run.updated_at)
+            || event
+                .pointer("/data/pauseReason")
+                .or_else(|| event.pointer("/data/pause_reason"))
+                .and_then(|value| value.as_str())
+                .map(normalize_lifecycle_code)
+                .as_deref()
+                != Some("runtime-abnormal")
+        {
+            return None;
+        }
+        let runtime_error = event
+            .pointer("/data/controlFailure/runtimeError")
+            .cloned()
+            .or_else(|| {
+                event
+                    .pointer("/data/control_failure/runtime_error")
+                    .cloned()
+            });
+        return runtime_error
+            .and_then(|value| serde_json::from_value::<RuntimeErrorInfo>(value).ok());
+    }
+    None
+}
+
+fn dynamic_leaf_runtime_error_message(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    leaf: &ConversationSessionLeafVm,
+) -> Option<String> {
+    let (outer_node_id, outer_attempt_id) = leaf
+        .outer_node_id
+        .as_deref()
+        .zip(leaf.outer_attempt_id.as_deref())?;
+    let graph_path = app.paths.dynamic_graph_file(
+        task_id,
+        run_id,
+        &leaf.round_id,
+        outer_node_id,
+        outer_attempt_id,
+    );
+    let graph = load_dynamic_graph(&graph_path, &app.paths.repo_root).ok()?;
+    let diagnostic = graph
+        .nodes
+        .iter()
+        .find(|node| node.id == leaf.node_id)?
+        .runtime_error
+        .as_ref()?
+        .diagnostic
+        .trim();
+    (!diagnostic.is_empty()).then(|| format_runtime_error_reason(diagnostic))
+}
+
+#[cfg(test)]
+fn runtime_error_message_from_summary(summary: &str) -> Option<String> {
+    let summary = summary.trim();
+    if summary.is_empty() {
+        return None;
+    }
+    let reason = summary
+        .split_once(" blocked at ")
+        .and_then(|(_, blocked)| blocked.split_once(": ").map(|(_, reason)| reason.trim()))
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or(summary);
+    Some(format_runtime_error_reason(reason))
+}
+
+fn format_runtime_error_reason(reason: &str) -> String {
+    let reason = reason.trim();
+    let Some((json_start, error_value)) = find_embedded_json_object(reason) else {
+        return reason.to_string();
+    };
+    let formatted = format_json_error_payload(&error_value);
+    if json_start == 0 {
+        return formatted;
+    }
+    let prefix = reason[..json_start].trim_end();
+    if prefix.ends_with(':') {
+        format!("{prefix} {formatted}")
+    } else {
+        format!("{prefix}: {formatted}")
+    }
+}
+
+fn find_embedded_json_object(text: &str) -> Option<(usize, serde_json::Value)> {
+    text.char_indices()
+        .filter(|(_, ch)| *ch == '{')
+        .find_map(|(index, _)| {
+            serde_json::from_str(&text[index..])
+                .ok()
+                .map(|value| (index, value))
+        })
+}
+
+fn format_json_error_payload(value: &serde_json::Value) -> String {
+    let details = value
+        .pointer("/data/details")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("details").and_then(serde_json::Value::as_str));
+    let message = value.get("message").and_then(serde_json::Value::as_str);
+    let code = value.get("code").map(|code| match code {
+        serde_json::Value::String(code) => code.clone(),
+        other => other.to_string(),
+    });
+
+    match (details, message, code.as_deref()) {
+        (Some(details), Some(message), _) if details != message => format!("{details} ({message})"),
+        (Some(details), _, _) => details.to_string(),
+        (None, Some(message), Some(code)) => format!("{message} ({code})"),
+        (None, Some(message), None) => message.to_string(),
+        _ => value.to_string(),
+    }
+}
+
+fn is_active_session_status(status: &str) -> bool {
+    matches!(
+        normalize_lifecycle_code(status).as_str(),
+        "pending"
+            | "ready"
+            | "running"
+            | "in-progress"
+            | "active"
+            | "sending"
+            | "cancelling"
+            | "cancel-requested"
+    )
+}
+
+fn is_runtime_continue_pause_reason(pause_reason: Option<&str>) -> bool {
+    matches!(
+        pause_reason.map(normalize_lifecycle_code).as_deref(),
+        Some("process-interrupted" | "runtime-abnormal")
+    )
+}
+
+fn runtime_continue_kind(
+    runtime_status: &str,
+    runtime_outcome: Option<&str>,
+    runtime_continue_owner: bool,
+    pause_reason: Option<&str>,
+    runtime_resumable: bool,
+    manual_check_pending: bool,
+    is_orchestrated: bool,
+) -> Option<String> {
+    if !runtime_continue_owner || !is_orchestrated || manual_check_pending || !runtime_resumable {
+        return None;
+    }
+    if !matches!(
+        pause_reason.map(normalize_lifecycle_code).as_deref(),
+        Some("process-interrupted" | "runtime-abnormal")
+    ) {
+        return None;
+    }
+    match (
+        normalize_lifecycle_code(runtime_status).as_str(),
+        runtime_outcome.map(normalize_lifecycle_code).as_deref(),
+    ) {
+        ("paused", None) => Some("continue-current-attempt".to_string()),
+        ("completed", Some("success")) => Some("recover-completed-attempt".to_string()),
+        _ => None,
+    }
+}
+
+fn runtime_execution_phase_code(phase: RuntimeExecutionPhase) -> &'static str {
+    match phase {
+        RuntimeExecutionPhase::StartingNode => "starting-node",
+        RuntimeExecutionPhase::RunningNode => "running-node",
+        RuntimeExecutionPhase::FinalizingArtifact => "finalizing-artifact",
+        RuntimeExecutionPhase::RepairingArtifact => "repairing-artifact",
+        RuntimeExecutionPhase::AwaitingManualCheck => "awaiting-manual-check",
+        RuntimeExecutionPhase::Transitioning => "transitioning",
+        RuntimeExecutionPhase::LaunchingNextNode => "launching-next-node",
+        RuntimeExecutionPhase::PreparingWorkspace => "preparing-workspace",
+        RuntimeExecutionPhase::Paused => "paused",
+        RuntimeExecutionPhase::Terminal => "terminal",
+    }
+}
+
+fn runtime_execution_applies_to_attempt(
+    execution: &RuntimeExecutionState,
+    round_id: &str,
+    node_id: &str,
+    attempt_id: &str,
+    outer_node_id: Option<&str>,
+    outer_attempt_id: Option<&str>,
+) -> bool {
+    execution.locator.as_ref().is_some_and(|locator| {
+        locator.round_id == round_id
+            && match (outer_node_id, outer_attempt_id) {
+                (Some(outer_node_id), Some(outer_attempt_id)) => {
+                    (locator.node_id == node_id
+                        && locator.attempt_id == attempt_id
+                        && locator.outer_node_id.as_deref() == Some(outer_node_id)
+                        && locator.outer_attempt_id.as_deref() == Some(outer_attempt_id))
+                        || (locator.node_id == outer_node_id
+                            && locator.attempt_id == outer_attempt_id
+                            && locator.outer_node_id.is_none()
+                            && locator.outer_attempt_id.is_none())
+                }
+                _ => {
+                    locator.node_id == node_id
+                        && locator.attempt_id == attempt_id
+                        && locator.outer_node_id.is_none()
+                        && locator.outer_attempt_id.is_none()
+                }
+            }
+    })
+}
+
+fn dynamic_node_runtime_execution(
+    node: &sasuke::dynamic::DynamicNodeState,
+) -> Option<RuntimeExecutionState> {
+    node.runtime_execution_phase
+        .map(|phase| RuntimeExecutionState {
+            revision: node.runtime_lifecycle_revision,
+            phase,
+            locator: None,
+            recovery_candidate_token: None,
+            updated_at: node
+                .runtime_lifecycle_updated_at
+                .clone()
+                .unwrap_or_default(),
+        })
+}
+
+fn dynamic_attempt_runtime_execution(
+    run: &sasuke::runtime::RunState,
+    graph: &sasuke::dynamic::DynamicGraphState,
+    node: &sasuke::dynamic::DynamicNodeState,
+) -> Option<RuntimeExecutionState> {
+    let graph_owns_transitional_leaf = graph.run.status == DynamicRunStatus::Running
+        && (sasuke::dynamic::dynamic_runtime_owns_leaf_projection(graph, node)
+            || (node.status == sasuke::dynamic::DynamicNodeStatus::Paused
+                && graph
+                    .run
+                    .current_node_ids
+                    .iter()
+                    .any(|node_id| node_id == &node.id)));
+    let execution = if (run.status == RunStatus::Paused && node.outcome.is_none())
+        || graph_owns_transitional_leaf
+    {
+        Some(run.execution.clone())
+    } else {
+        dynamic_node_runtime_execution(node).or_else(|| {
+            (node.status == sasuke::dynamic::DynamicNodeStatus::Ready).then(|| {
+                RuntimeExecutionState {
+                    revision: node.runtime_lifecycle_revision,
+                    phase: RuntimeExecutionPhase::StartingNode,
+                    locator: None,
+                    recovery_candidate_token: None,
+                    updated_at: node
+                        .runtime_lifecycle_updated_at
+                        .clone()
+                        .unwrap_or_else(|| graph.run.updated_at.clone()),
+                }
+            })
+        })
+    };
+    execution.map(|mut execution| {
+        // Phase ownership may temporarily move to the outer AI-DYNAMIC run,
+        // but ordering remains leaf-owned. Graph transitions advance this
+        // watermark before publishing the corresponding leaf session update.
+        execution.revision = node.runtime_lifecycle_revision;
+        execution
+    })
+}
+
+fn acp_session_availability(session_status: Option<&str>, established: bool) -> String {
+    let normalized = session_status.map(normalize_lifecycle_code);
+    if matches!(normalized.as_deref(), Some("restorable")) {
+        "restorable".to_string()
+    } else if established || matches!(normalized.as_deref(), Some("established")) {
+        "established".to_string()
+    } else {
+        "unavailable".to_string()
+    }
+}
+
+fn acp_latest_turn_status(session_status: Option<&str>) -> String {
+    match session_status.map(normalize_lifecycle_code).as_deref() {
+        Some("completed" | "complete") => "completed",
+        Some("cancelled" | "canceled") => "cancelled",
+        Some("failed" | "failure" | "error" | "killed") => "failed",
+        _ => "none",
+    }
+    .to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttemptControlProjection {
+    mode: TurnControlMode,
+    transition_cause: Option<TurnControlTransitionCause>,
+}
+
+fn attempt_control_projection(
+    attempt_dir: &Utf8Path,
+    is_orchestrated: bool,
+) -> AttemptControlProjection {
+    load_runtime_control_cursor(attempt_dir)
+        .ok()
+        .flatten()
+        .map(|cursor| AttemptControlProjection {
+            mode: cursor.current_mode,
+            transition_cause: Some(cursor.transition_cause),
+        })
+        .unwrap_or(AttemptControlProjection {
+            mode: if is_orchestrated {
+                TurnControlMode::RuntimeControlled
+            } else {
+                TurnControlMode::NonRuntimeControlled
+            },
+            transition_cause: None,
+        })
+}
+
+#[cfg(test)]
+fn attempt_control_mode(attempt_dir: &Utf8Path, is_orchestrated: bool) -> TurnControlMode {
+    attempt_control_projection(attempt_dir, is_orchestrated).mode
+}
+
+fn composer_for_lifecycle(
+    runtime_phase: &str,
+    runtime_active: bool,
+    acp_active: bool,
+    acp_stopping: bool,
+    live_turn_activity: &str,
+    continue_kind: Option<&str>,
+    runtime_display: &RuntimeDisplayVm,
+) -> ConversationComposerVm {
+    let mode = if acp_stopping {
+        "stopping"
+    } else if runtime_active || acp_active {
+        "runtime-active"
+    } else if continue_kind.is_some() {
+        "normal"
+    } else if runtime_display.blocking_error {
+        "runtime-error"
+    } else {
+        "normal"
+    };
+    let submit_target = match mode {
+        "normal" => "acp-prompt",
+        _ => "none",
+    };
+    let processing_kind = match mode {
+        "stopping" => "stopping",
+        "runtime-active" if runtime_phase == "launching-next-node" => "launching-next-node",
+        "runtime-active" if runtime_phase == "preparing-workspace" => "preparing-workspace",
+        "runtime-active" if !runtime_active && live_turn_activity == "starting" => "launching",
+        "runtime-active" => "processing",
+        _ => "processing",
+    };
+    let status_key = match mode {
+        "stopping" => Some("acp.stopping"),
+        "runtime-active" if runtime_phase == "launching-next-node" => {
+            Some("conversation.runtime.launchingNextNode")
+        }
+        "runtime-active" if runtime_phase == "preparing-workspace" => {
+            Some("conversation.runtime.preparingDevelopmentEnvironment")
+        }
+        "runtime-active" => Some("conversation.runtime.runtimeActive"),
+        _ => None,
+    };
+
+    ConversationComposerVm {
+        mode: mode.to_string(),
+        submit_target: submit_target.to_string(),
+        processing_kind: processing_kind.to_string(),
+        status_key: status_key.map(str::to_string),
+        can_stop: runtime_active || acp_active || acp_stopping,
+        lock_input: mode != "normal",
+        superseded_by: None,
+    }
+}
+
+fn apply_dynamic_workspace_transition_composer(
+    graph: &sasuke::dynamic::DynamicGraphState,
+    node: &sasuke::dynamic::DynamicNodeState,
+    lifecycle: &mut ConversationAttemptLifecycleVm,
+) {
+    let processing_completed_leaf_workspace = graph.run.phase
+        == DynamicRunPhase::PreparingWorkspace
+        && node.status == sasuke::dynamic::DynamicNodeStatus::Completed
+        && node.outcome == Some(NodeOutcome::Success)
+        && sasuke::dynamic::dynamic_runtime_owns_leaf_projection(graph, node)
+        && lifecycle.runtime.active
+        && lifecycle.runtime.phase == "preparing-workspace";
+    if !processing_completed_leaf_workspace {
+        return;
+    }
+
+    lifecycle.composer.processing_kind = "processing-workspace".to_string();
+    lifecycle.composer.status_key = Some("conversation.runtime.processingWorkspace".to_string());
+}
+
+fn derive_conversation_attempt_lifecycle_with_facets(
+    session_status: Option<&str>,
+    prompt_activity: Option<PromptActivity>,
+    runtime_status: &str,
+    runtime_outcome: Option<&str>,
+    current: bool,
+    runtime_continue_owner: bool,
+    pause_reason: Option<&str>,
+    runtime_resumable: bool,
+    manual_check_pending: bool,
+    is_orchestrated: bool,
+    runtime_revision: Option<u64>,
+    runtime_execution: Option<&RuntimeExecutionState>,
+    execution_current: bool,
+    control_mode: TurnControlMode,
+    control_transition_cause: Option<TurnControlTransitionCause>,
+    session_established: bool,
+) -> ConversationAttemptLifecycleVm {
+    let session_status = session_status
+        .map(str::trim)
+        .filter(|status| !status.is_empty() && !status.eq_ignore_ascii_case("unknown"))
+        .map(str::to_string);
+    let normalized_runtime_status = normalize_lifecycle_code(runtime_status);
+    let runtime_paused = normalized_runtime_status == "paused";
+    let runtime_pause_releases_control = runtime_paused
+        && (runtime_resumable
+            || manual_check_pending
+            || matches!(
+                pause_reason.map(normalize_lifecycle_code).as_deref(),
+                Some("error-blocked" | "waiting-for-user-input")
+            ));
+    let runtime_active = runtime_execution.is_some_and(|execution| {
+        execution_current
+            && !runtime_pause_releases_control
+            && !matches!(
+                normalized_runtime_status.as_str(),
+                "completed" | "complete" | "failed" | "failure" | "cancelled" | "canceled"
+            )
+            && !matches!(
+                execution.phase,
+                RuntimeExecutionPhase::Paused
+                    | RuntimeExecutionPhase::AwaitingManualCheck
+                    | RuntimeExecutionPhase::Terminal
+            )
+    });
+    let live_phase = prompt_activity.map(|activity| match activity {
+        PromptActivity::Starting => "starting",
+        PromptActivity::Accepted => "accepted",
+        PromptActivity::Running => "running",
+        PromptActivity::CancelRequested => "cancel-requested",
+    });
+    let live_active = matches!(
+        prompt_activity,
+        Some(PromptActivity::Starting | PromptActivity::Accepted | PromptActivity::Running)
+    );
+    // Only the in-process prompt registry can prove that a turn is currently
+    // active. Persisted session status is history/session availability and may
+    // survive a restart or arrive late; it must not recreate live activity.
+    let acp_stopping = matches!(prompt_activity, Some(PromptActivity::CancelRequested));
+    let runtime_terminal = runtime_execution.is_some_and(|execution| {
+        execution_current && execution.phase == RuntimeExecutionPhase::Terminal
+    });
+    let suppress_stale_acp_active =
+        runtime_terminal && !runtime_resumable && prompt_activity.is_none();
+    let acp_active = live_active;
+    let runtime_pause_overrides_session = runtime_paused
+        && runtime_outcome.is_none()
+        && (pause_reason.is_none()
+            || manual_check_pending
+            || matches!(
+                pause_reason
+                    .as_deref()
+                    .map(normalize_lifecycle_code)
+                    .as_deref(),
+                Some("error-blocked")
+            )
+            || (runtime_resumable && is_runtime_continue_pause_reason(pause_reason)));
+
+    let display_status = if matches!(prompt_activity, Some(PromptActivity::CancelRequested)) {
+        "cancelling".to_string()
+    } else if matches!(prompt_activity, Some(PromptActivity::Starting)) && !runtime_active {
+        "starting".to_string()
+    } else if matches!(
+        prompt_activity,
+        Some(PromptActivity::Accepted | PromptActivity::Running)
+    ) && !runtime_active
+    {
+        "running".to_string()
+    } else if acp_stopping {
+        session_status
+            .clone()
+            .unwrap_or_else(|| "cancelling".to_string())
+    } else if runtime_active || suppress_stale_acp_active || runtime_pause_overrides_session {
+        runtime_status.to_string()
+    } else if acp_active {
+        session_status
+            .clone()
+            .unwrap_or_else(|| runtime_status.to_string())
+    } else {
+        session_status
+            .clone()
+            .unwrap_or_else(|| runtime_status.to_string())
+    };
+    let runtime_display = runtime_display_vm(
+        Some(&display_status),
+        runtime_outcome,
+        current,
+        pause_reason,
+        runtime_resumable,
+    );
+    let continue_kind = runtime_continue_kind(
+        runtime_status,
+        runtime_outcome,
+        runtime_continue_owner,
+        pause_reason,
+        runtime_resumable,
+        manual_check_pending,
+        is_orchestrated,
+    );
+    let runtime_phase = runtime_execution
+        .filter(|_| execution_current)
+        .map(|execution| runtime_execution_phase_code(execution.phase).to_string())
+        .unwrap_or_else(|| "idle".to_string());
+    let composer = composer_for_lifecycle(
+        &runtime_phase,
+        runtime_active,
+        acp_active,
+        acp_stopping,
+        live_phase.unwrap_or("idle"),
+        continue_kind.as_deref(),
+        &runtime_display,
+    );
+
+    let effective_control_mode =
+        if runtime_pause_releases_control || manual_check_pending || runtime_terminal {
+            TurnControlMode::NonRuntimeControlled
+        } else {
+            control_mode
+        };
+    let effective_control_transition_cause = if effective_control_mode == control_mode {
+        control_transition_cause
+    } else if runtime_terminal {
+        Some(TurnControlTransitionCause::RuntimeTerminal)
+    } else {
+        None
+    };
+
+    ConversationAttemptLifecycleVm {
+        runtime: ConversationRuntimeFacetVm {
+            status: runtime_status.to_string(),
+            outcome: runtime_outcome.map(str::to_string),
+            pause_reason: pause_reason.map(str::to_string),
+            resumable: runtime_resumable,
+            current,
+            active: runtime_active,
+            continuable: continue_kind.is_some(),
+            phase: runtime_phase,
+            // The revision is the watermark of the Runtime snapshot used to
+            // derive this facet, not proof that this attempt currently owns
+            // execution. Non-current workflow leaves must still advance this
+            // watermark so a fresh inactive projection can replace an older
+            // locally cached active facet. `active` and `phase` remain gated
+            // by the exact execution locator above. Direct carries the run
+            // revision only as an ordering watermark and still passes no
+            // Runtime execution; AI-DYNAMIC supplies its leaf-owned execution.
+            revision: runtime_revision,
+        },
+        control: ConversationControlFacetVm {
+            mode: match effective_control_mode {
+                TurnControlMode::RuntimeControlled => "runtime-controlled",
+                TurnControlMode::NonRuntimeControlled => "non-runtime-controlled",
+            }
+            .to_string(),
+            transition_cause: effective_control_transition_cause,
+        },
+        acp: ConversationAcpFacetVm {
+            revision: 0,
+            turn_id: None,
+            prompt_event_id: None,
+            session_availability: acp_session_availability(
+                session_status.as_deref(),
+                session_established,
+            ),
+            live_turn_activity: live_phase.unwrap_or("idle").to_string(),
+            latest_turn_status: acp_latest_turn_status(session_status.as_deref()),
+            stopping: acp_stopping,
+            stop_reason: None,
+            turn_error: None,
+            operation_id: None,
+        },
+        display_status,
+        runtime_display,
+        continue_kind,
+        composer,
+        prompt_queue: None,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn derive_conversation_attempt_lifecycle(
+    session_status: Option<&str>,
+    prompt_activity: Option<PromptActivity>,
+    runtime_status: &str,
+    runtime_outcome: Option<&str>,
+    current: bool,
+    pause_reason: Option<&str>,
+    runtime_resumable: bool,
+    manual_check_pending: bool,
+    is_orchestrated: bool,
+) -> ConversationAttemptLifecycleVm {
+    let execution_phase = match normalize_lifecycle_code(runtime_status).as_str() {
+        "running" | "pending" | "active" => RuntimeExecutionPhase::RunningNode,
+        "paused" if manual_check_pending => RuntimeExecutionPhase::AwaitingManualCheck,
+        "paused" => RuntimeExecutionPhase::Paused,
+        _ => RuntimeExecutionPhase::Terminal,
+    };
+    let execution = RuntimeExecutionState {
+        revision: 1,
+        phase: execution_phase,
+        locator: None,
+        recovery_candidate_token: None,
+        updated_at: String::new(),
+    };
+    derive_conversation_attempt_lifecycle_with_facets(
+        session_status,
+        prompt_activity,
+        runtime_status,
+        runtime_outcome,
+        current,
+        current,
+        pause_reason,
+        runtime_resumable,
+        manual_check_pending,
+        is_orchestrated,
+        is_orchestrated.then_some(execution.revision),
+        is_orchestrated.then_some(&execution),
+        is_orchestrated,
+        if is_orchestrated {
+            TurnControlMode::RuntimeControlled
+        } else {
+            TurnControlMode::NonRuntimeControlled
+        },
+        None,
+        session_status.is_some(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn conversation_attempt_lifecycle_vm(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    round_id: &str,
+    node_id: &str,
+    attempt_id: &str,
+    outer_node_id: Option<&str>,
+    outer_attempt_id: Option<&str>,
+) -> anyhow::Result<ConversationAttemptLifecycleVm> {
+    let run = app.run_status(task_id, run_id)?;
+    let run_pause_reason = run.pause_reason.as_ref().map(enum_label);
+    let runtime_resumable = is_run_continuable(&run);
+    let is_orchestrated = conversation_is_orchestrated(app, task_id);
+
+    if let (Some(outer_node_id), Some(outer_attempt_id)) = (outer_node_id, outer_attempt_id) {
+        let session_status = dynamic_acp_session_status(
+            app,
+            task_id,
+            run_id,
+            round_id,
+            outer_node_id,
+            outer_attempt_id,
+            node_id,
+            attempt_id,
+        )?;
+        let dynamic_path = app.paths.dynamic_graph_file(
+            task_id,
+            run_id,
+            round_id,
+            outer_node_id,
+            outer_attempt_id,
+        );
+        let dynamic_graph = load_dynamic_graph(&dynamic_path, &app.paths.repo_root)?;
+        let dynamic_node = dynamic_graph
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .ok_or_else(|| anyhow::anyhow!("dynamic node `{}` not found", node_id))?;
+        let raw_runtime_status = enum_label(&dynamic_node.status);
+        let pause_reason = display_pause_reason_for_dynamic_attempt(
+            app,
+            task_id,
+            run_id,
+            round_id,
+            outer_node_id,
+            outer_attempt_id,
+            node_id,
+            attempt_id,
+            dynamic_node,
+            run_pause_reason.as_deref(),
+        );
+        let dynamic_runtime_owns_leaf =
+            sasuke::dynamic::dynamic_runtime_owns_leaf_projection(&dynamic_graph, dynamic_node);
+        let runtime_status = if dynamic_runtime_owns_leaf {
+            "running".to_string()
+        } else if run.status == RunStatus::Paused
+            && raw_runtime_status == "running"
+            && dynamic_node.outcome.is_none()
+            && is_runtime_continue_pause_reason(pause_reason.as_deref())
+        {
+            "paused".to_string()
+        } else {
+            raw_runtime_status
+        };
+        let outcome = dynamic_node.outcome.as_ref().map(enum_label);
+        let run_paused_for_current_leaf = run_pause_reason.as_deref().is_some_and(|reason| {
+            normalize_lifecycle_code(reason) == "error-blocked"
+                || is_runtime_continue_pause_reason(Some(reason))
+        });
+        let current = run.current_round.as_deref() == Some(round_id)
+            && run.current_node.as_deref() == Some(outer_node_id)
+            && run.current_attempt.as_deref() == Some(outer_attempt_id)
+            && (dynamic_graph
+                .run
+                .current_node_ids
+                .iter()
+                .any(|id| id == node_id)
+                || dynamic_runtime_owns_leaf
+                || (run_paused_for_current_leaf
+                    && dynamic_node.status == sasuke::dynamic::DynamicNodeStatus::Paused
+                    && dynamic_node.outcome.is_none()));
+        let runtime_continue_owner = run.current_round.as_deref() == Some(round_id)
+            && run.current_node.as_deref() == Some(outer_node_id)
+            && run.current_attempt.as_deref() == Some(outer_attempt_id);
+        let leaf_resumable = runtime_status == "paused"
+            && outcome.is_none()
+            && is_runtime_continue_pause_reason(pause_reason.as_deref());
+        let attempt_dir = app.paths.dynamic_node_attempt_dir(
+            task_id,
+            run_id,
+            round_id,
+            outer_node_id,
+            outer_attempt_id,
+            node_id,
+            attempt_id,
+        );
+        let session_presence = acp_session_presence(&attempt_dir);
+        let leaf_execution = dynamic_attempt_runtime_execution(&run, &dynamic_graph, dynamic_node);
+        let control = attempt_control_projection(&attempt_dir, is_orchestrated);
+        let mut lifecycle = derive_conversation_attempt_lifecycle_with_facets(
+            session_status.as_deref(),
+            prompt_activity(&attempt_dir),
+            &runtime_status,
+            outcome.as_deref(),
+            current,
+            runtime_continue_owner,
+            pause_reason.as_deref(),
+            leaf_resumable,
+            false,
+            is_orchestrated,
+            leaf_execution.as_ref().map(|execution| execution.revision),
+            leaf_execution.as_ref(),
+            leaf_execution.is_some(),
+            control.mode,
+            control.transition_cause,
+            session_presence.established,
+        );
+        attach_acp_lifecycle_header(&attempt_dir, &mut lifecycle);
+        attach_direct_prompt_queue(app, task_id, &attempt_dir, &mut lifecycle);
+        apply_dynamic_workspace_transition_composer(&dynamic_graph, dynamic_node, &mut lifecycle);
+        return Ok(lifecycle);
+    }
+
+    let session_status = acp_session_status(app, task_id, run_id, round_id, node_id, attempt_id)?;
+    let node_path = app
+        .paths
+        .node_file(task_id, run_id, round_id, node_id, attempt_id);
+    let node = read_json::<sasuke::runtime::NodeState>(&node_path)?;
+    let runtime_status = enum_label(&node.status);
+    let outcome = node.outcome.as_ref().map(enum_label);
+    let current = run.current_round.as_deref() == Some(round_id)
+        && run.current_node.as_deref() == Some(node_id)
+        && run.current_attempt.as_deref() == Some(attempt_id);
+    let pause_reason = display_pause_reason_for_attempt(
+        app,
+        task_id,
+        run_id,
+        round_id,
+        node_id,
+        attempt_id,
+        run_pause_reason.as_deref(),
+    );
+    let attempt_dir = app
+        .paths
+        .attempt_dir(task_id, run_id, round_id, node_id, attempt_id);
+    let session_presence = acp_session_presence(&attempt_dir);
+    let control = attempt_control_projection(&attempt_dir, is_orchestrated);
+    let mut lifecycle = derive_conversation_attempt_lifecycle_with_facets(
+        session_status.as_deref(),
+        prompt_activity(&attempt_dir),
+        &runtime_status,
+        outcome.as_deref(),
+        current,
+        current,
+        pause_reason.as_deref(),
+        runtime_resumable,
+        node.manual_check_pending,
+        is_orchestrated,
+        Some(run.execution.revision),
+        is_orchestrated.then_some(&run.execution),
+        current
+            && runtime_execution_applies_to_attempt(
+                &run.execution,
+                round_id,
+                node_id,
+                attempt_id,
+                None,
+                None,
+            ),
+        control.mode,
+        control.transition_cause,
+        session_presence.established,
+    );
+    attach_acp_lifecycle_header(&attempt_dir, &mut lifecycle);
+    attach_direct_prompt_queue(app, task_id, &attempt_dir, &mut lifecycle);
+    Ok(lifecycle)
+}
+
+fn attach_acp_lifecycle_header(
+    attempt_dir: &Utf8Path,
+    lifecycle: &mut ConversationAttemptLifecycleVm,
+) {
+    let snapshot = attempt_dir.join("acp.snapshot.json");
+    let session = attempt_dir.join("acp.session.json");
+    let header = [snapshot.as_path(), session.as_path()]
+        .into_iter()
+        .find_map(|path| {
+            sasuke::acp::events::read_lifecycle_header_snapshot(path)
+                .ok()
+                .flatten()
+        });
+    let Some(header) = header else { return };
+    lifecycle.acp.revision = header.revision;
+    lifecycle.acp.turn_id = header.turn_id;
+    lifecycle.acp.prompt_event_id = header.prompt_event_id;
+    lifecycle.acp.session_availability = match header.availability {
+        sasuke::acp::events::AcpSessionAvailability::Established => "established",
+        sasuke::acp::events::AcpSessionAvailability::Restorable => "restorable",
+        sasuke::acp::events::AcpSessionAvailability::Unavailable => "unavailable",
+        sasuke::acp::events::AcpSessionAvailability::Closing => "closing",
+    }
+    .to_string();
+    lifecycle.acp.live_turn_activity = match header.live_turn_activity {
+        sasuke::acp::events::AcpLiveTurnActivity::Idle => "idle",
+        sasuke::acp::events::AcpLiveTurnActivity::Starting => "starting",
+        sasuke::acp::events::AcpLiveTurnActivity::Accepted => "accepted",
+        sasuke::acp::events::AcpLiveTurnActivity::Running => "running",
+        sasuke::acp::events::AcpLiveTurnActivity::CancelRequested => "cancel-requested",
+    }
+    .to_string();
+    lifecycle.acp.latest_turn_status = match header.latest_turn_status {
+        sasuke::acp::events::AcpLatestTurnStatus::None => "none",
+        sasuke::acp::events::AcpLatestTurnStatus::Completed => "completed",
+        sasuke::acp::events::AcpLatestTurnStatus::Cancelled => "cancelled",
+        sasuke::acp::events::AcpLatestTurnStatus::Failed => "failed",
+    }
+    .to_string();
+    lifecycle.acp.stopping =
+        header.live_turn_activity == sasuke::acp::events::AcpLiveTurnActivity::CancelRequested;
+    lifecycle.acp.stop_reason = header.stop_reason;
+    lifecycle.acp.turn_error = header.turn_error;
+    lifecycle.acp.operation_id = header.operation_id;
+    // The snapshot header may arrive after the broader runtime facet. Rebuild
+    // the derived projection from the merged canonical facets so a terminal
+    // header cannot leave the composer locked by an older running projection.
+    let acp_active = matches!(
+        header.live_turn_activity,
+        sasuke::acp::events::AcpLiveTurnActivity::Starting
+            | sasuke::acp::events::AcpLiveTurnActivity::Accepted
+            | sasuke::acp::events::AcpLiveTurnActivity::Running
+    );
+    let display_status = if lifecycle.acp.stopping {
+        "cancelling".to_string()
+    } else if acp_active && !lifecycle.runtime.active {
+        match header.live_turn_activity {
+            sasuke::acp::events::AcpLiveTurnActivity::Starting => "starting".to_string(),
+            _ => "running".to_string(),
+        }
+    } else if lifecycle.runtime.active {
+        lifecycle.runtime.status.clone()
+    } else {
+        lifecycle.display_status.clone()
+    };
+    lifecycle.display_status = display_status.clone();
+    lifecycle.runtime_display = runtime_display_vm(
+        Some(&display_status),
+        lifecycle.runtime.outcome.as_deref(),
+        lifecycle.runtime.current,
+        lifecycle.runtime.pause_reason.as_deref(),
+        lifecycle.runtime.resumable,
+    );
+    lifecycle.composer = composer_for_lifecycle(
+        &lifecycle.runtime.phase,
+        lifecycle.runtime.active,
+        acp_active,
+        lifecycle.acp.stopping,
+        &lifecycle.acp.live_turn_activity,
+        lifecycle.continue_kind.as_deref(),
+        &lifecycle.runtime_display,
+    );
+}
+
+#[cfg(test)]
+fn conversation_status_from_session(
+    session_status: Option<&str>,
+    runtime_status: &str,
+    run_pause_reason: Option<&str>,
+    runtime_resumable: bool,
+) -> String {
+    derive_conversation_attempt_lifecycle(
+        session_status,
+        None,
+        runtime_status,
+        None,
+        false,
+        run_pause_reason,
+        runtime_resumable,
+        false,
+        true,
+    )
+    .display_status
+}
+
+fn lifecycle_is_active(
+    lifecycle: &ConversationAttemptLifecycleVm,
+    manual_check_pending: bool,
+) -> bool {
+    manual_check_pending
+        || lifecycle.runtime.active
+        || lifecycle.acp.live_turn_activity != "idle"
+        || lifecycle.acp.stopping
+}
+
+fn is_leaf_newer(
+    candidate: &ConversationSessionLeafVm,
+    current: Option<&ConversationSessionLeafVm>,
+) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+    leaf_order_key(candidate) > leaf_order_key(current)
+}
+
+fn leaf_order_key(leaf: &ConversationSessionLeafVm) -> (&str, &str, &str, &str, &str) {
+    (
+        leaf.started_at
+            .as_deref()
+            .or(leaf.finished_at.as_deref())
+            .unwrap_or(""),
+        leaf.round_id.as_str(),
+        leaf.outer_node_id.as_deref().unwrap_or(""),
+        leaf.node_id.as_str(),
+        leaf.attempt_id.as_str(),
+    )
+}
+
+fn conversation_leaf_key(leaf: &ConversationSessionLeafVm) -> String {
+    if leaf.outer_node_id.is_some() {
+        format!(
+            "{}/{}/{}/{}/{}",
+            leaf.round_id,
+            leaf.outer_node_id.as_deref().unwrap_or(""),
+            leaf.outer_attempt_id.as_deref().unwrap_or(""),
+            leaf.node_id,
+            leaf.attempt_id
+        )
+    } else {
+        format!("{}/{}/{}", leaf.round_id, leaf.node_id, leaf.attempt_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ConversationSessionLocator {
+    round_id: String,
+    node_id: String,
+    attempt_id: String,
+    outer_node_id: Option<String>,
+    outer_attempt_id: Option<String>,
+}
+
+impl ConversationSessionLocator {
+    fn target_vm(&self) -> ConversationSessionTargetVm {
+        ConversationSessionTargetVm {
+            round_id: self.round_id.clone(),
+            node_id: self.node_id.clone(),
+            attempt_id: self.attempt_id.clone(),
+            outer_node_id: self.outer_node_id.clone(),
+            outer_attempt_id: self.outer_attempt_id.clone(),
+            path_label: format!("{}/{}", self.node_id, self.attempt_id),
+        }
+    }
+}
+
+fn worker_ref_can_continue(path: &Utf8Path) -> bool {
+    read_json::<WorkerRefState>(path)
+        .ok()
+        .and_then(|worker_ref| worker_ref.continue_ref)
+        .is_some()
+}
+
+fn workflow_edge_continues_session(
+    workflow: &WorkflowDsl,
+    from_node_id: Option<&str>,
+    to_node_id: &str,
+    edge_outcome: Option<&str>,
+) -> bool {
+    let (Some(from_node_id), Some(edge_outcome)) = (from_node_id, edge_outcome) else {
+        return false;
+    };
+    workflow.edges.iter().any(|edge| {
+        edge.from == from_node_id
+            && edge.to == to_node_id
+            && enum_label(&edge.on) == edge_outcome
+            && edge.session == Some(SessionMode::Continue)
+    })
+}
+
+fn resolve_terminal_session_successor(
+    source: &ConversationSessionLocator,
+    direct: &HashMap<ConversationSessionLocator, ConversationSessionLocator>,
+) -> Option<ConversationSessionLocator> {
+    let mut seen = HashSet::from([source.clone()]);
+    let mut current = direct.get(source)?.clone();
+    while seen.insert(current.clone()) {
+        let Some(next) = direct.get(&current) else {
+            return Some(current);
+        };
+        current = next.clone();
+    }
+    None
+}
+
+fn conversation_session_successors_from_state(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    rounds: &[RoundState],
+    workflow: Option<&WorkflowDsl>,
+) -> anyhow::Result<HashMap<ConversationSessionLocator, ConversationSessionTargetVm>> {
+    let mut direct = HashMap::<ConversationSessionLocator, ConversationSessionLocator>::new();
+
+    if let Some(workflow) = workflow {
+        for round in rounds {
+            let mut trace = round.trace.clone();
+            trace.sort_by_key(|step| step.sequence);
+            let mut latest_by_node = HashMap::<String, ConversationSessionLocator>::new();
+            for step in trace {
+                let target = ConversationSessionLocator {
+                    round_id: round.id.clone(),
+                    node_id: step.node_id.clone(),
+                    attempt_id: step.attempt_id.clone(),
+                    outer_node_id: None,
+                    outer_attempt_id: None,
+                };
+                if workflow_edge_continues_session(
+                    workflow,
+                    step.from_node_id.as_deref(),
+                    &step.node_id,
+                    step.edge_outcome.as_deref(),
+                ) && let Some(source) = latest_by_node.get(&step.node_id)
+                {
+                    let worker_ref_path = app.paths.worker_ref_file(
+                        task_id,
+                        run_id,
+                        &source.round_id,
+                        &source.node_id,
+                        &source.attempt_id,
+                    );
+                    if source != &target && worker_ref_can_continue(&worker_ref_path) {
+                        direct.insert(source.clone(), target.clone());
+                    }
+                }
+                latest_by_node.insert(step.node_id, target);
+            }
+        }
+    }
+
+    for round in rounds {
+        for node in app.node_list(task_id, run_id, &round.id)? {
+            if node.node_type != NodeType::AiDynamic {
+                continue;
+            }
+            for outer_attempt in app.attempt_list(task_id, run_id, &round.id, &node.node_id)? {
+                let dynamic_path = app.paths.dynamic_graph_file(
+                    task_id,
+                    run_id,
+                    &round.id,
+                    &node.node_id,
+                    &outer_attempt.attempt_id,
+                );
+                if !dynamic_path.exists() {
+                    continue;
+                }
+                let graph = load_dynamic_graph(&dynamic_path, &app.paths.repo_root)?;
+                for dynamic_node in &graph.nodes {
+                    if dynamic_node.session_mode != SessionMode::Continue {
+                        continue;
+                    }
+                    let Some(source_node_id) = dynamic_node.continue_from_node_id.as_ref() else {
+                        continue;
+                    };
+                    let attempt_id = default_dynamic_attempt_id();
+                    let source = ConversationSessionLocator {
+                        round_id: round.id.clone(),
+                        node_id: source_node_id.clone(),
+                        attempt_id: attempt_id.clone(),
+                        outer_node_id: Some(node.node_id.clone()),
+                        outer_attempt_id: Some(outer_attempt.attempt_id.clone()),
+                    };
+                    let target = ConversationSessionLocator {
+                        round_id: round.id.clone(),
+                        node_id: dynamic_node.id.clone(),
+                        attempt_id: attempt_id.clone(),
+                        outer_node_id: Some(node.node_id.clone()),
+                        outer_attempt_id: Some(outer_attempt.attempt_id.clone()),
+                    };
+                    let source_attempt_dir = app.paths.dynamic_node_attempt_dir(
+                        task_id,
+                        run_id,
+                        &round.id,
+                        &node.node_id,
+                        &outer_attempt.attempt_id,
+                        source_node_id,
+                        &attempt_id,
+                    );
+                    let target_attempt_dir = app.paths.dynamic_node_attempt_dir(
+                        task_id,
+                        run_id,
+                        &round.id,
+                        &node.node_id,
+                        &outer_attempt.attempt_id,
+                        &dynamic_node.id,
+                        &attempt_id,
+                    );
+                    if source != target
+                        && target_attempt_dir.exists()
+                        && worker_ref_can_continue(&source_attempt_dir.join("worker-ref.json"))
+                    {
+                        direct.insert(source, target);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(direct
+        .keys()
+        .filter_map(|source| {
+            resolve_terminal_session_successor(source, &direct)
+                .map(|target| (source.clone(), target.target_vm()))
+        })
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn conversation_session_successor(
+    app: &App,
+    task_id: &str,
+    run_id: &str,
+    round_id: &str,
+    node_id: &str,
+    attempt_id: &str,
+    outer_node_id: Option<&str>,
+    outer_attempt_id: Option<&str>,
+) -> anyhow::Result<Option<ConversationSessionTargetVm>> {
+    if !conversation_is_orchestrated(app, task_id) {
+        return Ok(None);
+    }
+    let round = read_json::<RoundState>(&app.paths.round_file(task_id, run_id, round_id))?;
+    let workflow =
+        read_json::<WorkflowDsl>(&app.paths.workflow_snapshot_file(task_id, run_id)).ok();
+    let successors = conversation_session_successors_from_state(
+        app,
+        task_id,
+        run_id,
+        &[round],
+        workflow.as_ref(),
+    )?;
+    Ok(successors
+        .get(&ConversationSessionLocator {
+            round_id: round_id.to_string(),
+            node_id: node_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            outer_node_id: outer_node_id.map(str::to_string),
+            outer_attempt_id: outer_attempt_id.map(str::to_string),
+        })
+        .cloned())
+}
+
+fn mark_composer_session_superseded(
+    composer: &mut ConversationComposerVm,
+    target: ConversationSessionTargetVm,
+) {
+    composer.mode = "session-superseded".to_string();
+    composer.submit_target = "none".to_string();
+    composer.status_key = None;
+    composer.can_stop = false;
+    composer.lock_input = true;
+    composer.superseded_by = Some(target);
+}
+
+fn apply_session_successors_to_tree(
+    rounds: &mut [ConversationRoundNodeVm],
+    successors: &HashMap<ConversationSessionLocator, ConversationSessionTargetVm>,
+) {
+    for round in rounds {
+        for node in &mut round.nodes {
+            for leaf in &mut node.attempts {
+                let locator = ConversationSessionLocator {
+                    round_id: leaf.round_id.clone(),
+                    node_id: leaf.node_id.clone(),
+                    attempt_id: leaf.attempt_id.clone(),
+                    outer_node_id: leaf.outer_node_id.clone(),
+                    outer_attempt_id: leaf.outer_attempt_id.clone(),
+                };
+                if let Some(target) = successors.get(&locator) {
+                    mark_composer_session_superseded(&mut leaf.lifecycle.composer, target.clone());
+                }
+            }
+            if let Some(outer_nodes) = &mut node.outer_nodes {
+                for outer_node in outer_nodes {
+                    for leaf in &mut outer_node.attempts {
+                        let locator = ConversationSessionLocator {
+                            round_id: leaf.round_id.clone(),
+                            node_id: leaf.node_id.clone(),
+                            attempt_id: leaf.attempt_id.clone(),
+                            outer_node_id: leaf.outer_node_id.clone(),
+                            outer_attempt_id: leaf.outer_attempt_id.clone(),
+                        };
+                        if let Some(target) = successors.get(&locator) {
+                            mark_composer_session_superseded(
+                                &mut leaf.lifecycle.composer,
+                                target.clone(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn apply_session_successors_to_active_sessions(
+    sessions: &mut [ConversationActiveSessionVm],
+    successors: &HashMap<ConversationSessionLocator, ConversationSessionTargetVm>,
+) {
+    for session in sessions {
+        let locator = ConversationSessionLocator {
+            round_id: session.round_id.clone(),
+            node_id: session.node_id.clone(),
+            attempt_id: session.attempt_id.clone(),
+            outer_node_id: session.outer_node_id.clone(),
+            outer_attempt_id: session.outer_attempt_id.clone(),
+        };
+        if let Some(target) = successors.get(&locator) {
+            mark_composer_session_superseded(&mut session.lifecycle.composer, target.clone());
+        }
+    }
+}
+
+pub fn conversation_run_vm(
+    app: &App,
+    project_id: &str,
+    task_id: &str,
+    run_id: &str,
+    selected_session_key: Option<&str>,
+) -> anyhow::Result<ConversationRunVm> {
+    // Read the run state from disk
+    let run = match app.run_status(task_id, run_id) {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(anyhow::anyhow!("run not found: {task_id}/{run_id}: {e}"));
+        }
+    };
+
+    // Read the task state for stable task identity.
+    let task_state = app
+        .task_show(task_id)
+        .map_err(|e| anyhow::anyhow!("task not found: {task_id}: {e}"))?;
+    let task_uuid = task_state
+        .uuid
+        .clone()
+        .or_else(|| Some(task_id.to_string()));
+
+    // Read conversation metadata if exists
+    let conversation_metadata = read_conversation_metadata(app, task_id);
+    let run_mode = conversation_metadata
+        .as_ref()
+        .map(|metadata| metadata.run_mode.clone())
+        .unwrap_or_else(|| "workflow".to_string());
+    let is_orchestrated = conversation_run_mode_from_label(&run_mode)
+        .unwrap_or(ConversationRunMode::Workflow)
+        .is_orchestrated();
+
+    // Build the session tree from rounds/nodes/attempts
+    // Read workflow snapshot once for node order + validity + raw JSON
+    let workflow_snapshot: Option<WorkflowDsl> = sasuke::storage::read_json::<WorkflowDsl>(
+        &app.paths.workflow_snapshot_file(task_id, run_id),
+    )
+    .ok();
+    let workflow_node_order: HashMap<String, usize> = workflow_snapshot
+        .as_ref()
+        .map(|dsl| {
+            dsl.nodes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (n.id().to_string(), i))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let rounds = app.round_list(task_id, run_id)?;
+    let session_successors = if is_orchestrated {
+        conversation_session_successors_from_state(
+            app,
+            task_id,
+            run_id,
+            &rounds,
+            workflow_snapshot.as_ref(),
+        )?
+    } else {
+        HashMap::new()
+    };
+    let mut tree_rounds: Vec<ConversationRoundNodeVm> = Vec::new();
+    let mut active_sessions: Vec<ConversationActiveSessionVm> = Vec::new();
+    let run_worktree = run.worktree.as_ref();
+    let run_pause_reason = run.pause_reason.as_ref().map(enum_label);
+    let runtime_resumable = is_run_continuable(&run);
+
+    for round in &rounds {
+        // List all nodes for this round (latest attempt per node)
+        let mut nodes = app.node_list(task_id, run_id, &round.id)?;
+        let trace_node_order: HashMap<String, usize> = {
+            let mut order = HashMap::new();
+            let mut trace = round.trace.clone();
+            trace.sort_by_key(|step| step.sequence);
+            for (index, step) in trace.iter().enumerate() {
+                order.entry(step.node_id.clone()).or_insert(index);
+            }
+            order
+        };
+        // Prefer the actual per-round execution trace. Workflow DSL order is only a fallback for
+        // legacy or synthetic nodes that do not have trace entries.
+        nodes.sort_by_key(|n| {
+            (
+                trace_node_order
+                    .get(&n.node_id)
+                    .copied()
+                    .unwrap_or(usize::MAX),
+                workflow_node_order
+                    .get(&n.node_id)
+                    .copied()
+                    .unwrap_or(usize::MAX),
+            )
+        });
+        let mut tree_nodes: Vec<ConversationTreeNodeVm> = Vec::new();
+
+        for node in &nodes {
+            let is_ai_dynamic = node.node_type == NodeType::AiDynamic;
+            let all_attempts = app.attempt_list(task_id, run_id, &round.id, &node.node_id)?;
+
+            // Build child nodes for AI-DYNAMIC
+            let mut outer_nodes: Option<Vec<ConversationTreeNodeVm>> = None;
+            if is_ai_dynamic {
+                if let Some(latest_attempt) = all_attempts.last() {
+                    let dynamic_path = app.paths.dynamic_graph_file(
+                        task_id,
+                        run_id,
+                        &round.id,
+                        &node.node_id,
+                        &latest_attempt.attempt_id,
+                    );
+                    if let Ok(dynamic_graph) =
+                        load_dynamic_graph(&dynamic_path, &app.paths.repo_root)
+                    {
+                        let mut dynamic_tree_nodes: Vec<ConversationTreeNodeVm> = Vec::new();
+                        for dyn_node in &dynamic_graph.nodes {
+                            // Find the latest attempt for this dynamic child node
+                            let dyn_node_dir = app.paths.dynamic_node_dir(
+                                task_id,
+                                run_id,
+                                &round.id,
+                                &node.node_id,
+                                &latest_attempt.attempt_id,
+                                &dyn_node.id,
+                            );
+                            let mut dyn_attempt_ids = std::fs::read_dir(dyn_node_dir.as_std_path())
+                                .map(|entries| {
+                                    entries
+                                        .filter_map(|e| e.ok())
+                                        .filter(|e| {
+                                            e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                                        })
+                                        .filter_map(|e| e.file_name().into_string().ok())
+                                        .filter(|n| n.starts_with("attempt-"))
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            dyn_attempt_ids.sort();
+                            let dyn_runtime_status = enum_label(&dyn_node.status);
+                            if dyn_attempt_ids.is_empty()
+                                && is_active_session_status(&dyn_runtime_status)
+                            {
+                                dyn_attempt_ids.push(default_dynamic_attempt_id());
+                            }
+
+                            let mut dyn_leafs: Vec<ConversationSessionLeafVm> = Vec::new();
+                            let dyn_outcome = dyn_node.outcome.as_ref().map(enum_label);
+                            let run_paused_for_dyn_leaf =
+                                run_pause_reason.as_deref().is_some_and(|reason| {
+                                    normalize_lifecycle_code(reason) == "error-blocked"
+                                        || is_runtime_continue_pause_reason(Some(reason))
+                                });
+                            let dynamic_parent_current = run.current_round.as_deref()
+                                == Some(&round.id)
+                                && run.current_node.as_deref() == Some(&node.node_id)
+                                && run.current_attempt.as_deref()
+                                    == Some(&latest_attempt.attempt_id);
+                            let graph_owns_dyn_leaf =
+                                sasuke::dynamic::dynamic_runtime_owns_leaf_projection(
+                                    &dynamic_graph,
+                                    dyn_node,
+                                );
+                            let dyn_current = dynamic_parent_current
+                                && (dynamic_graph
+                                    .run
+                                    .current_node_ids
+                                    .iter()
+                                    .any(|id| id == &dyn_node.id)
+                                    || graph_owns_dyn_leaf
+                                    || (run_paused_for_dyn_leaf
+                                        && dyn_node.status
+                                            == sasuke::dynamic::DynamicNodeStatus::Paused
+                                        && dyn_node.outcome.is_none()));
+                            let dyn_base_status = if graph_owns_dyn_leaf {
+                                "running".to_string()
+                            } else if run.status == RunStatus::Paused
+                                && dyn_runtime_status == "running"
+                                && dyn_node.outcome.is_none()
+                                && is_runtime_continue_pause_reason(run_pause_reason.as_deref())
+                            {
+                                "paused".to_string()
+                            } else {
+                                dyn_runtime_status.clone()
+                            };
+                            for dyn_attempt_id in &dyn_attempt_ids {
+                                let dyn_session_status = dynamic_acp_session_status(
+                                    app,
+                                    task_id,
+                                    run_id,
+                                    &round.id,
+                                    &node.node_id,
+                                    &latest_attempt.attempt_id,
+                                    &dyn_node.id,
+                                    dyn_attempt_id,
+                                )?;
+                                let dyn_pause_reason = display_pause_reason_for_dynamic_attempt(
+                                    app,
+                                    task_id,
+                                    run_id,
+                                    &round.id,
+                                    &node.node_id,
+                                    &latest_attempt.attempt_id,
+                                    &dyn_node.id,
+                                    dyn_attempt_id,
+                                    dyn_node,
+                                    run_pause_reason.as_deref(),
+                                );
+                                let dyn_status = if graph_owns_dyn_leaf {
+                                    "running".to_string()
+                                } else if run.status == RunStatus::Paused
+                                    && dyn_runtime_status == "running"
+                                    && dyn_node.outcome.is_none()
+                                    && is_runtime_continue_pause_reason(dyn_pause_reason.as_deref())
+                                {
+                                    "paused".to_string()
+                                } else {
+                                    dyn_runtime_status.clone()
+                                };
+                                let dyn_leaf_resumable = dyn_status == "paused"
+                                    && dyn_outcome.is_none()
+                                    && is_runtime_continue_pause_reason(
+                                        dyn_pause_reason.as_deref(),
+                                    );
+                                let dyn_attempt_dir = app.paths.dynamic_node_attempt_dir(
+                                    task_id,
+                                    run_id,
+                                    &round.id,
+                                    &node.node_id,
+                                    &latest_attempt.attempt_id,
+                                    &dyn_node.id,
+                                    dyn_attempt_id,
+                                );
+                                let session_presence = acp_session_presence(&dyn_attempt_dir);
+                                let leaf_execution = dynamic_attempt_runtime_execution(
+                                    &run,
+                                    &dynamic_graph,
+                                    dyn_node,
+                                );
+                                let control =
+                                    attempt_control_projection(&dyn_attempt_dir, is_orchestrated);
+                                let mut lifecycle =
+                                    derive_conversation_attempt_lifecycle_with_facets(
+                                        dyn_session_status.as_deref(),
+                                        prompt_activity(&dyn_attempt_dir),
+                                        &dyn_status,
+                                        dyn_outcome.as_deref(),
+                                        dyn_current,
+                                        dynamic_parent_current,
+                                        dyn_pause_reason.as_deref(),
+                                        dyn_leaf_resumable,
+                                        false,
+                                        is_orchestrated,
+                                        leaf_execution.as_ref().map(|execution| execution.revision),
+                                        leaf_execution.as_ref(),
+                                        leaf_execution.is_some(),
+                                        control.mode,
+                                        control.transition_cause,
+                                        session_presence.established,
+                                    );
+                                attach_direct_prompt_queue(
+                                    app,
+                                    task_id,
+                                    &dyn_attempt_dir,
+                                    &mut lifecycle,
+                                );
+                                apply_dynamic_workspace_transition_composer(
+                                    &dynamic_graph,
+                                    dyn_node,
+                                    &mut lifecycle,
+                                );
+                                let dyn_status = lifecycle.display_status.clone();
+                                let dyn_runtime_display = lifecycle.runtime_display.clone();
+                                let is_active = lifecycle_is_active(&lifecycle, false);
+                                let session_presence = acp_session_presence(&dyn_attempt_dir);
+                                let (artifacts, attachments) = conversation_session_assets(
+                                    app,
+                                    task_id,
+                                    run_id,
+                                    &round.id,
+                                    &dyn_node.id,
+                                    dyn_attempt_id,
+                                    Some(&node.node_id),
+                                    Some(&latest_attempt.attempt_id),
+                                )?;
+                                let session_worktree = session_worktree_projection(
+                                    run_worktree,
+                                    Some(&dynamic_graph),
+                                    Some(&dyn_node.id),
+                                );
+
+                                dyn_leafs.push(ConversationSessionLeafVm {
+                                    round_id: round.id.clone(),
+                                    node_id: dyn_node.id.clone(),
+                                    attempt_id: dyn_attempt_id.clone(),
+                                    outer_node_id: Some(node.node_id.clone()),
+                                    outer_attempt_id: Some(latest_attempt.attempt_id.clone()),
+                                    path_label: format!("{}/{}", dyn_node.id, dyn_attempt_id),
+                                    status: dyn_status.clone(),
+                                    outcome: dyn_outcome.clone(),
+                                    runtime_display: dyn_runtime_display.clone(),
+                                    lifecycle: lifecycle.clone(),
+                                    current: dyn_current,
+                                    manual_check_pending: false,
+                                    started_at: dyn_node.started_at.clone(),
+                                    finished_at: dyn_node.finished_at.clone(),
+                                    session_id: session_presence.session_id.clone(),
+                                    session_established: session_presence.established,
+                                    worktree_path: session_worktree
+                                        .as_ref()
+                                        .map(|workspace| workspace.path.clone()),
+                                    worktree_branch: session_worktree
+                                        .and_then(|workspace| workspace.branch),
+                                    artifact_count: artifacts.len(),
+                                    attachment_count: attachments.len(),
+                                });
+
+                                if is_active {
+                                    active_sessions.push(ConversationActiveSessionVm {
+                                        round_id: round.id.clone(),
+                                        node_id: dyn_node.id.clone(),
+                                        attempt_id: dyn_attempt_id.clone(),
+                                        outer_node_id: Some(node.node_id.clone()),
+                                        outer_attempt_id: Some(latest_attempt.attempt_id.clone()),
+                                        path_label: format!("{}/{}", dyn_node.id, dyn_attempt_id),
+                                        status: dyn_status.clone(),
+                                        runtime_display: dyn_runtime_display.clone(),
+                                        lifecycle: lifecycle.clone(),
+                                        manual_check_pending: false,
+                                        session_id: session_presence.session_id.clone(),
+                                        session_established: session_presence.established,
+                                        started_at: None,
+                                    });
+                                }
+                            }
+
+                            let dyn_node_status = dyn_leafs
+                                .last()
+                                .map(|l| l.status.clone())
+                                .unwrap_or_else(|| dyn_base_status.clone());
+                            let dyn_node_runtime_display = dyn_leafs
+                                .last()
+                                .map(|l| l.runtime_display.clone())
+                                .unwrap_or_else(|| {
+                                    runtime_display_vm(
+                                        Some(&dyn_base_status),
+                                        dyn_outcome.as_deref(),
+                                        dyn_current,
+                                        run_pause_reason.as_deref(),
+                                        runtime_resumable,
+                                    )
+                                });
+
+                            dynamic_tree_nodes.push(ConversationTreeNodeVm {
+                                node_id: dyn_node.id.clone(),
+                                label: dyn_node.title.clone(),
+                                node_type: format!("dynamic-{}", enum_label(&dyn_node.kind)),
+                                status: dyn_node_status,
+                                runtime_display: dyn_node_runtime_display,
+                                attempts: dyn_leafs,
+                                outer_nodes: None,
+                            });
+                        }
+                        outer_nodes = Some(dynamic_tree_nodes);
+                    }
+                }
+            }
+
+            // Build leafs for the top-level node itself.
+            // AI-DYNAMIC nodes are containers — their real sessions live in outer_nodes.
+            let mut leafs: Vec<ConversationSessionLeafVm> = Vec::new();
+            if !is_ai_dynamic {
+                for attempt in &all_attempts {
+                    let session_status = acp_session_status(
+                        app,
+                        task_id,
+                        run_id,
+                        &round.id,
+                        &node.node_id,
+                        &attempt.attempt_id,
+                    )?;
+                    let runtime_status = enum_label(&attempt.status);
+                    let display_pause_reason = display_pause_reason_for_attempt(
+                        app,
+                        task_id,
+                        run_id,
+                        &round.id,
+                        &node.node_id,
+                        &attempt.attempt_id,
+                        run_pause_reason.as_deref(),
+                    );
+                    let outcome = attempt.outcome.as_ref().map(enum_label);
+                    let current = run.current_round.as_deref() == Some(&round.id)
+                        && run.current_node.as_deref() == Some(&node.node_id)
+                        && run.current_attempt.as_deref() == Some(&attempt.attempt_id);
+                    let manual_check_pending = attempt.manual_check_pending;
+                    let attempt_dir = app.paths.attempt_dir(
+                        task_id,
+                        run_id,
+                        &round.id,
+                        &node.node_id,
+                        &attempt.attempt_id,
+                    );
+                    let session_presence = acp_session_presence(&attempt_dir);
+                    let control = attempt_control_projection(&attempt_dir, is_orchestrated);
+                    let mut lifecycle = derive_conversation_attempt_lifecycle_with_facets(
+                        session_status.as_deref(),
+                        prompt_activity(&attempt_dir),
+                        &runtime_status,
+                        outcome.as_deref(),
+                        current,
+                        current,
+                        display_pause_reason.as_deref(),
+                        runtime_resumable,
+                        manual_check_pending,
+                        is_orchestrated,
+                        Some(run.execution.revision),
+                        is_orchestrated.then_some(&run.execution),
+                        current
+                            && runtime_execution_applies_to_attempt(
+                                &run.execution,
+                                &round.id,
+                                &node.node_id,
+                                &attempt.attempt_id,
+                                None,
+                                None,
+                            ),
+                        control.mode,
+                        control.transition_cause,
+                        session_presence.established,
+                    );
+                    attach_direct_prompt_queue(app, task_id, &attempt_dir, &mut lifecycle);
+                    let status = lifecycle.display_status.clone();
+                    let runtime_display = lifecycle.runtime_display.clone();
+                    let is_active = lifecycle_is_active(&lifecycle, manual_check_pending);
+                    let session_presence = acp_session_presence(&attempt_dir);
+                    let (artifacts, attachments) = conversation_session_assets(
+                        app,
+                        task_id,
+                        run_id,
+                        &round.id,
+                        &node.node_id,
+                        &attempt.attempt_id,
+                        None,
+                        None,
+                    )?;
+                    let session_worktree = session_worktree_projection(run_worktree, None, None);
+                    leafs.push(ConversationSessionLeafVm {
+                        round_id: round.id.clone(),
+                        node_id: node.node_id.clone(),
+                        attempt_id: attempt.attempt_id.clone(),
+                        outer_node_id: None,
+                        outer_attempt_id: None,
+                        path_label: format!("{}/{}", node.node_id, attempt.attempt_id),
+                        status: status.clone(),
+                        outcome,
+                        runtime_display: runtime_display.clone(),
+                        lifecycle: lifecycle.clone(),
+                        current,
+                        manual_check_pending,
+                        started_at: Some(attempt.started_at.clone()),
+                        finished_at: attempt.finished_at.clone(),
+                        session_id: session_presence.session_id.clone(),
+                        session_established: session_presence.established,
+                        worktree_path: session_worktree
+                            .as_ref()
+                            .map(|workspace| workspace.path.clone()),
+                        worktree_branch: session_worktree.and_then(|workspace| workspace.branch),
+                        artifact_count: artifacts.len(),
+                        attachment_count: attachments.len(),
+                    });
+
+                    if is_active {
+                        active_sessions.push(ConversationActiveSessionVm {
+                            round_id: round.id.clone(),
+                            node_id: node.node_id.clone(),
+                            attempt_id: attempt.attempt_id.clone(),
+                            outer_node_id: None,
+                            outer_attempt_id: None,
+                            path_label: format!("{}/{}", node.node_id, attempt.attempt_id),
+                            status,
+                            runtime_display: runtime_display.clone(),
+                            lifecycle: lifecycle.clone(),
+                            manual_check_pending,
+                            session_id: session_presence.session_id.clone(),
+                            session_established: session_presence.established,
+                            started_at: Some(attempt.started_at.clone()),
+                        });
+                    }
+                }
+            }
+
+            let node_status = if is_ai_dynamic {
+                // Derive status from dynamic child nodes
+                outer_nodes
+                    .as_ref()
+                    .and_then(|ons| ons.last())
+                    .map(|on| on.status.clone())
+                    .unwrap_or_else(|| "completed".to_string())
+            } else {
+                all_attempts
+                    .last()
+                    .map(|a| enum_label(&a.status))
+                    .unwrap_or_else(|| "pending".to_string())
+            };
+            let node_runtime_display = if is_ai_dynamic {
+                outer_nodes
+                    .as_ref()
+                    .and_then(|ons| ons.last())
+                    .map(|on| on.runtime_display.clone())
+                    .unwrap_or_else(|| {
+                        runtime_display_vm(
+                            Some(&node_status),
+                            None,
+                            false,
+                            run_pause_reason.as_deref(),
+                            runtime_resumable,
+                        )
+                    })
+            } else {
+                leafs
+                    .last()
+                    .map(|leaf| leaf.runtime_display.clone())
+                    .unwrap_or_else(|| {
+                        runtime_display_vm(
+                            Some(&node_status),
+                            None,
+                            false,
+                            run_pause_reason.as_deref(),
+                            runtime_resumable,
+                        )
+                    })
+            };
+
+            tree_nodes.push(ConversationTreeNodeVm {
+                node_id: node.node_id.clone(),
+                label: node.node_id.clone(),
+                node_type: enum_label(&node.node_type),
+                status: node_status,
+                runtime_display: node_runtime_display,
+                attempts: leafs,
+                outer_nodes,
+            });
+        }
+
+        let round_status = enum_label(&round.status);
+        let round_outcome = round.outcome.as_ref().map(enum_label);
+        tree_rounds.push(ConversationRoundNodeVm {
+            round_id: round.id.clone(),
+            index: round.index,
+            label: format!("round-{:03}", round.index),
+            status: round_status.clone(),
+            runtime_display: runtime_display_vm(
+                Some(&round_status),
+                round_outcome.as_deref(),
+                run.current_round.as_deref() == Some(&round.id),
+                run_pause_reason.as_deref(),
+                runtime_resumable,
+            ),
+            nodes: tree_nodes,
+        });
+    }
+
+    apply_session_successors_to_tree(&mut tree_rounds, &session_successors);
+    apply_session_successors_to_active_sessions(&mut active_sessions, &session_successors);
+
+    // Determine which session leaf to load.
+    let selected_leaf: Option<ConversationSessionLeafVm> = if let Some(key) = selected_session_key {
+        // Find the leaf matching the key by searching the tree.
+        find_leaf_by_key(&tree_rounds, key)
+    } else {
+        // Runtime-owned sessions need a stable UI anchor as soon as the run starts.
+        // Prefer the current/running attempt, then fall back to the newest conversation.
+        default_session_leaf(&tree_rounds)
+    };
+
+    let effective_key: Option<String> = selected_leaf.as_ref().map(conversation_leaf_key);
+
+    // The run aggregate owns navigation and lifecycle only. ACPChatDialog is
+    // the single bounded正文 query boundary for the selected branch.
+    let selected_session: Option<crate::view_models::AcpSessionVm> = None;
+
+    let input_attachments = input_attachments_vm(app, task_id);
+
+    let run_outcome = run.outcome.map(|o| enum_label(&o));
+    let resumable = sasuke::app::is_run_continuable(&run);
+    let run_status = enum_label(&run.status);
+    let paused_runtime_error = current_run_paused_runtime_error(app, task_id, &run);
+    let runtime_error_message = selected_leaf
+        .as_ref()
+        .and_then(|leaf| dynamic_leaf_runtime_error_message(app, task_id, run_id, leaf))
+        .or_else(|| {
+            runtime_error_message(
+                app,
+                task_id,
+                run_id,
+                run_pause_reason.as_deref(),
+                run_outcome.as_deref(),
+                paused_runtime_error.as_ref(),
+            )
+        });
+
+    let (workflow_valid, workflow_json) = if let Some(ref dsl) = workflow_snapshot {
+        (true, Some(serde_json::to_string(dsl).unwrap_or_default()))
+    } else {
+        (true, None)
+    };
+
+    // Build workflow graph from the selected session's runtime locator so the
+    // conversation view keeps AI-DYNAMIC internal graphs even after terminal refreshes.
+    let workflow_graph = selected_leaf
+        .as_ref()
+        .and_then(|leaf| {
+            leaf.outer_node_id
+                .as_deref()
+                .zip(leaf.outer_attempt_id.as_deref())
+                .and_then(|(outer_node_id, outer_attempt_id)| {
+                    dynamic_runtime_graph_vm(
+                        app,
+                        task_id,
+                        run_id,
+                        &leaf.round_id,
+                        outer_node_id,
+                        outer_attempt_id,
+                    )
+                })
+                .or_else(|| {
+                    round_detail_vm(app, task_id, run_id, &leaf.round_id, None)
+                        .ok()
+                        .map(|detail| detail.graph)
+                })
+        })
+        .or_else(|| {
+            workflow_snapshot
+                .as_ref()
+                .map(|dsl| workflow_graph_vm(app, dsl))
+        })
+        .unwrap_or_else(|| GraphVm {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        });
+
+    Ok(ConversationRunVm {
+        workflow_graph,
+        project_id: project_id.to_string(),
+        task_id: task_id.to_string(),
+        task_uuid,
+        run_id: run_id.to_string(),
+        run_mode,
+        workflow_template_id: None,
+        direct_config: conversation_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.direct_config.clone()),
+        agent_identity: conversation_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.agent_identity.clone()),
+        last_activity_at: conversation_metadata.as_ref().and_then(|metadata| {
+            metadata
+                .last_activity_at
+                .clone()
+                .or_else(|| Some(metadata.created_at.clone()))
+        }),
+        run_status,
+        run_outcome,
+        session_tree: ConversationSessionTreeVm {
+            rounds: tree_rounds,
+            selected_session_key: effective_key,
+        },
+        selected_session,
+        active_sessions,
+        input_attachments,
+        workflow_status: "valid".to_string(),
+        workflow_valid,
+        workflow_error: None,
+        workflow_json,
+        resumable,
+        pause_reason: run.pause_reason.map(|r| enum_label(&r)),
+        runtime_error_message,
+        runtime_error: paused_runtime_error,
+        scheduled_task_id: conversation_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.scheduled_task_id.clone()),
+        worktree: conversation_run_worktree_vm(run.worktree.as_ref()),
+    })
+}
+
+// ── Attachment validation helpers ──
+
+pub(crate) const MAX_ATTACHMENT_COUNT: usize = 10;
+pub(crate) const MAX_ATTACHMENT_PER_FILE: u64 = 25 * 1024 * 1024; // 25 MB
+pub(crate) const MAX_ATTACHMENT_TOTAL: u64 = 100 * 1024 * 1024; // 100 MB
+
+pub(crate) fn allowed_attachment_ext(ext: &str) -> bool {
+    sasuke::provider::supported_attachment_extensions()
+        .into_iter()
+        .any(|supported| supported == ext)
+}
+
+pub(crate) fn validate_attachment_paths(paths: &[String]) -> Vec<String> {
+    let mut errors: Vec<String> = Vec::new();
+    if paths.len() > MAX_ATTACHMENT_COUNT {
+        errors.push("conversation.attachment-count-exceeded".to_string());
+        return errors;
+    }
+    let mut total_size: u64 = 0;
+    let mut seen = std::collections::HashSet::new();
+    for p in paths {
+        if !seen.insert(p) {
+            continue;
+        }
+        let path = Path::new(p);
+        if !path.exists() {
+            errors.push("conversation.attachment-not-found".to_string());
+            continue;
+        }
+        if path.is_dir() {
+            errors.push("conversation.attachment-unsupported-type".to_string());
+            continue;
+        }
+        let meta = match path.metadata() {
+            Ok(m) => m,
+            Err(_) => {
+                errors.push("conversation.attachment-unreadable".to_string());
+                continue;
+            }
+        };
+        if meta.len() == 0 {
+            errors.push("conversation.attachment-unreadable".to_string());
+            continue;
+        }
+        if meta.len() > MAX_ATTACHMENT_PER_FILE {
+            errors.push("conversation.attachment-too-large".to_string());
+            continue;
+        }
+        total_size += meta.len();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !allowed_attachment_ext(ext.to_lowercase().as_str()) {
+            errors.push("conversation.attachment-unsupported-type".to_string());
+        }
+    }
+    if total_size > MAX_ATTACHMENT_TOTAL {
+        errors.push("conversation.attachment-total-too-large".to_string());
+    }
+    errors
+}
+
+fn missing_item(code: &str, label: &str, recovery_path: &str) -> ConversationMissingItemVm {
+    ConversationMissingItemVm {
+        code: code.to_string(),
+        label: label.to_string(),
+        recovery_path: recovery_path.to_string(),
+        params: serde_json::json!({}),
+    }
+}
+
+fn workflow_binding_missing_item(
+    error: &sasuke::workflow_model_binding::WorkflowModelBindingError,
+    workflow_template_id: &str,
+) -> ConversationMissingItemVm {
+    let mut params = error.params();
+    if let Some(object) = params.as_object_mut() {
+        object.insert(
+            "workflowTemplateId".to_string(),
+            serde_json::Value::String(workflow_template_id.to_string()),
+        );
+    }
+    ConversationMissingItemVm {
+        code: error.code().to_string(),
+        label: error.code().to_string(),
+        recovery_path: "/chat/run-modes".to_string(),
+        params,
+    }
+}
+
+// ── Input attachments (task-level authoring) ──
+
+fn input_attachments_vm(app: &App, task_id: &str) -> Vec<AssetItemVm> {
+    let dir = app.paths.task_dir(task_id).join("authoring").join("inputs");
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut files: Vec<AssetItemVm> = std::fs::read_dir(dir.as_std_path())
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_type().map(|t| t.is_file()).unwrap_or(false))
+                .filter_map(|entry| {
+                    let name = entry.file_name().into_string().ok()?;
+                    let size = entry.metadata().ok()?.len();
+                    Some(AssetItemVm {
+                        kind: "input-attachment".to_string(),
+                        title: format!("{} ({} KB)", name, size / 1024),
+                        preview: name.clone(),
+                        tone: "info".to_string(),
+                        round_id: String::new(),
+                        node_id: String::new(),
+                        attempt_id: String::new(),
+                        name,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    files
+}
+
+// ── Validated create ──
+
+pub fn validate_conversation_create_vm(
+    app: &App,
+    input: &ConversationCreateInputVm,
+) -> anyhow::Result<ConversationValidationResultVm> {
+    if input.work_location == ConversationWorkLocationVm::Worktree {
+        sasuke::git::GitRepositoryService::default().require_worktree(&app.paths.repo_root)?;
+    }
+    let mut missing: Vec<ConversationMissingItemVm> = Vec::new();
+
+    let attachment_paths = input.attachment_paths.as_deref().unwrap_or_default();
+    if input.content.trim().is_empty() && attachment_paths.is_empty() {
+        missing.push(missing_item(
+            "content.required",
+            "Content is required",
+            "/chat",
+        ));
+    }
+
+    if input.run_mode == ConversationRunMode::Direct.as_str() {
+        let config = input.direct_config.as_ref();
+        let agent_type = config
+            .map(|config| config.agent_type.trim())
+            .unwrap_or_default();
+        if agent_type.is_empty() {
+            missing.push(missing_item(
+                "direct.agent.required",
+                "Agent is required for Direct mode",
+                "/chat/agents",
+            ));
+        } else if app.managed_agent(agent_type).is_err() {
+            missing.push(missing_item(
+                "direct.agent.not-found",
+                "Selected Agent is not configured",
+                "/chat/agents",
+            ));
+        }
+    } else if input.run_mode == ConversationRunMode::Auto.as_str() {
+        let config = input.auto_config.as_ref();
+        let strategy = config
+            .and_then(|c| c.agent_strategy.as_deref())
+            .unwrap_or("fixed");
+        if strategy == "dynamic" {
+            if config
+                .and_then(|c| c.bootstrap_agent_type.as_deref())
+                .or_else(|| config.map(|c| c.agent_type.as_str()))
+                .map(|agent| agent.trim().is_empty())
+                .unwrap_or(true)
+            {
+                missing.push(missing_item(
+                    "agent.required",
+                    "Agent is required for AUTO mode",
+                    "/chat/agents",
+                ));
+            }
+            if config
+                .and_then(|c| c.available_agents.as_ref())
+                .map(|agents| agents.iter().all(|agent| agent.provider.trim().is_empty()))
+                .unwrap_or(true)
+            {
+                missing.push(missing_item(
+                    "agent.required",
+                    "Agent is required for AUTO mode",
+                    "/chat/agents",
+                ));
+            }
+        } else if config
+            .map(|c| c.agent_type.trim().is_empty())
+            .unwrap_or(true)
+        {
+            missing.push(missing_item(
+                "agent.required",
+                "Agent is required for AUTO mode",
+                "/chat/agents",
+            ));
+        }
+    } else if input.run_mode == ConversationRunMode::Workflow.as_str() {
+        if input
+            .workflow_template_id
+            .as_ref()
+            .map(|t| t.trim().is_empty())
+            .unwrap_or(true)
+        {
+            missing.push(missing_item(
+                "workflow.required",
+                "Workflow template is required",
+                "/chat/run-modes",
+            ));
+        } else if let Some(ref tid) = input.workflow_template_id {
+            let authoring = if let Some(authoring) = input.workflow_authoring.as_ref() {
+                Some(authoring.clone())
+            } else {
+                app.workflow_templates().ok().and_then(|store| {
+                    store
+                        .templates
+                        .iter()
+                        .find(|template| template.id == *tid)
+                        .and_then(|template| {
+                            let mut workflow = template.workflow.clone();
+                            apply_optional_entry_preference(
+                                template,
+                                input.include_optional_entry,
+                                &mut workflow,
+                            )
+                            .ok()?;
+                            Some(TaskAuthoringWorkflow {
+                                workflow,
+                                model_bindings: template.model_bindings.clone(),
+                            })
+                        })
+                })
+            };
+            if let Some(mut authoring) = authoring {
+                if let Err(error) = migrate_authoring_workflow(
+                    &mut authoring.workflow,
+                    &mut authoring.model_bindings,
+                    None,
+                ) {
+                    missing.push(workflow_binding_missing_item(&error, tid));
+                } else if let Err(error) = validate_and_inject(
+                    &authoring.workflow,
+                    &authoring.model_bindings,
+                    &app.config.agents,
+                    &app.provider_diagnostics(),
+                ) {
+                    missing.push(workflow_binding_missing_item(&error, tid));
+                }
+            } else {
+                missing.push(missing_item(
+                    "workflow.not-found",
+                    "Selected workflow template not found",
+                    "/chat/run-modes",
+                ));
+            }
+        }
+    }
+
+    // Validate attachments
+    if let Some(ref paths) = input.attachment_paths {
+        let errors = validate_attachment_paths(paths);
+        for code in &errors {
+            missing.push(missing_item(code, code, "/chat"));
+        }
+    }
+
+    Ok(ConversationValidationResultVm {
+        valid: missing.is_empty(),
+        missing_items: missing,
+    })
+}
+
+// ── Real create ──
+
+fn conversation_auto_title(content: &str, max_chars: usize) -> String {
+    if content.is_empty() {
+        "New Task".to_string()
+    } else {
+        content
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(max_chars.max(1))
+            .collect()
+    }
+}
+
+fn dynamic_control_from_vm(control: Option<&ConversationDynamicControlVm>) -> DynamicControlDsl {
+    control
+        .map(|control| DynamicControlDsl {
+            max_dynamic_nodes: control.max_dynamic_nodes,
+            max_fanout: control.max_fanout,
+            max_depth: control.max_depth,
+            max_parallel: control.max_parallel,
+            max_group_depth: control.max_group_depth,
+            max_workflow_invocations: control.max_workflow_invocations,
+            allow_nested_dynamic: control.allow_nested_dynamic,
+        })
+        .unwrap_or_default()
+}
+
+fn build_auto_workflow(config: Option<&ConversationAutoConfigVm>) -> WorkflowDsl {
+    let agent_type = config.map(|c| c.agent_type.as_str()).unwrap_or("");
+    let model_id = config
+        .and_then(|c| c.model_id.as_deref())
+        .filter(|v| !v.trim().is_empty());
+    let bootstrap_model_id = config
+        .and_then(|c| c.bootstrap_model_id.as_deref())
+        .filter(|v| !v.trim().is_empty());
+    let acceptance_model_id = config
+        .and_then(|c| c.acceptance_model_id.as_deref())
+        .filter(|v| !v.trim().is_empty());
+    let permission_mode = config
+        .and_then(|c| c.permission_mode.as_deref())
+        .filter(|v| !v.trim().is_empty());
+    let global_goal = config
+        .and_then(|c| c.global_goal.as_deref())
+        .filter(|v| !v.trim().is_empty());
+    let agent_strategy_mode = config
+        .and_then(|c| c.agent_strategy.as_deref())
+        .unwrap_or("fixed");
+
+    let agent_strategy = if agent_strategy_mode == "dynamic" {
+        let bootstrap_provider = config
+            .and_then(|c| c.bootstrap_agent_type.as_deref())
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or(agent_type)
+            .to_string();
+        let available_agents = config
+            .and_then(|c| c.available_agents.as_ref())
+            .map(|agents| {
+                agents
+                    .iter()
+                    .filter_map(|agent| {
+                        let provider = agent.provider.trim();
+                        if provider.is_empty() {
+                            return None;
+                        }
+                        Some(DynamicAgentRef {
+                            provider: provider.to_string(),
+                            model: agent
+                                .model
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string),
+                            permission_mode: agent
+                                .permission_mode
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string),
+                            config_options: agent.config_options.clone(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|agents| !agents.is_empty())
+            .unwrap_or_else(|| {
+                vec![DynamicAgentRef {
+                    provider: bootstrap_provider.clone(),
+                    model: model_id.map(str::to_string),
+                    permission_mode: None,
+                    config_options: BTreeMap::new(),
+                }]
+            });
+        AiDynamicAgentStrategy::Dynamic {
+            bootstrap_provider,
+            bootstrap_model: bootstrap_model_id.map(str::to_string),
+            permission_mode: permission_mode.map(str::to_string),
+            bootstrap_config_options: config
+                .map(|config| config.bootstrap_config_options.clone())
+                .unwrap_or_default(),
+            acceptance_model: acceptance_model_id.map(str::to_string),
+            acceptance_config_options: config
+                .map(|config| config.acceptance_config_options.clone())
+                .unwrap_or_default(),
+            routing_prompt: config
+                .and_then(|c| c.routing_prompt.as_deref())
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string(),
+            available_agents,
+        }
+    } else {
+        AiDynamicAgentStrategy::Fixed {
+            provider: agent_type.to_string(),
+            model: model_id.map(str::to_string),
+            permission_mode: permission_mode.map(str::to_string),
+        }
+    };
+
+    WorkflowDsl {
+        version: "0.1".to_string(),
+        id: "auto-workflow".to_string(),
+        entry: "ai-dynamic".to_string(),
+        control: Default::default(),
+        nodes: vec![NodeDsl::AiDynamic(AiDynamicNode {
+            id: "ai-dynamic".to_string(),
+            agent_strategy,
+            config_options: config
+                .map(|config| config.config_options.clone())
+                .unwrap_or_default(),
+            allowed_profiles: config
+                .and_then(|c| c.allowed_profiles.clone())
+                .unwrap_or_default(),
+            global_goal: global_goal.map(|s| s.to_string()),
+            control: dynamic_control_from_vm(config.and_then(|c| c.control.as_ref())),
+            allowed_workflows: config
+                .and_then(|c| c.allowed_workflows.as_ref())
+                .map(|workflows| {
+                    workflows
+                        .iter()
+                        .filter_map(|workflow| {
+                            let workflow_id = workflow.workflow_id.trim();
+                            (!workflow_id.is_empty()).then(|| {
+                                sasuke::dsl::AllowedWorkflowRefDsl {
+                                    workflow_id: workflow_id.to_string(),
+                                }
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })],
+        edges: vec![EdgeDsl {
+            from: "ai-dynamic".to_string(),
+            to: END_NODE.to_string(),
+            on: EdgeOutcome::Success,
+            session: None,
+            new_round_entry: None,
+        }],
+    }
+}
+
+fn build_direct_workflow(config: &ConversationDirectConfigVm) -> WorkflowDsl {
+    WorkflowDsl {
+        version: "0.1".to_string(),
+        id: "direct-agent".to_string(),
+        entry: "direct-agent".to_string(),
+        control: Default::default(),
+        nodes: vec![NodeDsl::Worker(WorkerNode {
+            id: "direct-agent".to_string(),
+            execution_slot_id: None,
+            provider: Some(config.agent_type.clone()),
+            model: config.model_id.clone(),
+            profile: None,
+            goal: None,
+            output: None,
+            success_condition: None,
+            permission_mode: config.permission_mode.clone(),
+            config_options: config.config_options.clone(),
+            manual_check: Some(false),
+            prompt_envelope: PromptEnvelopeMode::RawAgent,
+        })],
+        edges: vec![EdgeDsl {
+            from: "direct-agent".to_string(),
+            to: END_NODE.to_string(),
+            on: EdgeOutcome::Success,
+            session: None,
+            new_round_entry: None,
+        }],
+    }
+}
+
+pub struct PreparedConversationTask {
+    task_id: String,
+    task_uuid: Option<String>,
+    title: String,
+    task_dir: camino::Utf8PathBuf,
+    armed: bool,
+}
+
+impl PreparedConversationTask {
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    pub fn task_uuid(&self) -> Option<&str> {
+        self.task_uuid.as_deref()
+    }
+
+    pub fn accept(mut self) -> (String, Option<String>, String) {
+        self.armed = false;
+        (
+            std::mem::take(&mut self.task_id),
+            self.task_uuid.take(),
+            std::mem::take(&mut self.title),
+        )
+    }
+}
+
+impl Drop for PreparedConversationTask {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_dir_all(self.task_dir.as_std_path());
+        }
+    }
+}
+
+pub fn prepare_conversation_task_vm(
+    app: &App,
+    input: &ConversationCreateInputVm,
+) -> anyhow::Result<PreparedConversationTask> {
+    anyhow::ensure!(
+        !input.content.trim().is_empty()
+            || input
+                .attachment_paths
+                .as_ref()
+                .is_some_and(|paths| !paths.is_empty()),
+        "conversation payload cannot be empty"
+    );
+    let title =
+        conversation_auto_title(&input.content, app.config.conversation_auto_title_max_chars);
+
+    // Build workflow
+    let (mut workflow, mut model_bindings, effective_include_optional_entry) = if input.run_mode
+        == ConversationRunMode::Direct.as_str()
+    {
+        let config = input
+            .direct_config
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("direct config is required"))?;
+        (
+            build_direct_workflow(config),
+            WorkflowModelBindings::default(),
+            None,
+        )
+    } else if input.run_mode == ConversationRunMode::Auto.as_str() {
+        (
+            build_auto_workflow(input.auto_config.as_ref()),
+            sasuke::workflow_model_binding::WorkflowModelBindings::default(),
+            None,
+        )
+    } else if let Some(authoring) = input.workflow_authoring.as_ref() {
+        (
+            authoring.workflow.clone(),
+            authoring.model_bindings.clone(),
+            input.include_optional_entry,
+        )
+    } else {
+        // Load from template
+        let store = app.workflow_templates()?;
+        let template_id = input
+            .workflow_template_id
+            .as_deref()
+            .unwrap_or(DEFAULT_WORKFLOW_TEMPLATE_ID);
+        let template = store
+            .templates
+            .iter()
+            .find(|t| t.id == template_id)
+            .ok_or_else(|| anyhow::anyhow!("workflow template not found: {template_id}"))?;
+        let mut workflow = template.workflow.clone();
+        let include_optional_entry =
+            apply_optional_entry_preference(template, input.include_optional_entry, &mut workflow)?;
+        (
+            workflow,
+            template.model_bindings.clone(),
+            include_optional_entry,
+        )
+    };
+    migrate_authoring_workflow(&mut workflow, &mut model_bindings, None)?;
+
+    // Git is an authoritative prerequisite for Auto and every workflow that
+    // directly contains AI-DYNAMIC. Check before creating either the task or run.
+    if sasuke::dsl::workflow_contains_ai_dynamic(&workflow) {
+        sasuke::git::GitRepositoryService::default().require_worktree(&app.paths.repo_root)?;
+    }
+    if input.work_location == ConversationWorkLocationVm::Worktree {
+        sasuke::git::GitRepositoryService::default().require_worktree(&app.paths.repo_root)?;
+    }
+
+    // Create task
+    let task_input = CreateTaskInput {
+        title: Some(title.clone()),
+        description: None,
+        requirement_file_name: None,
+        requirement_content: input.content.clone(),
+        workflow: workflow.clone(),
+        workflow_template_id: input.workflow_template_id.clone(),
+    };
+    let summary = app.create_conversation_task_from_payload_with_bindings(
+        task_input,
+        workflow,
+        model_bindings,
+    )?;
+
+    let task_id = summary.task.id.clone();
+    let task_uuid = summary.task.uuid.clone().or_else(|| Some(task_id.clone()));
+    let prepared = PreparedConversationTask {
+        task_id: task_id.clone(),
+        task_uuid,
+        title,
+        task_dir: app.paths.task_dir(&task_id),
+        armed: true,
+    };
+
+    // Save conversation metadata
+    let authoring_dir = app.paths.task_dir(&task_id).join("authoring");
+    fs::create_dir_all(authoring_dir.as_std_path())?;
+
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let agent_identity = input
+        .direct_config
+        .as_ref()
+        .and_then(|config| direct_agent_identity(app, &config.agent_type));
+    let meta = ConversationMetadata {
+        version: "3".to_string(),
+        source: "conversation-ui".to_string(),
+        run_mode: input.run_mode.clone(),
+        workflow_template_id: input.workflow_template_id.clone(),
+        include_optional_entry: effective_include_optional_entry,
+        direct_config: input.direct_config.clone(),
+        agent_identity,
+        title_auto_generated: true,
+        initial_attachment_names: Some(
+            input
+                .attachment_paths
+                .as_ref()
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .map(|path| {
+                            Path::new(path)
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("unknown")
+                                .to_string()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        created_at: created_at.clone(),
+        last_activity_at: Some(created_at),
+        work_location: input.work_location,
+        scheduled_task_id: input.scheduled_task_id.clone(),
+        scheduled_content_fingerprint: input.scheduled_content_fingerprint.clone(),
+    };
+    write_json(&authoring_dir.join("conversation.json"), &meta)?;
+
+    // Copy attachments to authoring dir
+    if let Some(ref paths) = input.attachment_paths {
+        let attach_dir = authoring_dir.join("inputs");
+        fs::create_dir_all(attach_dir.as_std_path())?;
+        for src in paths {
+            let src_path = Path::new(src);
+            if let Some(name) = src_path.file_name().and_then(|n| n.to_str()) {
+                let dest = attach_dir.join(name);
+                fs::copy(src_path, &dest)?;
+            }
+        }
+    }
+
+    app.record_task_activity_index(&task_id, &meta.created_at);
+
+    Ok(prepared)
+}
+
+pub fn create_conversation_task_vm(
+    app: &App,
+    input: &ConversationCreateInputVm,
+) -> anyhow::Result<(String, Option<String>, String)> {
+    Ok(prepare_conversation_task_vm(app, input)?.accept())
+}
+
+pub fn create_conversation_run_vm(
+    app: &App,
+    input: &ConversationCreateInputVm,
+) -> anyhow::Result<ConversationCreateResultVm> {
+    let fork_point = if input.work_location == ConversationWorkLocationVm::Worktree {
+        Some(
+            sasuke::git::GitSourceControlService::default().resolve_branch_fork_point(
+                &app.paths.repo_root,
+                input.selected_branch.as_deref(),
+            )?,
+        )
+    } else {
+        None
+    };
+    let prepared_task = prepare_conversation_task_vm(app, input)?;
+    let task_id = prepared_task.task_id().to_string();
+    let task_uuid = prepared_task.task_uuid().map(ToOwned::to_owned);
+
+    let prepared_run = if let Some(fork_point) = fork_point {
+        app.prepare_run_in_worktree_at(&task_id, None, fork_point.head_oid)?
+    } else {
+        app.prepare_run(&task_id, None)?
+    };
+    let run = app.launch_prepared_run_background(&task_id, prepared_run.accept())?;
+    prepared_task.accept();
+    if let Some(run_mode) = conversation_run_mode_from_label(&input.run_mode) {
+        emit_conversation_run_started(app, &input.project_id, &task_id, &run.id, run_mode);
+    }
+
+    // Return an early run snapshot together with the canonical task projection.
+    let run =
+        conversation_run_vm(app, &input.project_id, &task_id, &run.id, None).unwrap_or_else(|_| {
+            ConversationRunVm {
+                project_id: input.project_id.clone(),
+                task_id: task_id.clone(),
+                task_uuid: task_uuid.clone(),
+                run_id: run.id,
+                run_mode: input.run_mode.clone(),
+                workflow_template_id: input.workflow_template_id.clone(),
+                direct_config: input.direct_config.clone(),
+                agent_identity: input
+                    .direct_config
+                    .as_ref()
+                    .and_then(|config| direct_agent_identity(app, &config.agent_type)),
+                last_activity_at: Some(chrono::Utc::now().to_rfc3339()),
+                run_status: enum_label(&run.status),
+                run_outcome: None,
+                session_tree: ConversationSessionTreeVm {
+                    rounds: Vec::new(),
+                    selected_session_key: None,
+                },
+                selected_session: None,
+                active_sessions: Vec::new(),
+                input_attachments: Vec::new(),
+                workflow_status: "valid".to_string(),
+                workflow_valid: true,
+                workflow_error: None,
+                workflow_json: None,
+                workflow_graph: GraphVm {
+                    nodes: Vec::new(),
+                    edges: Vec::new(),
+                },
+                resumable: false,
+                pause_reason: None,
+                runtime_error_message: None,
+                runtime_error: None,
+                scheduled_task_id: input.scheduled_task_id.clone(),
+                worktree: conversation_run_worktree_vm(run.worktree.as_ref()),
+            }
+        });
+    let task = conversation_task_row_vm(app, &input.project_id, &task_id, false, None)?;
+    Ok(ConversationCreateResultVm { task, run })
+}
+
+pub fn rerun_conversation_task_vm(
+    app: &App,
+    project_id: &str,
+    task_id: &str,
+) -> anyhow::Result<ConversationRunVm> {
+    let run_mode = conversation_run_mode(app, task_id);
+    // Pause running run if any
+    if let Ok(summaries) = app.task_summaries() {
+        if let Some(ts) = summaries.iter().find(|s| s.task.id == task_id) {
+            if let Some(ref latest) = ts.latest_run {
+                if latest.status == RunStatus::Running {
+                    let _ = app.run_pause(
+                        task_id,
+                        &latest.id,
+                        sasuke::domain::PauseReason::ProcessInterrupted,
+                    );
+                }
+            }
+        }
+    }
+    let work_location = read_conversation_metadata(app, task_id)
+        .map(|metadata| metadata.work_location)
+        .unwrap_or_default();
+    let prepared_run = if work_location == ConversationWorkLocationVm::Worktree {
+        app.prepare_run_in_worktree(task_id, None)?
+    } else {
+        app.prepare_run(task_id, None)?
+    };
+    let run = app.launch_prepared_run_background(task_id, prepared_run.accept())?;
+    if let Some(run_mode) = run_mode {
+        emit_conversation_run_started(app, project_id, task_id, &run.id, run_mode);
+    }
+    conversation_run_vm(app, project_id, task_id, &run.id, None).or_else(|_| {
+        Ok(ConversationRunVm {
+            project_id: project_id.to_string(),
+            task_id: task_id.to_string(),
+            task_uuid: app
+                .task_show(task_id)
+                .ok()
+                .and_then(|task| task.uuid)
+                .or_else(|| Some(task_id.to_string())),
+            run_id: run.id,
+            run_mode: "workflow".to_string(),
+            workflow_template_id: None,
+            direct_config: read_conversation_metadata(app, task_id)
+                .and_then(|metadata| metadata.direct_config),
+            agent_identity: read_conversation_metadata(app, task_id)
+                .and_then(|metadata| metadata.agent_identity),
+            last_activity_at: read_conversation_metadata(app, task_id).and_then(|metadata| {
+                metadata
+                    .last_activity_at
+                    .or_else(|| Some(metadata.created_at))
+            }),
+            run_status: enum_label(&run.status),
+            run_outcome: None,
+            session_tree: ConversationSessionTreeVm {
+                rounds: Vec::new(),
+                selected_session_key: None,
+            },
+            selected_session: None,
+            active_sessions: Vec::new(),
+            input_attachments: Vec::new(),
+            workflow_status: "valid".to_string(),
+            workflow_valid: true,
+            workflow_error: None,
+            workflow_json: None,
+            workflow_graph: GraphVm {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            },
+            resumable: false,
+            pause_reason: None,
+            runtime_error_message: None,
+            runtime_error: None,
+            scheduled_task_id: None,
+            worktree: conversation_run_worktree_vm(run.worktree.as_ref()),
+        })
+    })
+}
+
+fn emit_conversation_run_started(
+    app: &App,
+    project_id: &str,
+    task_id: &str,
+    run_id: &str,
+    run_mode: ConversationRunMode,
+) {
+    app.emit_lifecycle_event(
+        sasuke::app::RuntimeLifecycleEvent::ConversationRunStarted {
+            project_id: project_id.to_string(),
+            task_id: task_id.to_string(),
+            run_id: run_id.to_string(),
+            run_mode,
+        },
+    );
+}
+
+fn conversation_run_worktree_vm(
+    worktree: Option<&sasuke::runtime::RunWorktreeState>,
+) -> Option<ConversationRunWorktreeVm> {
+    worktree.map(|worktree| ConversationRunWorktreeVm {
+        path: worktree.path.to_string(),
+        branch: worktree.branch.clone(),
+        fork_commit: worktree.fork_commit.clone(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        fs,
+        sync::{Arc, Mutex},
+    };
+
+    use super::{
+        ConversationAutoConfigVm, ConversationCreateInputVm, ConversationDirectConfigVm,
+        ConversationDynamicAgentRefVm, ConversationRunSummaryVm, ConversationSessionLocator,
+        ConversationTaskActivityVm, ConversationWorkLocationVm, ConversationWorkspaceSource,
+        ConversationWorkspaceVm, PromptActivity, attempt_control_mode, attempt_control_projection,
+        build_auto_workflow, build_direct_workflow, conversation_attempt_lifecycle_vm,
+        conversation_auto_title, conversation_run_summary_page_vm, conversation_run_vm,
+        conversation_session_successors_from_state, conversation_sidebar_bootstrap_vm,
+        conversation_sidebar_vm_from_sources, conversation_status_from_session,
+        conversation_task_activity, conversation_task_page_vm, conversation_task_row_vm,
+        conversation_workspace_vms, create_conversation_run_vm, create_conversation_task_vm,
+        derive_conversation_attempt_lifecycle, derive_conversation_attempt_lifecycle_with_facets,
+        find_leaf_by_key, lifecycle_is_active, paged_task_ids_by_activity,
+        rerun_conversation_task_vm, scheduled_content_snapshot, scheduled_task_vms_from_sources,
+        touch_conversation_activity_at, update_task_metadata_vm, validate_conversation_create_vm,
+        workflow_binding_missing_item,
+    };
+    use camino::{Utf8Path, Utf8PathBuf};
+    use chrono::TimeZone;
+    use sasuke::acp::prompt_queue::enqueue_prompt;
+    use sasuke::app::{
+        App, CreateTaskInput, OptionalEntryStage, RuntimeLifecycleEvent, WorkflowTemplate,
+    };
+    use sasuke::config::{ConversationRunMode, ProviderDiagnosticSnapshot};
+    use sasuke::domain::{TurnControlMode, TurnControlTransitionCause};
+    use sasuke::dsl::{AiDynamicAgentStrategy, NodeDsl, PromptEnvelopeMode};
+    use sasuke::runtime::{RoundState, RuntimeExecutionPhase, RuntimeExecutionState};
+    use sasuke::workflow_model_binding::WorkflowModelBindings;
+    use serde_json::json;
+
+    #[test]
+    fn workflow_binding_missing_item_preserves_repair_locator_params() {
+        let item = workflow_binding_missing_item(
+            &sasuke::workflow_model_binding::WorkflowModelBindingError::AgentRequired {
+                execution_slot_id: "slot-dev".to_string(),
+                node_id: "dev".to_string(),
+            },
+            "default",
+        );
+
+        assert_eq!(item.code, "workflow-model-binding.agent-required");
+        assert_eq!(item.recovery_path, "/chat/run-modes");
+        assert_eq!(item.params["workflowTemplateId"], "default");
+        assert_eq!(item.params["executionSlotId"], "slot-dev");
+        assert_eq!(item.params["nodeId"], "dev");
+    }
+
+    fn workflow_with_interview() -> sasuke::dsl::WorkflowDsl {
+        serde_json::from_value(json!({
+            "version": "0.1",
+            "id": "workflow-with-interview",
+            "entry": "interview",
+            "control": {},
+            "nodes": [
+                { "type": "worker", "id": "interview", "provider": "claude-acp" },
+                { "type": "worker", "id": "plan", "provider": "claude-acp" }
+            ],
+            "edges": [
+                { "from": "interview", "to": "plan", "on": "success" },
+                { "from": "plan", "to": "$end", "on": "success" }
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn optional_entry_preference_only_changes_a_template_that_declares_the_capability() {
+        let mut custom = workflow_with_interview();
+        let custom_template = WorkflowTemplate {
+            id: "custom".to_string(),
+            name: "Custom".to_string(),
+            is_built_in: false,
+            optional_entry_stage: None,
+            workflow: custom.clone(),
+            model_bindings: WorkflowModelBindings::default(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let result = sasuke::app::apply_optional_entry_preference(
+            &custom_template,
+            Some(false),
+            &mut custom,
+        )
+        .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(custom.entry, "interview");
+        assert!(custom.nodes.iter().any(|node| node.id() == "interview"));
+
+        let mut default = workflow_with_interview();
+        let default_template = WorkflowTemplate {
+            id: "default".to_string(),
+            name: "Default".to_string(),
+            is_built_in: true,
+            optional_entry_stage: Some(OptionalEntryStage {
+                node_id: "interview".to_string(),
+                label_key: "conversation.home.includeInterview".to_string(),
+                default_enabled: true,
+            }),
+            workflow: default.clone(),
+            model_bindings: WorkflowModelBindings::default(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let result = sasuke::app::apply_optional_entry_preference(
+            &default_template,
+            Some(false),
+            &mut default,
+        )
+        .unwrap();
+        assert_eq!(result, Some(false));
+        assert_eq!(default.entry, "plan");
+        assert!(!default.nodes.iter().any(|node| node.id() == "interview"));
+    }
+
+    #[test]
+    fn optional_entry_uses_the_template_default_when_the_preference_is_missing() {
+        let mut workflow = workflow_with_interview();
+        let template = WorkflowTemplate {
+            id: "default".to_string(),
+            name: "Default".to_string(),
+            is_built_in: true,
+            optional_entry_stage: Some(OptionalEntryStage {
+                node_id: "interview".to_string(),
+                label_key: "conversation.home.includeInterview".to_string(),
+                default_enabled: true,
+            }),
+            workflow: workflow.clone(),
+            model_bindings: WorkflowModelBindings::default(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let result =
+            sasuke::app::apply_optional_entry_preference(&template, None, &mut workflow)
+                .unwrap();
+        assert_eq!(result, Some(true));
+        assert_eq!(workflow.entry, "interview");
+    }
+
+    #[test]
+    fn conversation_auto_title_uses_configured_character_limit() {
+        let content = "在.claude下输出两个python类，一个输出hello，一个输出good bye";
+
+        assert_eq!(conversation_auto_title(content, 12), "在.claude下输出两");
+        assert_eq!(
+            conversation_auto_title(content, 20),
+            "在.claude下输出两个python类"
+        );
+        assert_eq!(conversation_auto_title("", 20), "New Task");
+    }
+
+    #[test]
+    fn workflow_continue_successors_resolve_the_whole_chain_to_the_latest_attempt() {
+        let app = App::new(temp_repo_root());
+        let task_id = "task-session-owner";
+        let run_id = "run-001";
+        let round_id = "round-001";
+        let workflow: sasuke::dsl::WorkflowDsl = serde_json::from_value(json!({
+            "version": "0.1",
+            "id": "session-owner",
+            "entry": "review",
+            "control": {},
+            "nodes": [
+                { "type": "worker", "id": "review", "provider": "claude-acp" }
+            ],
+            "edges": [
+                { "from": "review", "to": "review", "on": "failure", "session": "continue" }
+            ]
+        }))
+        .unwrap();
+        let round: RoundState = serde_json::from_value(json!({
+            "version": sasuke::domain::VERSION,
+            "id": round_id,
+            "run_id": run_id,
+            "index": 1,
+            "status": "completed",
+            "outcome": "success",
+            "trigger": "initial",
+            "started_at": "2026-08-16T00:00:00Z",
+            "trace": [
+                { "sequence": 1, "node_id": "review", "attempt_id": "attempt-001", "from_node_id": null, "edge_outcome": null, "entered_at": "2026-08-16T00:00:00Z" },
+                { "sequence": 2, "node_id": "review", "attempt_id": "attempt-002", "from_node_id": "review", "edge_outcome": "failure", "entered_at": "2026-08-16T00:00:01Z" },
+                { "sequence": 3, "node_id": "review", "attempt_id": "attempt-003", "from_node_id": "review", "edge_outcome": "failure", "entered_at": "2026-08-16T00:00:02Z" }
+            ]
+        }))
+        .unwrap();
+        for (attempt_id, session_id) in [
+            ("attempt-001", "session-001"),
+            ("attempt-002", "session-001"),
+        ] {
+            sasuke::storage::write_json(
+                &app.paths
+                    .worker_ref_file(task_id, run_id, round_id, "review", attempt_id),
+                &json!({
+                    "version": sasuke::domain::VERSION,
+                    "provider": "claude-acp",
+                    "mode": "continue",
+                    "supports_open_session": true,
+                    "supports_continue_session": true,
+                    "continue_ref": { "acpSessionId": session_id },
+                    "open_command": null
+                }),
+            )
+            .unwrap();
+        }
+
+        let successors = conversation_session_successors_from_state(
+            &app,
+            task_id,
+            run_id,
+            std::slice::from_ref(&round),
+            Some(&workflow),
+        )
+        .unwrap();
+        let first = successors
+            .get(&ConversationSessionLocator {
+                round_id: round_id.to_string(),
+                node_id: "review".to_string(),
+                attempt_id: "attempt-001".to_string(),
+                outer_node_id: None,
+                outer_attempt_id: None,
+            })
+            .unwrap();
+        let second = successors
+            .get(&ConversationSessionLocator {
+                round_id: round_id.to_string(),
+                node_id: "review".to_string(),
+                attempt_id: "attempt-002".to_string(),
+                outer_node_id: None,
+                outer_attempt_id: None,
+            })
+            .unwrap();
+
+        assert_eq!(first.attempt_id, "attempt-003");
+        assert_eq!(second.attempt_id, "attempt-003");
+        assert!(
+            !successors
+                .keys()
+                .any(|locator| locator.attempt_id == "attempt-003")
+        );
+
+        let mut new_session_workflow = workflow;
+        new_session_workflow.edges[0].session = Some(sasuke::domain::SessionMode::New);
+        let new_session_successors = conversation_session_successors_from_state(
+            &app,
+            task_id,
+            run_id,
+            &[round],
+            Some(&new_session_workflow),
+        )
+        .unwrap();
+        assert!(new_session_successors.is_empty());
+    }
+
+    #[test]
+    fn auto_dynamic_continue_successor_uses_the_explicit_continue_source() {
+        let app = App::new(temp_repo_root());
+        write_dynamic_lifecycle_fixture_with_cancelled_session(
+            &app,
+            "paused",
+            json!("process-interrupted"),
+            "completed",
+            Vec::new(),
+            true,
+        );
+        let task_id = "task-dyn";
+        let run_id = "run-dyn";
+        let round_id = "round-001";
+        let outer_node_id = "ai-dynamic";
+        let outer_attempt_id = "attempt-001";
+        let graph_path = app.paths.dynamic_graph_file(
+            task_id,
+            run_id,
+            round_id,
+            outer_node_id,
+            outer_attempt_id,
+        );
+        let mut graph: serde_json::Value = sasuke::storage::read_json(&graph_path).unwrap();
+        let mut target = graph["nodes"][0].clone();
+        target["id"] = json!("good-night");
+        target["title"] = json!("Good night");
+        target["task"] = json!("Say good night");
+        target["chainId"] = json!("good-night");
+        target["sessionMode"] = json!("continue");
+        target["continueFromNodeId"] = json!("good-morning");
+        graph["nodes"].as_array_mut().unwrap().push(target);
+        sasuke::storage::write_json(&graph_path, &graph).unwrap();
+        let source_attempt_dir = app.paths.dynamic_node_attempt_dir(
+            task_id,
+            run_id,
+            round_id,
+            outer_node_id,
+            outer_attempt_id,
+            "good-morning",
+            "attempt-001",
+        );
+        sasuke::storage::write_json(
+            &source_attempt_dir.join("worker-ref.json"),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "provider": "claude-acp",
+                "mode": "new",
+                "supports_open_session": true,
+                "supports_continue_session": true,
+                "continue_ref": { "acpSessionId": "session-good-morning" },
+                "open_command": null
+            }),
+        )
+        .unwrap();
+        std::fs::create_dir_all(
+            app.paths
+                .dynamic_node_attempt_dir(
+                    task_id,
+                    run_id,
+                    round_id,
+                    outer_node_id,
+                    outer_attempt_id,
+                    "good-night",
+                    "attempt-001",
+                )
+                .as_std_path(),
+        )
+        .unwrap();
+
+        let rounds = app.round_list(task_id, run_id).unwrap();
+        let successors =
+            conversation_session_successors_from_state(&app, task_id, run_id, &rounds, None)
+                .unwrap();
+        let target = successors
+            .get(&ConversationSessionLocator {
+                round_id: round_id.to_string(),
+                node_id: "good-morning".to_string(),
+                attempt_id: "attempt-001".to_string(),
+                outer_node_id: Some(outer_node_id.to_string()),
+                outer_attempt_id: Some(outer_attempt_id.to_string()),
+            })
+            .unwrap();
+
+        assert_eq!(target.node_id, "good-night");
+        assert_eq!(target.outer_node_id.as_deref(), Some(outer_node_id));
+    }
+
+    #[test]
+    fn paused_runtime_keeps_paused_status_after_process_interrupt() {
+        let status = conversation_status_from_session(
+            Some("cancelled"),
+            "paused",
+            Some("process-interrupted"),
+            true,
+        );
+
+        assert_eq!(status, "paused");
+    }
+
+    #[test]
+    fn running_runtime_overrides_stale_session_cancelled_status_without_launching_next_node() {
+        let lifecycle = derive_conversation_attempt_lifecycle(
+            Some("cancelled"),
+            None,
+            "running",
+            None,
+            true,
+            None,
+            false,
+            false,
+            true,
+        );
+
+        assert_eq!(lifecycle.display_status, "running");
+        assert!(lifecycle.runtime.active);
+        assert_eq!(lifecycle.runtime.phase, "running-node");
+        assert_eq!(lifecycle.acp.live_turn_activity, "idle");
+        assert!(lifecycle_is_active(&lifecycle, false));
+        assert_eq!(lifecycle.composer.mode, "runtime-active");
+        assert_eq!(lifecycle.composer.processing_kind, "processing");
+        assert_eq!(
+            lifecycle.composer.status_key.as_deref(),
+            Some("conversation.runtime.runtimeActive")
+        );
+    }
+
+    #[test]
+    fn running_runtime_with_completed_session_stays_in_authoritative_node_phase() {
+        let lifecycle = derive_conversation_attempt_lifecycle(
+            Some("completed"),
+            None,
+            "running",
+            None,
+            true,
+            None,
+            false,
+            false,
+            true,
+        );
+
+        assert_eq!(lifecycle.runtime.phase, "running-node");
+        assert_eq!(lifecycle.composer.processing_kind, "processing");
+        assert_eq!(
+            lifecycle.composer.status_key.as_deref(),
+            Some("conversation.runtime.runtimeActive")
+        );
+    }
+
+    #[test]
+    fn launching_next_node_requires_explicit_runtime_execution_phase() {
+        let execution = RuntimeExecutionState {
+            revision: 7,
+            phase: RuntimeExecutionPhase::LaunchingNextNode,
+            locator: None,
+            recovery_candidate_token: None,
+            updated_at: "t1".to_string(),
+        };
+        let lifecycle = derive_conversation_attempt_lifecycle_with_facets(
+            Some("completed"),
+            None,
+            "running",
+            None,
+            true,
+            true,
+            None,
+            false,
+            false,
+            true,
+            Some(execution.revision),
+            Some(&execution),
+            true,
+            TurnControlMode::RuntimeControlled,
+            None,
+            true,
+        );
+
+        assert_eq!(lifecycle.runtime.phase, "launching-next-node");
+        assert_eq!(lifecycle.runtime.revision, Some(7));
+        assert_eq!(lifecycle.acp.latest_turn_status, "completed");
+        assert_eq!(lifecycle.composer.processing_kind, "launching-next-node");
+    }
+
+    #[test]
+    fn initial_workspace_preparation_keeps_development_environment_copy() {
+        let execution = RuntimeExecutionState {
+            revision: 8,
+            phase: RuntimeExecutionPhase::PreparingWorkspace,
+            locator: None,
+            recovery_candidate_token: None,
+            updated_at: "t2".to_string(),
+        };
+        let lifecycle = derive_conversation_attempt_lifecycle_with_facets(
+            None,
+            None,
+            "running",
+            None,
+            true,
+            true,
+            None,
+            false,
+            false,
+            true,
+            Some(execution.revision),
+            Some(&execution),
+            true,
+            TurnControlMode::RuntimeControlled,
+            None,
+            false,
+        );
+
+        assert_eq!(lifecycle.runtime.phase, "preparing-workspace");
+        assert_eq!(lifecycle.composer.processing_kind, "preparing-workspace");
+        assert_eq!(
+            lifecycle.composer.status_key.as_deref(),
+            Some("conversation.runtime.preparingDevelopmentEnvironment")
+        );
+    }
+
+    #[test]
+    fn runtime_terminal_projects_the_auto_follow_transition_cause() {
+        let execution = RuntimeExecutionState {
+            revision: 9,
+            phase: RuntimeExecutionPhase::Terminal,
+            locator: None,
+            recovery_candidate_token: None,
+            updated_at: "t3".to_string(),
+        };
+        let lifecycle = derive_conversation_attempt_lifecycle_with_facets(
+            Some("completed"),
+            None,
+            "completed",
+            Some("success"),
+            true,
+            true,
+            None,
+            false,
+            false,
+            true,
+            Some(execution.revision),
+            Some(&execution),
+            true,
+            TurnControlMode::RuntimeControlled,
+            None,
+            true,
+        );
+
+        assert_eq!(lifecycle.control.mode, "non-runtime-controlled");
+        assert_eq!(
+            lifecycle.control.transition_cause,
+            Some(TurnControlTransitionCause::RuntimeTerminal)
+        );
+        assert_eq!(
+            serde_json::to_value(&lifecycle.control).unwrap()["transitionCause"],
+            "runtime-terminal"
+        );
+    }
+
+    #[test]
+    fn non_current_workflow_leaf_carries_run_revision_without_becoming_active() {
+        let execution = RuntimeExecutionState {
+            revision: 8,
+            phase: RuntimeExecutionPhase::RunningNode,
+            locator: None,
+            recovery_candidate_token: None,
+            updated_at: "t2".to_string(),
+        };
+        let lifecycle = derive_conversation_attempt_lifecycle_with_facets(
+            Some("completed"),
+            None,
+            "completed",
+            Some("success"),
+            false,
+            false,
+            None,
+            false,
+            false,
+            true,
+            Some(execution.revision),
+            Some(&execution),
+            false,
+            TurnControlMode::NonRuntimeControlled,
+            None,
+            true,
+        );
+
+        assert_eq!(lifecycle.runtime.revision, Some(8));
+        assert_eq!(lifecycle.runtime.phase, "idle");
+        assert!(!lifecycle.runtime.current);
+        assert!(!lifecycle.runtime.active);
+        assert_eq!(lifecycle.control.mode, "non-runtime-controlled");
+        assert_eq!(lifecycle.composer.submit_target, "acp-prompt");
+    }
+
+    #[test]
+    fn manual_check_follow_up_completion_keeps_authoritative_waiting_phase() {
+        let execution = RuntimeExecutionState {
+            revision: 4,
+            phase: RuntimeExecutionPhase::AwaitingManualCheck,
+            locator: None,
+            recovery_candidate_token: None,
+            updated_at: "t1".to_string(),
+        };
+        let lifecycle = derive_conversation_attempt_lifecycle_with_facets(
+            Some("completed"),
+            None,
+            "paused",
+            None,
+            true,
+            true,
+            Some("waiting-for-user-input"),
+            false,
+            true,
+            true,
+            Some(execution.revision),
+            Some(&execution),
+            true,
+            TurnControlMode::NonRuntimeControlled,
+            Some(TurnControlTransitionCause::ManualFollowUp),
+            true,
+        );
+
+        assert_eq!(lifecycle.runtime.phase, "awaiting-manual-check");
+        assert!(!lifecycle.runtime.active);
+        assert!(!lifecycle.runtime.continuable);
+        assert_eq!(lifecycle.acp.latest_turn_status, "completed");
+        assert_eq!(lifecycle.control.mode, "non-runtime-controlled");
+        assert_eq!(
+            lifecycle.control.transition_cause,
+            Some(TurnControlTransitionCause::ManualFollowUp)
+        );
+    }
+
+    #[test]
+    fn accepted_manual_follow_up_projects_non_runtime_control_for_orchestrated_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempt_dir = camino::Utf8Path::from_path(dir.path()).unwrap();
+        assert_eq!(
+            attempt_control_mode(attempt_dir, true),
+            TurnControlMode::RuntimeControlled
+        );
+        let (source_id, transition_id) =
+            sasuke::acp::control::prepare_manual_follow_up(attempt_dir)
+                .unwrap()
+                .unwrap();
+        assert!(
+            sasuke::acp::control::commit_manual_follow_up(
+                attempt_dir,
+                source_id.as_deref(),
+                &transition_id,
+            )
+            .unwrap()
+        );
+
+        assert_eq!(
+            attempt_control_mode(attempt_dir, true),
+            TurnControlMode::NonRuntimeControlled
+        );
+        assert_eq!(
+            attempt_control_projection(attempt_dir, true).transition_cause,
+            Some(TurnControlTransitionCause::ManualFollowUp)
+        );
+    }
+
+    #[test]
+    fn direct_lifecycle_ignores_workflow_runtime_execution_phase() {
+        let lifecycle = derive_conversation_attempt_lifecycle_with_facets(
+            Some("completed"),
+            None,
+            "completed",
+            Some("success"),
+            true,
+            true,
+            None,
+            false,
+            false,
+            false,
+            Some(7),
+            None,
+            false,
+            TurnControlMode::NonRuntimeControlled,
+            None,
+            true,
+        );
+
+        assert_eq!(lifecycle.runtime.phase, "idle");
+        assert_eq!(lifecycle.runtime.revision, Some(7));
+        assert!(!lifecycle.runtime.active);
+    }
+
+    #[test]
+    fn non_resumable_runtime_still_uses_session_terminal_status() {
+        let status = conversation_status_from_session(
+            Some("cancelled"),
+            "paused",
+            Some("process-interrupted"),
+            false,
+        );
+
+        assert_eq!(status, "cancelled");
+    }
+
+    #[test]
+    fn persisted_acp_cancelling_does_not_recreate_live_turn_after_restart() {
+        let lifecycle = derive_conversation_attempt_lifecycle(
+            Some("cancelling"),
+            None,
+            "paused",
+            None,
+            true,
+            Some("process-interrupted"),
+            true,
+            false,
+            true,
+        );
+
+        assert_eq!(lifecycle.display_status, "paused");
+        assert_eq!(lifecycle.acp.live_turn_activity, "idle");
+        assert!(!lifecycle.acp.stopping);
+        assert!(!lifecycle_is_active(&lifecycle, false));
+        assert_eq!(lifecycle.composer.mode, "normal");
+        assert_eq!(lifecycle.composer.submit_target, "acp-prompt");
+        assert!(!lifecycle.composer.lock_input);
+    }
+
+    #[test]
+    fn legacy_closing_projection_keeps_session_available_for_turn_cancel() {
+        let lifecycle = derive_conversation_attempt_lifecycle(
+            Some("closing"),
+            None,
+            "paused",
+            None,
+            false,
+            Some("process-interrupted"),
+            true,
+            false,
+            true,
+        );
+
+        assert_eq!(lifecycle.acp.session_availability, "established");
+        assert_eq!(lifecycle.acp.latest_turn_status, "none");
+    }
+
+    #[test]
+    fn completed_runtime_suppresses_stale_acp_running() {
+        let lifecycle = derive_conversation_attempt_lifecycle(
+            Some("running"),
+            None,
+            "completed",
+            Some("success"),
+            false,
+            None,
+            false,
+            false,
+            true,
+        );
+
+        assert_eq!(lifecycle.display_status, "completed");
+        assert!(!lifecycle.runtime.active);
+        assert_eq!(lifecycle.runtime.status, "completed");
+        assert_eq!(lifecycle.acp.live_turn_activity, "idle");
+        assert_eq!(lifecycle.acp.latest_turn_status, "none");
+        assert!(!lifecycle_is_active(&lifecycle, false));
+    }
+
+    #[test]
+    fn completed_runtime_keeps_live_follow_up_running() {
+        let lifecycle = derive_conversation_attempt_lifecycle(
+            Some("running"),
+            Some(PromptActivity::Running),
+            "completed",
+            Some("success"),
+            false,
+            None,
+            false,
+            false,
+            true,
+        );
+
+        assert_eq!(lifecycle.display_status, "running");
+        assert_eq!(lifecycle.acp.live_turn_activity, "running");
+        assert_eq!(lifecycle.acp.latest_turn_status, "none");
+        assert_eq!(lifecycle.runtime.phase, "terminal");
+        assert_eq!(lifecycle.composer.mode, "runtime-active");
+        assert!(lifecycle.composer.can_stop);
+        assert!(lifecycle.composer.lock_input);
+    }
+
+    #[test]
+    fn completed_runtime_exposes_starting_follow_up() {
+        let lifecycle = derive_conversation_attempt_lifecycle(
+            Some("completed"),
+            Some(PromptActivity::Starting),
+            "completed",
+            Some("success"),
+            false,
+            None,
+            false,
+            false,
+            true,
+        );
+
+        assert_eq!(lifecycle.display_status, "starting");
+        assert_eq!(lifecycle.runtime.phase, "terminal");
+        assert_eq!(lifecycle.composer.processing_kind, "launching");
+        assert_eq!(lifecycle.acp.live_turn_activity, "starting");
+    }
+
+    #[test]
+    fn completed_runtime_exposes_accepted_follow_up_as_processing() {
+        let lifecycle = derive_conversation_attempt_lifecycle(
+            Some("running"),
+            Some(PromptActivity::Accepted),
+            "completed",
+            Some("success"),
+            false,
+            None,
+            false,
+            false,
+            true,
+        );
+
+        assert_eq!(lifecycle.display_status, "running");
+        assert_eq!(lifecycle.acp.live_turn_activity, "accepted");
+        assert_eq!(lifecycle.composer.processing_kind, "processing");
+    }
+
+    #[test]
+    fn completed_runtime_exposes_follow_up_cancel_request() {
+        let lifecycle = derive_conversation_attempt_lifecycle(
+            Some("running"),
+            Some(PromptActivity::CancelRequested),
+            "completed",
+            Some("success"),
+            false,
+            None,
+            false,
+            false,
+            true,
+        );
+
+        assert_eq!(lifecycle.display_status, "cancelling");
+        assert_eq!(lifecycle.acp.live_turn_activity, "cancel-requested");
+        assert!(lifecycle.acp.stopping);
+        assert_eq!(lifecycle.composer.mode, "stopping");
+    }
+
+    #[test]
+    fn initialization_cancel_converges_from_stopping_to_idle_without_navigation() {
+        let stopping = derive_conversation_attempt_lifecycle(
+            None,
+            Some(PromptActivity::CancelRequested),
+            "paused",
+            None,
+            true,
+            Some("process-interrupted"),
+            true,
+            false,
+            false,
+        );
+        assert_eq!(stopping.acp.live_turn_activity, "cancel-requested");
+        assert!(stopping.acp.stopping);
+        assert_eq!(stopping.composer.mode, "stopping");
+
+        let settled = derive_conversation_attempt_lifecycle(
+            Some("cancelled"),
+            None,
+            "paused",
+            None,
+            true,
+            Some("process-interrupted"),
+            true,
+            false,
+            false,
+        );
+        assert_eq!(settled.acp.live_turn_activity, "idle");
+        assert_eq!(settled.acp.latest_turn_status, "cancelled");
+        assert!(!settled.acp.stopping);
+        assert_eq!(settled.composer.mode, "normal");
+        assert!(!settled.composer.lock_input);
+    }
+
+    #[test]
+    fn workflow_failure_runtime_suppresses_stale_acp_running() {
+        let lifecycle = derive_conversation_attempt_lifecycle(
+            Some("running"),
+            None,
+            "completed",
+            Some("failure"),
+            false,
+            None,
+            false,
+            false,
+            true,
+        );
+
+        assert_eq!(lifecycle.display_status, "completed");
+        assert_eq!(lifecycle.runtime_display.tone, "danger");
+        assert!(!lifecycle.runtime_display.blocking_error);
+        assert_eq!(lifecycle.acp.live_turn_activity, "idle");
+        assert!(!lifecycle_is_active(&lifecycle, false));
+    }
+
+    #[test]
+    fn interrupted_runtime_pause_has_explicit_continue_action_and_free_conversation() {
+        let lifecycle = derive_conversation_attempt_lifecycle(
+            Some("cancelled"),
+            None,
+            "paused",
+            None,
+            true,
+            Some("process-interrupted"),
+            true,
+            false,
+            true,
+        );
+
+        assert_eq!(lifecycle.display_status, "paused");
+        assert_eq!(lifecycle.runtime_display.tone, "warning");
+        assert_eq!(lifecycle.runtime_display.icon, "pause");
+        assert_eq!(
+            lifecycle.continue_kind.as_deref(),
+            Some("continue-current-attempt")
+        );
+        assert!(lifecycle.runtime.continuable);
+        assert_eq!(lifecycle.runtime.phase, "paused");
+        assert_eq!(lifecycle.composer.mode, "normal");
+        assert_eq!(lifecycle.composer.submit_target, "acp-prompt");
+        assert!(!lifecycle.composer.lock_input);
+    }
+
+    #[test]
+    fn interrupted_completed_attempt_has_recovery_action() {
+        let lifecycle = derive_conversation_attempt_lifecycle(
+            Some("completed"),
+            None,
+            "completed",
+            Some("success"),
+            true,
+            Some("process-interrupted"),
+            true,
+            false,
+            true,
+        );
+
+        assert_eq!(
+            lifecycle.continue_kind.as_deref(),
+            Some("recover-completed-attempt")
+        );
+        assert!(lifecycle.runtime.continuable);
+        assert_eq!(lifecycle.composer.mode, "normal");
+    }
+
+    #[test]
+    fn non_current_attempt_never_inherits_runtime_continue_action() {
+        let historical_completed = derive_conversation_attempt_lifecycle(
+            Some("completed"),
+            None,
+            "completed",
+            Some("success"),
+            false,
+            Some("process-interrupted"),
+            true,
+            false,
+            true,
+        );
+        let historical_paused = derive_conversation_attempt_lifecycle(
+            Some("cancelled"),
+            None,
+            "paused",
+            None,
+            false,
+            Some("process-interrupted"),
+            true,
+            false,
+            true,
+        );
+
+        assert_eq!(historical_completed.continue_kind, None);
+        assert!(!historical_completed.runtime.continuable);
+        assert_eq!(historical_paused.continue_kind, None);
+        assert!(!historical_paused.runtime.continuable);
+    }
+
+    #[test]
+    fn lifecycle_vm_scopes_continue_action_to_run_current_attempt() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        let task_id = "task-current-continue";
+        let run_id = "run-001";
+        let round_id = "round-001";
+        let historical_node_id = "dev-test";
+        let current_node_id = "test";
+        let attempt_id = "attempt-001";
+        sasuke::storage::write_json(
+            &app.paths.run_file(task_id, run_id),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "id": run_id,
+                "task_id": task_id,
+                "status": "paused",
+                "outcome": null,
+                "started_at": "2026-08-22T00:00:00Z",
+                "updated_at": "2026-08-22T00:00:03Z",
+                "workflow_snapshot": "workflow.snapshot.json",
+                "current_round": round_id,
+                "current_node": current_node_id,
+                "current_attempt": attempt_id,
+                "new_rounds_opened": 0,
+                "pause_reason": "process-interrupted",
+                "execution": {
+                    "revision": 3,
+                    "phase": "paused",
+                    "locator": {
+                        "roundId": round_id,
+                        "nodeId": current_node_id,
+                        "attemptId": attempt_id
+                    },
+                    "updatedAt": "2026-08-22T00:00:03Z"
+                }
+            }),
+        )
+        .unwrap();
+        for (node_id, status, outcome) in [
+            (historical_node_id, "completed", json!("success")),
+            (current_node_id, "paused", json!(null)),
+        ] {
+            sasuke::storage::write_json(
+                &app.paths
+                    .node_file(task_id, run_id, round_id, node_id, attempt_id),
+                &json!({
+                    "version": sasuke::domain::VERSION,
+                    "acp_storage_schema_version": 2,
+                    "node_id": node_id,
+                    "node_type": "worker",
+                    "run_id": run_id,
+                    "round_id": round_id,
+                    "attempt_id": attempt_id,
+                    "status": status,
+                    "outcome": outcome,
+                    "started_at": "2026-08-22T00:00:00Z",
+                    "finished_at": "2026-08-22T00:00:03Z",
+                    "manual_check_pending": false,
+                    "runtime_execution_id": null,
+                    "resolved_config": {}
+                }),
+            )
+            .unwrap();
+        }
+
+        let historical = conversation_attempt_lifecycle_vm(
+            &app,
+            task_id,
+            run_id,
+            round_id,
+            historical_node_id,
+            attempt_id,
+            None,
+            None,
+        )
+        .unwrap();
+        let current = conversation_attempt_lifecycle_vm(
+            &app,
+            task_id,
+            run_id,
+            round_id,
+            current_node_id,
+            attempt_id,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(!historical.runtime.current);
+        assert_eq!(historical.continue_kind, None);
+        assert!(!historical.runtime.continuable);
+        assert!(current.runtime.current);
+        assert_eq!(
+            current.continue_kind.as_deref(),
+            Some("continue-current-attempt")
+        );
+        assert!(current.runtime.continuable);
+    }
+
+    #[test]
+    fn interrupted_direct_attempt_has_free_conversation_without_runtime_continue() {
+        let lifecycle = derive_conversation_attempt_lifecycle(
+            Some("cancelled"),
+            None,
+            "paused",
+            None,
+            true,
+            Some("process-interrupted"),
+            true,
+            false,
+            false,
+        );
+
+        assert_eq!(lifecycle.display_status, "paused");
+        assert_eq!(lifecycle.continue_kind, None);
+        assert!(!lifecycle.runtime.continuable);
+        assert_eq!(lifecycle.composer.mode, "normal");
+        assert_eq!(lifecycle.composer.submit_target, "acp-prompt");
+        assert!(!lifecycle.composer.lock_input);
+    }
+
+    #[test]
+    fn runtime_abnormal_pause_has_explicit_continue_action_even_when_acp_failed() {
+        let lifecycle = derive_conversation_attempt_lifecycle(
+            Some("failed"),
+            None,
+            "paused",
+            None,
+            true,
+            Some("runtime-abnormal"),
+            true,
+            false,
+            true,
+        );
+
+        assert_eq!(lifecycle.display_status, "paused");
+        assert_eq!(
+            lifecycle.continue_kind.as_deref(),
+            Some("continue-current-attempt")
+        );
+        assert!(lifecycle.runtime.continuable);
+        assert_eq!(
+            lifecycle.runtime.pause_reason.as_deref(),
+            Some("runtime-abnormal")
+        );
+        assert_eq!(lifecycle.composer.mode, "normal");
+        assert_eq!(lifecycle.composer.submit_target, "acp-prompt");
+        assert!(!lifecycle.composer.lock_input);
+    }
+
+    #[test]
+    fn unexplained_paused_provider_failure_does_not_invent_runtime_activity() {
+        let lifecycle = derive_conversation_attempt_lifecycle(
+            Some("failed"),
+            None,
+            "paused",
+            None,
+            true,
+            None,
+            false,
+            false,
+            true,
+        );
+
+        assert_eq!(lifecycle.display_status, "paused");
+        assert!(!lifecycle.runtime.active);
+        assert!(!lifecycle.runtime_display.blocking_error);
+        assert_eq!(lifecycle.composer.mode, "normal");
+        assert_eq!(lifecycle.composer.submit_target, "acp-prompt");
+        assert!(!lifecycle.composer.lock_input);
+    }
+
+    #[test]
+    fn unexplained_paused_provider_failure_without_current_marker_is_not_runtime_active() {
+        let lifecycle = derive_conversation_attempt_lifecycle(
+            Some("failed"),
+            None,
+            "paused",
+            None,
+            false,
+            None,
+            false,
+            false,
+            true,
+        );
+
+        assert_eq!(lifecycle.display_status, "paused");
+        assert!(!lifecycle.runtime.active);
+        assert!(!lifecycle.runtime_display.blocking_error);
+        assert_eq!(lifecycle.composer.mode, "normal");
+        assert_eq!(lifecycle.composer.submit_target, "acp-prompt");
+        assert!(!lifecycle.composer.lock_input);
+    }
+
+    #[test]
+    fn manual_check_waiting_for_user_input_keeps_acp_prompt_available() {
+        let lifecycle = derive_conversation_attempt_lifecycle(
+            None,
+            None,
+            "paused",
+            None,
+            true,
+            Some("waiting-for-user-input"),
+            true,
+            true,
+            true,
+        );
+
+        assert_eq!(lifecycle.display_status, "paused");
+        assert_eq!(lifecycle.continue_kind, None);
+        assert!(!lifecycle.runtime.continuable);
+        assert_eq!(lifecycle.composer.mode, "normal");
+        assert_eq!(lifecycle.composer.submit_target, "acp-prompt");
+        assert!(!lifecycle.composer.lock_input);
+        assert!(lifecycle_is_active(&lifecycle, true));
+    }
+
+    #[test]
+    fn error_blocked_runtime_pause_is_runtime_error() {
+        let lifecycle = derive_conversation_attempt_lifecycle(
+            Some("failed"),
+            None,
+            "paused",
+            None,
+            true,
+            Some("error-blocked"),
+            true,
+            false,
+            true,
+        );
+
+        assert_eq!(lifecycle.display_status, "paused");
+        assert_eq!(lifecycle.continue_kind, None);
+        assert_eq!(lifecycle.composer.mode, "runtime-error");
+        assert_eq!(lifecycle.composer.submit_target, "none");
+    }
+
+    #[test]
+    fn runtime_error_summary_keeps_json_error_details() {
+        let message = super::runtime_error_message_from_summary(
+            r#"run run-021 blocked at round-001/ai-dynamic/attempt-001: provider `claude-acp` failed to run `good-morning`: ACP `session/set_config_option` failed: {"code":-32603,"data":{"details":"Invalid value for config option model: claude-sonnet-4-6"},"message":"Internal error"}"#,
+        );
+
+        assert_eq!(
+            message.as_deref(),
+            Some(
+                "provider `claude-acp` failed to run `good-morning`: ACP `session/set_config_option` failed: Invalid value for config option model: claude-sonnet-4-6 (Internal error)"
+            )
+        );
+    }
+
+    #[test]
+    fn running_parent_dynamic_leaf_pause_is_runtime_continue() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_dynamic_lifecycle_fixture(&app, "running", json!(null), "paused", vec!["good-night"]);
+
+        let lifecycle = conversation_attempt_lifecycle_vm(
+            &app,
+            "task-dyn",
+            "run-dyn",
+            "round-001",
+            "good-morning",
+            "attempt-001",
+            Some("ai-dynamic"),
+            Some("attempt-001"),
+        )
+        .unwrap();
+
+        assert_eq!(lifecycle.runtime.status, "paused");
+        assert_eq!(
+            lifecycle.runtime.pause_reason.as_deref(),
+            Some("process-interrupted")
+        );
+        assert_eq!(
+            lifecycle.continue_kind.as_deref(),
+            Some("continue-current-attempt")
+        );
+        assert_eq!(lifecycle.composer.mode, "normal");
+        assert_eq!(lifecycle.composer.submit_target, "acp-prompt");
+    }
+
+    #[test]
+    fn paused_parent_stale_cancelled_dynamic_leaf_is_runtime_continue() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_dynamic_lifecycle_fixture_with_cancelled_session(
+            &app,
+            "paused",
+            json!("process-interrupted"),
+            "running",
+            Vec::new(),
+            true,
+        );
+
+        let lifecycle = conversation_attempt_lifecycle_vm(
+            &app,
+            "task-dyn",
+            "run-dyn",
+            "round-001",
+            "good-morning",
+            "attempt-001",
+            Some("ai-dynamic"),
+            Some("attempt-001"),
+        )
+        .unwrap();
+
+        assert_eq!(lifecycle.runtime.status, "paused");
+        assert_eq!(
+            lifecycle.runtime.pause_reason.as_deref(),
+            Some("process-interrupted")
+        );
+        assert_eq!(
+            lifecycle.continue_kind.as_deref(),
+            Some("continue-current-attempt")
+        );
+        assert_eq!(lifecycle.composer.submit_target, "acp-prompt");
+    }
+
+    #[test]
+    fn paused_parent_suppresses_stale_dynamic_leaf_launching_state() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_dynamic_lifecycle_fixture(
+            &app,
+            "paused",
+            json!("process-interrupted"),
+            "running",
+            Vec::new(),
+        );
+
+        let lifecycle = conversation_attempt_lifecycle_vm(
+            &app,
+            "task-dyn",
+            "run-dyn",
+            "round-001",
+            "good-morning",
+            "attempt-001",
+            Some("ai-dynamic"),
+            Some("attempt-001"),
+        )
+        .unwrap();
+
+        assert_eq!(lifecycle.runtime.status, "paused");
+        assert_eq!(lifecycle.runtime.phase, "paused");
+        assert_eq!(lifecycle.composer.processing_kind, "processing");
+        assert_eq!(
+            lifecycle.continue_kind.as_deref(),
+            Some("continue-current-attempt")
+        );
+    }
+
+    #[test]
+    fn paused_parent_runtime_abnormal_dynamic_leaf_is_runtime_continue() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_dynamic_lifecycle_fixture(
+            &app,
+            "paused",
+            json!("runtime-abnormal"),
+            "paused",
+            Vec::new(),
+        );
+
+        let lifecycle = conversation_attempt_lifecycle_vm(
+            &app,
+            "task-dyn",
+            "run-dyn",
+            "round-001",
+            "good-morning",
+            "attempt-001",
+            Some("ai-dynamic"),
+            Some("attempt-001"),
+        )
+        .unwrap();
+
+        assert_eq!(lifecycle.display_status, "paused");
+        assert_eq!(lifecycle.runtime.status, "paused");
+        assert_eq!(
+            lifecycle.runtime.pause_reason.as_deref(),
+            Some("runtime-abnormal")
+        );
+        assert_eq!(
+            lifecycle.continue_kind.as_deref(),
+            Some("continue-current-attempt")
+        );
+        assert_eq!(lifecycle.composer.mode, "normal");
+        assert_eq!(lifecycle.composer.submit_target, "acp-prompt");
+        assert!(!lifecycle.composer.lock_input);
+    }
+
+    #[test]
+    fn dynamic_leaf_pause_reason_overrides_legacy_graph_reason() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_dynamic_lifecycle_fixture(
+            &app,
+            "paused",
+            json!("process-interrupted"),
+            "paused",
+            Vec::new(),
+        );
+        write_dynamic_node_pause_details(
+            &app,
+            "runtime-abnormal",
+            Some("session/set_config_option: failed to persist config.toml"),
+        );
+
+        let lifecycle = conversation_attempt_lifecycle_vm(
+            &app,
+            "task-dyn",
+            "run-dyn",
+            "round-001",
+            "good-morning",
+            "attempt-001",
+            Some("ai-dynamic"),
+            Some("attempt-001"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            lifecycle.runtime.pause_reason.as_deref(),
+            Some("runtime-abnormal")
+        );
+        assert_eq!(lifecycle.composer.mode, "normal");
+    }
+
+    #[test]
+    fn selected_dynamic_leaf_runtime_error_overrides_run_fallback() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_dynamic_lifecycle_fixture(
+            &app,
+            "paused",
+            json!("process-interrupted"),
+            "paused",
+            Vec::new(),
+        );
+        write_dynamic_node_pause_details(
+            &app,
+            "runtime-abnormal",
+            Some("provider `codex-acp`: session/set_config_option: failed to persist config.toml"),
+        );
+
+        let vm = conversation_run_vm(&app, "default", "task-dyn", "run-dyn", None).unwrap();
+
+        assert_eq!(
+            vm.runtime_error_message.as_deref(),
+            Some("provider `codex-acp`: session/set_config_option: failed to persist config.toml")
+        );
+    }
+
+    #[test]
+    fn dynamic_leaf_provider_failure_does_not_flash_runtime_error_before_pause_reason() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_dynamic_lifecycle_fixture_with_cancelled_session(
+            &app,
+            "running",
+            json!(null),
+            "paused",
+            vec!["good-morning"],
+            false,
+        );
+        sasuke::storage::write_json(
+            &app.paths
+                .dynamic_node_attempt_dir(
+                    "task-dyn",
+                    "run-dyn",
+                    "round-001",
+                    "ai-dynamic",
+                    "attempt-001",
+                    "good-morning",
+                    "attempt-001",
+                )
+                .join("acp.session.json"),
+            &json!({
+                "status": "failed",
+                "stopReason": "error",
+                "sessionId": "session-good-morning",
+                "messages": []
+            }),
+        )
+        .unwrap();
+
+        let lifecycle = conversation_attempt_lifecycle_vm(
+            &app,
+            "task-dyn",
+            "run-dyn",
+            "round-001",
+            "good-morning",
+            "attempt-001",
+            Some("ai-dynamic"),
+            Some("attempt-001"),
+        )
+        .unwrap();
+
+        assert_eq!(lifecycle.display_status, "paused");
+        assert!(lifecycle.runtime.active);
+        assert!(!lifecycle.runtime_display.blocking_error);
+        assert_eq!(lifecycle.composer.mode, "runtime-active");
+        assert_eq!(lifecycle.composer.submit_target, "none");
+    }
+
+    #[test]
+    fn running_dynamic_leaf_with_terminal_acp_keeps_authoritative_starting_phase() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_dynamic_lifecycle_fixture(&app, "running", json!(null), "completed", Vec::new());
+        sasuke::storage::write_json(
+            &app.paths
+                .dynamic_node_attempt_dir(
+                    "task-dyn",
+                    "run-dyn",
+                    "round-001",
+                    "ai-dynamic",
+                    "attempt-001",
+                    "good-morning",
+                    "attempt-001",
+                )
+                .join("acp.session.json"),
+            &json!({
+                "status": "completed",
+                "sessionId": "session-good-morning",
+                "messages": []
+            }),
+        )
+        .unwrap();
+
+        let lifecycle = conversation_attempt_lifecycle_vm(
+            &app,
+            "task-dyn",
+            "run-dyn",
+            "round-001",
+            "good-morning",
+            "attempt-001",
+            Some("ai-dynamic"),
+            Some("attempt-001"),
+        )
+        .unwrap();
+
+        assert_eq!(lifecycle.runtime.status, "running");
+        assert_eq!(lifecycle.runtime.phase, "starting-node");
+        assert_eq!(lifecycle.composer.processing_kind, "processing");
+        assert_eq!(lifecycle.continue_kind, None);
+    }
+
+    #[test]
+    fn newer_dynamic_leaf_lifecycle_releases_terminal_processing_projection() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_dynamic_lifecycle_fixture(&app, "running", json!(null), "completed", Vec::new());
+        let graph_path = app.paths.dynamic_graph_file(
+            "task-dyn",
+            "run-dyn",
+            "round-001",
+            "ai-dynamic",
+            "attempt-001",
+        );
+        let mut graph: serde_json::Value = sasuke::storage::read_json(&graph_path).unwrap();
+        graph["nodes"][0]["runtimeLifecycleRevision"] = json!(5);
+        sasuke::storage::write_json(&graph_path, &graph).unwrap();
+        let run_path = app.paths.run_file("task-dyn", "run-dyn");
+        let mut run: serde_json::Value = sasuke::storage::read_json(&run_path).unwrap();
+        run["execution"]["revision"] = json!(20);
+        sasuke::storage::write_json(&run_path, &run).unwrap();
+
+        let transitional = conversation_attempt_lifecycle_vm(
+            &app,
+            "task-dyn",
+            "run-dyn",
+            "round-001",
+            "good-morning",
+            "attempt-001",
+            Some("ai-dynamic"),
+            Some("attempt-001"),
+        )
+        .unwrap();
+
+        assert!(transitional.runtime.active);
+        assert_eq!(transitional.runtime.revision, Some(5));
+
+        graph["run"]["status"] = json!("paused");
+        graph["run"]["pauseReason"] = json!("process-interrupted");
+        graph["nodes"][0]["runtimeLifecycleRevision"] = json!(6);
+        sasuke::storage::write_json(&graph_path, &graph).unwrap();
+
+        let lifecycle = conversation_attempt_lifecycle_vm(
+            &app,
+            "task-dyn",
+            "run-dyn",
+            "round-001",
+            "good-morning",
+            "attempt-001",
+            Some("ai-dynamic"),
+            Some("attempt-001"),
+        )
+        .unwrap();
+
+        assert_eq!(lifecycle.runtime.status, "completed");
+        assert_eq!(lifecycle.runtime.phase, "terminal");
+        assert_eq!(lifecycle.runtime.revision, Some(6));
+        assert!(lifecycle.runtime.revision > transitional.runtime.revision);
+        assert!(!lifecycle.runtime.active);
+        assert_eq!(lifecycle.composer.mode, "normal");
+        assert!(!lifecycle.composer.can_stop);
+        assert!(!lifecycle.composer.lock_input);
+    }
+
+    #[test]
+    fn completed_dynamic_leaf_projects_workspace_processing_composer_state() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_dynamic_lifecycle_fixture(
+            &app,
+            "running",
+            json!(null),
+            "running",
+            vec!["good-morning"],
+        );
+        let graph_path = app.paths.dynamic_graph_file(
+            "task-dyn",
+            "run-dyn",
+            "round-001",
+            "ai-dynamic",
+            "attempt-001",
+        );
+        let mut graph: serde_json::Value = sasuke::storage::read_json(&graph_path).unwrap();
+        let mut parallel = graph["nodes"][0].clone();
+        parallel["id"] = json!("parallel-worker");
+        parallel["title"] = json!("Parallel worker");
+        parallel["runtimeLifecycleRevision"] = json!(4);
+        graph["run"]["phase"] = json!("preparing-workspace");
+        graph["run"]["currentNodeIds"] = json!(["parallel-worker"]);
+        graph["nodes"][0]["status"] = json!("completed");
+        graph["nodes"][0]["outcome"] = json!("success");
+        graph["nodes"][0]["runtimeExecutionId"] = json!(null);
+        graph["nodes"][0]["runtimeExecutionPhase"] = json!("preparing-workspace");
+        graph["nodes"][0]["finishedAt"] = json!("2026-06-15T00:00:02Z");
+        graph["nodes"].as_array_mut().unwrap().push(parallel);
+        sasuke::storage::write_json(&graph_path, &graph).unwrap();
+        let run_path = app.paths.run_file("task-dyn", "run-dyn");
+        let mut run: serde_json::Value = sasuke::storage::read_json(&run_path).unwrap();
+        run["execution"]["phase"] = json!("preparing-workspace");
+        sasuke::storage::write_json(&run_path, &run).unwrap();
+
+        let lifecycle = conversation_attempt_lifecycle_vm(
+            &app,
+            "task-dyn",
+            "run-dyn",
+            "round-001",
+            "good-morning",
+            "attempt-001",
+            Some("ai-dynamic"),
+            Some("attempt-001"),
+        )
+        .unwrap();
+
+        assert!(lifecycle.runtime.active);
+        assert_eq!(lifecycle.runtime.status, "running");
+        assert_eq!(lifecycle.runtime.phase, "preparing-workspace");
+        assert_eq!(lifecycle.composer.mode, "runtime-active");
+        assert_eq!(lifecycle.composer.submit_target, "none");
+        assert_eq!(lifecycle.composer.processing_kind, "processing-workspace");
+        assert_eq!(
+            lifecycle.composer.status_key.as_deref(),
+            Some("conversation.runtime.processingWorkspace")
+        );
+        assert!(lifecycle.composer.can_stop);
+        assert!(lifecycle.composer.lock_input);
+
+        let run_vm = conversation_run_vm(&app, "default", "task-dyn", "run-dyn", None).unwrap();
+        let tree_leaf = run_vm.session_tree.rounds[0].nodes[0]
+            .outer_nodes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|node| node.node_id == "good-morning")
+            .unwrap()
+            .attempts
+            .first()
+            .unwrap();
+        assert_eq!(
+            tree_leaf.lifecycle.composer.processing_kind,
+            "processing-workspace"
+        );
+        assert_eq!(
+            tree_leaf.lifecycle.composer.status_key.as_deref(),
+            Some("conversation.runtime.processingWorkspace")
+        );
+
+        let parallel_lifecycle = conversation_attempt_lifecycle_vm(
+            &app,
+            "task-dyn",
+            "run-dyn",
+            "round-001",
+            "parallel-worker",
+            "attempt-001",
+            Some("ai-dynamic"),
+            Some("attempt-001"),
+        )
+        .unwrap();
+
+        assert_eq!(parallel_lifecycle.runtime.revision, Some(4));
+        assert_eq!(parallel_lifecycle.runtime.phase, "starting-node");
+        assert_eq!(parallel_lifecycle.composer.processing_kind, "processing");
+
+        let mut historical = graph["nodes"][0].clone();
+        historical["id"] = json!("historical-worker");
+        historical["title"] = json!("Historical worker");
+        historical["runtimeLifecycleRevision"] = json!(7);
+        historical["runtimeExecutionPhase"] = json!("terminal");
+        graph["nodes"].as_array_mut().unwrap().insert(0, historical);
+        sasuke::storage::write_json(&graph_path, &graph).unwrap();
+
+        let historical_lifecycle = conversation_attempt_lifecycle_vm(
+            &app,
+            "task-dyn",
+            "run-dyn",
+            "round-001",
+            "historical-worker",
+            "attempt-001",
+            Some("ai-dynamic"),
+            Some("attempt-001"),
+        )
+        .unwrap();
+
+        assert_eq!(historical_lifecycle.runtime.revision, Some(7));
+        assert_eq!(historical_lifecycle.runtime.phase, "terminal");
+        assert!(!historical_lifecycle.runtime.active);
+        assert_eq!(historical_lifecycle.composer.mode, "normal");
+    }
+
+    #[test]
+    fn error_blocked_dynamic_leaf_is_selected_runtime_error() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_dynamic_lifecycle_fixture(
+            &app,
+            "paused",
+            json!("error-blocked"),
+            "paused",
+            Vec::new(),
+        );
+        let graph_path = app.paths.dynamic_graph_file(
+            "task-dyn",
+            "run-dyn",
+            "round-001",
+            "ai-dynamic",
+            "attempt-001",
+        );
+        let mut graph: serde_json::Value = sasuke::storage::read_json(&graph_path).unwrap();
+        graph["nodes"][0]["pauseReason"] = json!("error-blocked");
+        graph["nodes"][0]["runtimeError"] = json!({
+            "code": { "domain": "provider", "code": "provider.acp-error" },
+            "domain": "provider",
+            "recovery": "blocked",
+            "retryPolicy": null,
+            "params": {},
+            "diagnostic": "ACP prompt cancelled",
+            "raw": null
+        });
+        sasuke::storage::write_json(&graph_path, &graph).unwrap();
+        sasuke::storage::write_json(
+            &app.paths.run_progress_file("task-dyn", "run-dyn"),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "status": "paused",
+                "currentRoundId": "round-001",
+                "currentNodeId": "ai-dynamic",
+                "currentAttemptId": "attempt-001",
+                "currentStage": "blocked",
+                "summary": "run run-dyn blocked at round-001/ai-dynamic/attempt-001: ACP prompt cancelled",
+                "updatedAt": "2026-06-15T00:00:02Z"
+            }),
+        )
+        .unwrap();
+
+        let vm = conversation_run_vm(&app, "default", "task-dyn", "run-dyn", None).unwrap();
+        let leaf = vm.session_tree.rounds[0].nodes[0]
+            .outer_nodes
+            .as_ref()
+            .unwrap()[0]
+            .attempts[0]
+            .clone();
+
+        assert_eq!(
+            vm.session_tree.selected_session_key.as_deref(),
+            Some("round-001/ai-dynamic/attempt-001/good-morning/attempt-001")
+        );
+        assert!(leaf.current);
+        assert_eq!(
+            leaf.lifecycle.runtime.pause_reason.as_deref(),
+            Some("error-blocked")
+        );
+        assert_eq!(leaf.runtime_display.code, "error-blocked");
+        assert!(leaf.runtime_display.blocking_error);
+        assert_eq!(leaf.lifecycle.composer.mode, "runtime-error");
+        assert_eq!(
+            vm.runtime_error_message.as_deref(),
+            Some("ACP prompt cancelled")
+        );
+    }
+
+    #[test]
+    fn conversation_run_vm_migrates_legacy_dynamic_graph_and_restores_session_tree() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_dynamic_lifecycle_fixture(
+            &app,
+            "paused",
+            json!("process-interrupted"),
+            "paused",
+            Vec::new(),
+        );
+        let graph_path = app.paths.dynamic_graph_file(
+            "task-dyn",
+            "run-dyn",
+            "round-001",
+            "ai-dynamic",
+            "attempt-001",
+        );
+        let mut legacy: serde_json::Value = sasuke::storage::read_json(&graph_path).unwrap();
+        legacy["version"] = json!("0.1");
+        legacy.as_object_mut().unwrap().remove("workspaces");
+        let node = legacy["nodes"][0].as_object_mut().unwrap();
+        node.remove("workspaceId");
+        node.insert("workspace".to_string(), json!({ "mode": "readonly" }));
+        node.insert(
+            "workspacePath".to_string(),
+            json!(app.paths.repo_root.clone()),
+        );
+        sasuke::storage::write_json(&graph_path, &legacy).unwrap();
+
+        let vm = conversation_run_vm(&app, "default", "task-dyn", "run-dyn", None).unwrap();
+
+        let outer_nodes = vm.session_tree.rounds[0].nodes[0]
+            .outer_nodes
+            .as_ref()
+            .unwrap();
+        assert_eq!(outer_nodes.len(), 1);
+        assert_eq!(outer_nodes[0].node_id, "good-morning");
+        assert_eq!(outer_nodes[0].attempts.len(), 1);
+        assert_eq!(
+            vm.session_tree.selected_session_key.as_deref(),
+            Some("round-001/ai-dynamic/attempt-001/good-morning/attempt-001")
+        );
+        let persisted: serde_json::Value = sasuke::storage::read_json(&graph_path).unwrap();
+        assert_eq!(
+            persisted["version"],
+            json!(sasuke::dynamic_store::CURRENT_DYNAMIC_GRAPH_VERSION)
+        );
+        assert_eq!(persisted["nodes"][0]["workspaceId"], "workspace-main");
+        assert!(persisted["workspaces"].is_array());
+    }
+
+    #[test]
+    fn conversation_run_vm_projects_worktree_on_leaf_without_selected_session_payload() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_dynamic_lifecycle_fixture_with_cancelled_session(
+            &app,
+            "paused",
+            json!("process-interrupted"),
+            "completed",
+            Vec::new(),
+            true,
+        );
+
+        let run_path = app.paths.run_file("task-dyn", "run-dyn");
+        let mut run: serde_json::Value = sasuke::storage::read_json(&run_path).unwrap();
+        run["worktree"] = json!({
+            "path": app.paths.repo_root,
+            "branch": "gb-conversation-test",
+            "forkCommit": "test-head"
+        });
+        sasuke::storage::write_json(&run_path, &run).unwrap();
+
+        let vm = conversation_run_vm(&app, "default", "task-dyn", "run-dyn", None).unwrap();
+        let leaf = vm.session_tree.rounds[0].nodes[0]
+            .outer_nodes
+            .as_ref()
+            .unwrap()[0]
+            .attempts[0]
+            .clone();
+
+        assert!(vm.selected_session.is_none());
+        assert_eq!(
+            leaf.worktree_path.as_deref(),
+            Some(app.paths.repo_root.as_str())
+        );
+    }
+
+    #[test]
+    fn ready_dynamic_child_without_attempt_is_active_launching_leaf() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_dynamic_lifecycle_fixture(
+            &app,
+            "running",
+            json!(null),
+            "ready",
+            vec!["good-morning"],
+        );
+
+        let vm = conversation_run_vm(&app, "default", "task-dyn", "run-dyn", None).unwrap();
+        let child = vm.session_tree.rounds[0].nodes[0]
+            .outer_nodes
+            .as_ref()
+            .unwrap()[0]
+            .clone();
+        assert_eq!(child.attempts.len(), 1);
+        assert_eq!(child.attempts[0].attempt_id, "attempt-001");
+        assert_eq!(child.attempts[0].lifecycle.runtime.status, "ready");
+        assert_eq!(child.attempts[0].lifecycle.runtime.phase, "starting-node");
+        assert!(vm.active_sessions.iter().any(|session| {
+            session.node_id == "good-morning" && session.attempt_id == "attempt-001"
+        }));
+    }
+
+    #[test]
+    fn build_auto_workflow_preserves_dynamic_acceptance_model() {
+        let workflow = build_auto_workflow(Some(&ConversationAutoConfigVm {
+            agent_strategy: Some("dynamic".to_string()),
+            agent_type: "claude-acp".to_string(),
+            bootstrap_agent_type: Some("claude-acp".to_string()),
+            bootstrap_model_id: Some("bootstrap-model".to_string()),
+            bootstrap_config_options: std::collections::BTreeMap::from([(
+                "reasoning_effort".to_string(),
+                "high".to_string(),
+            )]),
+            acceptance_model_id: Some("accept-model".to_string()),
+            acceptance_config_options: std::collections::BTreeMap::from([(
+                "reasoning_effort".to_string(),
+                "medium".to_string(),
+            )]),
+            model_id: None,
+            permission_mode: Some("acceptEdits".to_string()),
+            config_options: Default::default(),
+            available_agents: Some(vec![ConversationDynamicAgentRefVm {
+                provider: "claude-acp".to_string(),
+                model: Some("worker-model".to_string()),
+                permission_mode: Some("bypassPermissions".to_string()),
+                config_options: std::collections::BTreeMap::from([(
+                    "reasoning_effort".to_string(),
+                    "low".to_string(),
+                )]),
+            }]),
+            routing_prompt: Some("Pick worker models explicitly".to_string()),
+            allowed_workflows: None,
+            allowed_profiles: None,
+            global_goal: None,
+            control: None,
+            active_template_id: None,
+            active_template_name: None,
+        }));
+
+        let NodeDsl::AiDynamic(node) = &workflow.nodes[0] else {
+            panic!("expected ai-dynamic node");
+        };
+        match &node.agent_strategy {
+            AiDynamicAgentStrategy::Dynamic {
+                bootstrap_model,
+                permission_mode,
+                bootstrap_config_options,
+                acceptance_model,
+                acceptance_config_options,
+                available_agents,
+                ..
+            } => {
+                assert_eq!(bootstrap_model.as_deref(), Some("bootstrap-model"));
+                assert_eq!(permission_mode.as_deref(), Some("acceptEdits"));
+                assert_eq!(acceptance_model.as_deref(), Some("accept-model"));
+                assert_eq!(available_agents[0].model.as_deref(), Some("worker-model"));
+                assert_eq!(
+                    available_agents[0].permission_mode.as_deref(),
+                    Some("bypassPermissions")
+                );
+                assert_eq!(
+                    bootstrap_config_options
+                        .get("reasoning_effort")
+                        .map(String::as_str),
+                    Some("high")
+                );
+                assert_eq!(
+                    acceptance_config_options
+                        .get("reasoning_effort")
+                        .map(String::as_str),
+                    Some("medium")
+                );
+                assert_eq!(
+                    available_agents[0]
+                        .config_options
+                        .get("reasoning_effort")
+                        .map(String::as_str),
+                    Some("low")
+                );
+            }
+            other => panic!("expected dynamic strategy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scheduled_auto_snapshot_preserves_agent_and_strategy_identity() {
+        let app = App::new(temp_repo_root());
+        let input = ConversationCreateInputVm {
+            project_id: app.paths.project_id.clone(),
+            content: "run this automatically".to_string(),
+            run_mode: ConversationRunMode::Auto.as_str().to_string(),
+            workflow_template_id: None,
+            include_optional_entry: None,
+            direct_config: None,
+            auto_config: Some(ConversationAutoConfigVm {
+                agent_strategy: Some("dynamic".to_string()),
+                agent_type: "agent-primary".to_string(),
+                bootstrap_agent_type: Some("agent-bootstrap".to_string()),
+                bootstrap_model_id: None,
+                bootstrap_config_options: Default::default(),
+                acceptance_model_id: None,
+                acceptance_config_options: Default::default(),
+                model_id: None,
+                permission_mode: None,
+                config_options: Default::default(),
+                available_agents: Some(vec![ConversationDynamicAgentRefVm {
+                    provider: "agent-worker".to_string(),
+                    model: None,
+                    permission_mode: None,
+                    config_options: Default::default(),
+                }]),
+                routing_prompt: None,
+                allowed_workflows: None,
+                allowed_profiles: None,
+                global_goal: None,
+                control: None,
+                active_template_id: None,
+                active_template_name: None,
+            }),
+            attachment_paths: None,
+            work_location: Default::default(),
+            selected_branch: None,
+            scheduled_task_id: None,
+            scheduled_content_fingerprint: None,
+            workflow_authoring: None,
+        };
+
+        let snapshot = scheduled_content_snapshot(&app, &input).unwrap();
+        let auto = snapshot.auto_authoring.unwrap();
+
+        assert_eq!(auto.agent_type, "agent-primary");
+        assert_eq!(auto.agent_strategy, "dynamic");
+        assert_eq!(
+            auto.bootstrap_agent_type.as_deref(),
+            Some("agent-bootstrap")
+        );
+        assert_eq!(auto.available_agent_types, vec!["agent-worker"]);
+    }
+
+    #[test]
+    fn build_direct_workflow_uses_one_raw_agent_worker() {
+        let workflow = build_direct_workflow(&ConversationDirectConfigVm {
+            agent_type: "codex-acp".to_string(),
+            model_id: Some("gpt-direct".to_string()),
+            permission_mode: Some("ask".to_string()),
+            config_options: Default::default(),
+        });
+
+        assert_eq!(workflow.entry, "direct-agent");
+        assert_eq!(workflow.nodes.len(), 1);
+        assert_eq!(workflow.edges.len(), 1);
+        let NodeDsl::Worker(worker) = &workflow.nodes[0] else {
+            panic!("expected worker node");
+        };
+        assert_eq!(worker.provider.as_deref(), Some("codex-acp"));
+        assert_eq!(worker.model.as_deref(), Some("gpt-direct"));
+        assert_eq!(worker.permission_mode.as_deref(), Some("ask"));
+        assert_eq!(worker.prompt_envelope, PromptEnvelopeMode::RawAgent);
+        assert!(worker.profile.is_none());
+        assert!(worker.goal.is_none());
+        assert!(worker.output.is_none());
+    }
+
+    #[test]
+    fn direct_task_creation_does_not_require_role_metadata() {
+        let app = App::new(temp_repo_root());
+        let workflow = build_direct_workflow(&ConversationDirectConfigVm {
+            agent_type: "claude-acp".to_string(),
+            model_id: None,
+            permission_mode: None,
+            config_options: Default::default(),
+        });
+
+        let created = app.create_task_from_requirement(CreateTaskInput {
+            title: Some("Direct task".to_string()),
+            description: None,
+            requirement_file_name: None,
+            requirement_content: "hello".to_string(),
+            workflow,
+            workflow_template_id: None,
+        });
+
+        assert!(created.is_ok(), "{created:?}");
+    }
+
+    #[test]
+    fn conversation_new_run_and_rerun_publish_canonical_started_facts() {
+        let app = App::new(temp_repo_root()).with_provider_diagnostics_source(Arc::new(|| {
+            Ok(std::collections::BTreeMap::from([(
+                "claude-acp".to_string(),
+                ProviderDiagnosticSnapshot {
+                    available: true,
+                    reason: None,
+                    checked_at: "2026-08-18T00:00:00Z".to_string(),
+                    capabilities: None,
+                },
+            )]))
+        }));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_for_subscriber = events.clone();
+        app.lifecycle_bus.subscribe_inline(Arc::new(move |event| {
+            if let RuntimeLifecycleEvent::ConversationRunStarted {
+                project_id,
+                task_id,
+                run_id,
+                run_mode,
+            } = event
+            {
+                events_for_subscriber
+                    .lock()
+                    .unwrap()
+                    .push((project_id, task_id, run_id, run_mode));
+            }
+        }));
+        let input = ConversationCreateInputVm {
+            project_id: app.paths.project_id.clone(),
+            content: "start a direct conversation".to_string(),
+            run_mode: ConversationRunMode::Direct.as_str().to_string(),
+            workflow_template_id: None,
+            include_optional_entry: None,
+            direct_config: Some(ConversationDirectConfigVm {
+                agent_type: "claude-acp".to_string(),
+                model_id: None,
+                permission_mode: None,
+                config_options: Default::default(),
+            }),
+            auto_config: None,
+            attachment_paths: None,
+            work_location: Default::default(),
+            selected_branch: None,
+            scheduled_task_id: None,
+            scheduled_content_fingerprint: None,
+            workflow_authoring: None,
+        };
+
+        let created = create_conversation_run_vm(&app, &input).unwrap();
+        let rerun =
+            rerun_conversation_task_vm(&app, &input.project_id, &created.task.task_id).unwrap();
+
+        assert_ne!(created.run.run_id, rerun.run_id);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, input.project_id);
+        assert_eq!(events[0].1, created.task.task_id);
+        assert_eq!(events[0].2, created.run.run_id);
+        assert_eq!(events[0].3, ConversationRunMode::Direct);
+        assert_eq!(events[1].0, input.project_id);
+        assert_eq!(events[1].1, rerun.task_id);
+        assert_eq!(events[1].2, rerun.run_id);
+        assert_eq!(events[1].3, ConversationRunMode::Direct);
+    }
+
+    #[test]
+    fn worktree_validation_preserves_the_non_git_preflight_error_code() {
+        let app = App::new(temp_repo_root());
+        let input = ConversationCreateInputVm {
+            project_id: app.paths.project_id.clone(),
+            content: "run in an isolated worktree".to_string(),
+            run_mode: ConversationRunMode::Direct.as_str().to_string(),
+            workflow_template_id: None,
+            include_optional_entry: None,
+            direct_config: None,
+            auto_config: None,
+            attachment_paths: None,
+            work_location: ConversationWorkLocationVm::Worktree,
+            selected_branch: None,
+            scheduled_task_id: None,
+            scheduled_content_fingerprint: None,
+            workflow_authoring: None,
+        };
+
+        let error = validate_conversation_create_vm(&app, &input).unwrap_err();
+
+        assert_eq!(error.to_string(), "run.git-repository-required");
+    }
+
+    #[test]
+    fn scheduled_task_materialization_creates_task_without_starting_run() {
+        let app = App::new(temp_repo_root());
+        let input = ConversationCreateInputVm {
+            project_id: app.paths.project_id.clone(),
+            content: "run this later".to_string(),
+            run_mode: ConversationRunMode::Direct.as_str().to_string(),
+            workflow_template_id: None,
+            include_optional_entry: None,
+            direct_config: Some(ConversationDirectConfigVm {
+                agent_type: "claude-acp".to_string(),
+                model_id: None,
+                permission_mode: None,
+                config_options: Default::default(),
+            }),
+            auto_config: None,
+            attachment_paths: None,
+            work_location: Default::default(),
+            selected_branch: None,
+            scheduled_task_id: None,
+            scheduled_content_fingerprint: None,
+            workflow_authoring: None,
+        };
+
+        let (task_id, _, _) = create_conversation_task_vm(&app, &input).unwrap();
+        assert!(app.paths.task_file(&task_id).exists());
+        assert!(!app.paths.runs_dir(&task_id).exists());
+    }
+
+    #[test]
+    fn task_metadata_update_returns_the_authoritative_task_projection() {
+        let app = App::new(temp_repo_root());
+        let input = ConversationCreateInputVm {
+            project_id: app.paths.project_id.clone(),
+            content: "h".to_string(),
+            run_mode: ConversationRunMode::Direct.as_str().to_string(),
+            workflow_template_id: None,
+            include_optional_entry: None,
+            direct_config: Some(ConversationDirectConfigVm {
+                agent_type: "claude-acp".to_string(),
+                model_id: None,
+                permission_mode: None,
+                config_options: Default::default(),
+            }),
+            auto_config: None,
+            attachment_paths: None,
+            work_location: Default::default(),
+            selected_branch: None,
+            scheduled_task_id: None,
+            scheduled_content_fingerprint: None,
+            workflow_authoring: None,
+        };
+        let (task_id, _, _) = create_conversation_task_vm(&app, &input).unwrap();
+
+        let task = update_task_metadata_vm(&app, "project-a", &task_id, "hi", None, true, Some(2))
+            .unwrap();
+
+        assert_eq!(task.project_id, "project-a");
+        assert_eq!(task.task_id, task_id);
+        assert_eq!(task.title, "hi");
+        assert!(task.pinned);
+        assert_eq!(task.pinned_order, Some(2));
+        assert_eq!(
+            app.task_show(&task.task_id).unwrap().title.as_deref(),
+            Some("hi")
+        );
+    }
+
+    #[test]
+    fn conversation_task_creation_accepts_an_attachment_only_payload() {
+        let app = App::new(temp_repo_root());
+        let attachment = app.paths.repo_root.join("context.txt");
+        fs::write(attachment.as_std_path(), "attachment content").unwrap();
+        let input = ConversationCreateInputVm {
+            project_id: app.paths.project_id.clone(),
+            content: String::new(),
+            run_mode: ConversationRunMode::Direct.as_str().to_string(),
+            workflow_template_id: None,
+            include_optional_entry: None,
+            direct_config: Some(ConversationDirectConfigVm {
+                agent_type: "claude-acp".to_string(),
+                model_id: None,
+                permission_mode: None,
+                config_options: Default::default(),
+            }),
+            auto_config: None,
+            attachment_paths: Some(vec![attachment.to_string()]),
+            work_location: Default::default(),
+            selected_branch: None,
+            scheduled_task_id: None,
+            scheduled_content_fingerprint: None,
+            workflow_authoring: None,
+        };
+
+        let (task_id, _, _) = create_conversation_task_vm(&app, &input).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(app.paths.requirement_file(&task_id).as_std_path()).unwrap(),
+            ""
+        );
+        assert!(
+            app.paths
+                .task_dir(&task_id)
+                .join("authoring")
+                .join("inputs")
+                .join("context.txt")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn conversation_task_creation_rolls_back_when_attachment_copy_fails() {
+        let app = App::new(temp_repo_root());
+        let input = ConversationCreateInputVm {
+            project_id: app.paths.project_id.clone(),
+            content: "task must roll back".to_string(),
+            run_mode: ConversationRunMode::Direct.as_str().to_string(),
+            workflow_template_id: None,
+            include_optional_entry: None,
+            direct_config: Some(ConversationDirectConfigVm {
+                agent_type: "claude-acp".to_string(),
+                model_id: None,
+                permission_mode: None,
+                config_options: Default::default(),
+            }),
+            auto_config: None,
+            attachment_paths: Some(vec![app.paths.repo_root.join("missing.txt").to_string()]),
+            work_location: Default::default(),
+            selected_branch: None,
+            scheduled_task_id: None,
+            scheduled_content_fingerprint: None,
+            workflow_authoring: None,
+        };
+
+        assert!(create_conversation_task_vm(&app, &input).is_err());
+        assert!(app.task_list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn conversation_sidebar_vm_groups_tasks_by_workspace_source() {
+        let repo_a = temp_repo_root();
+        let repo_b = temp_repo_root();
+        let app_a = App::new(repo_a.clone());
+        let app_b = App::new(repo_b.clone());
+        write_sidebar_task_fixture(&app_a, "task-a", "Task A", "run-a", "2026-06-15T00:00:00Z");
+        write_sidebar_task_fixture(&app_b, "task-b", "Task B", "run-b", "2026-06-15T00:01:00Z");
+
+        let state = sasuke::config::StateConfig::default();
+        let sources = vec![
+            ConversationWorkspaceSource {
+                workspace: ConversationWorkspaceVm {
+                    project_id: "workspace-a".to_string(),
+                    workspace_path: repo_a.to_string(),
+                    name: "Workspace A".to_string(),
+                },
+                app: app_a.clone_for_background(),
+            },
+            ConversationWorkspaceSource {
+                workspace: ConversationWorkspaceVm {
+                    project_id: "workspace-b".to_string(),
+                    workspace_path: repo_b.to_string(),
+                    name: "Workspace B".to_string(),
+                },
+                app: app_b.clone_for_background(),
+            },
+        ];
+
+        let vm = conversation_sidebar_vm_from_sources(&state, &sources);
+
+        assert_eq!(vm.workspaces.len(), 2);
+        assert_eq!(vm.tasks_by_workspace["workspace-a"][0].task_id, "task-a");
+        assert_eq!(
+            vm.tasks_by_workspace["workspace-a"][0].project_id,
+            "workspace-a"
+        );
+        assert_eq!(vm.tasks_by_workspace["workspace-b"][0].task_id, "task-b");
+        assert_eq!(
+            vm.tasks_by_workspace["workspace-b"][0].project_id,
+            "workspace-b"
+        );
+    }
+
+    #[test]
+    fn progressive_sidebar_bootstrap_and_task_page_keep_history_out_of_the_identity_path() {
+        let repo = temp_repo_root();
+        let app = App::new(repo.clone());
+        write_sidebar_task_fixture(
+            &app,
+            "task-001",
+            "Task 1",
+            "run-001",
+            "2026-08-01T00:00:00Z",
+        );
+        write_sidebar_task_fixture(
+            &app,
+            "task-002",
+            "Task 2",
+            "run-001",
+            "2026-08-02T00:00:00Z",
+        );
+        write_sidebar_task_fixture(
+            &app,
+            "task-003",
+            "Task 3",
+            "run-001",
+            "2026-08-03T00:00:00Z",
+        );
+        let mut state = sasuke::config::StateConfig::default();
+        state
+            .conversation_workspaces
+            .push(sasuke::config::ConversationWorkspaceEntry {
+                project_id: "workspace-a".to_string(),
+                workspace_path: repo.to_string(),
+                name: "Workspace A".to_string(),
+                added_at: "2026-08-01T00:00:00Z".to_string(),
+            });
+
+        let bootstrap = conversation_sidebar_bootstrap_vm(&state);
+        assert_eq!(bootstrap.workspaces.len(), 1);
+        assert!(bootstrap.pin_refs.is_empty());
+
+        let page = conversation_task_page_vm(&app, &state, "workspace-a", None, 2).unwrap();
+        assert_eq!(page.tasks.len(), 2, "the first task page must be bounded");
+        assert_eq!(page.tasks[0].task_id, "task-003");
+        assert_eq!(page.tasks[1].task_id, "task-002");
+        assert!(page.next_cursor.is_some());
+        assert!(page.tasks.iter().all(|task| task.runs.is_empty()));
+        assert!(page.tasks.iter().all(|task| task.latest_run.is_some()));
+    }
+
+    #[test]
+    fn progressive_sidebar_run_history_is_cursor_paginated() {
+        let repo = temp_repo_root();
+        let app = App::new(repo);
+        write_sidebar_task_fixture(&app, "task-001", "Task", "run-001", "2026-08-01T00:00:00Z");
+        write_sidebar_task_fixture(&app, "task-001", "Task", "run-002", "2026-08-02T00:00:00Z");
+        write_sidebar_task_fixture(&app, "task-001", "Task", "run-003", "2026-08-03T00:00:00Z");
+
+        let first =
+            conversation_run_summary_page_vm(&app, "workspace-a", "task-001", None, 2).unwrap();
+        assert_eq!(
+            first
+                .runs
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run-003", "run-002"]
+        );
+        let second = conversation_run_summary_page_vm(
+            &app,
+            "workspace-a",
+            "task-001",
+            first.next_cursor.as_deref(),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            second
+                .runs
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run-001"]
+        );
+        assert!(second.next_cursor.is_none());
+    }
+
+    #[test]
+    fn progressive_task_ids_are_cursor_paginated_by_activity_then_sequence() {
+        let task_ids = vec![
+            "task-001".to_string(),
+            "task-002".to_string(),
+            "task-003".to_string(),
+        ];
+        let activities = HashMap::from([
+            ("task-001".to_string(), "2026-08-29T12:00:00Z".to_string()),
+            ("task-002".to_string(), "2026-08-29T10:00:00Z".to_string()),
+            ("task-003".to_string(), "2026-08-29T11:00:00Z".to_string()),
+        ]);
+
+        let first = paged_task_ids_by_activity(task_ids.clone(), &activities, None, 2).unwrap();
+        assert_eq!(first.0, vec!["task-001", "task-003"]);
+        let second =
+            paged_task_ids_by_activity(task_ids, &activities, first.1.as_deref(), 2).unwrap();
+        assert_eq!(second.0, vec!["task-002"]);
+        assert!(second.1.is_none());
+    }
+
+    #[test]
+    fn task_activity_canonical_timestamp_only_moves_forward() {
+        let app = App::new(temp_repo_root());
+        write_sidebar_task_fixture(&app, "task-001", "Task", "run-001", "2026-08-29T09:00:00Z");
+        write_sidebar_conversation_metadata_fixture(
+            &app,
+            "task-001",
+            "direct",
+            "2026-08-29T10:00:00Z",
+        );
+
+        touch_conversation_activity_at(&app, "task-001", "2026-08-29T12:00:00Z").unwrap();
+        touch_conversation_activity_at(&app, "task-001", "2026-08-29T11:00:00Z").unwrap();
+
+        let metadata: serde_json::Value = sasuke::storage::read_json(
+            &app.paths
+                .task_dir("task-001")
+                .join("authoring")
+                .join("conversation.json"),
+        )
+        .unwrap();
+        assert_eq!(metadata["lastActivityAt"], "2026-08-29T12:00:00Z");
+    }
+
+    #[test]
+    fn task_activity_projection_requires_readable_canonical_metadata() {
+        let app = App::new(temp_repo_root());
+        write_sidebar_task_fixture(&app, "task-001", "Task", "run-001", "2026-08-29T09:00:00Z");
+
+        assert!(touch_conversation_activity_at(&app, "task-001", "2026-08-29T12:00:00Z").is_err());
+    }
+
+    #[test]
+    fn conversation_sidebar_sorts_all_task_modes_by_normalized_last_activity() {
+        let repo = temp_repo_root();
+        let app = App::new(repo.clone());
+        write_sidebar_task_fixture_with_updated_at(
+            &app,
+            "task-workflow",
+            "Workflow task",
+            "run-001",
+            "1000000000Z",
+            "2000000000Z",
+        );
+        write_sidebar_task_fixture_with_updated_at(
+            &app,
+            "task-direct",
+            "Direct task",
+            "run-001",
+            "2026-07-24T00:00:00Z",
+            "2026-07-24T00:00:00Z",
+        );
+        write_sidebar_conversation_metadata_fixture(
+            &app,
+            "task-workflow",
+            "workflow",
+            "2000000000Z",
+        );
+        write_sidebar_conversation_metadata_fixture(
+            &app,
+            "task-direct",
+            "direct",
+            "2026-07-24T00:00:00Z",
+        );
+        let state = sasuke::config::StateConfig::default();
+        let sources = vec![ConversationWorkspaceSource {
+            workspace: ConversationWorkspaceVm {
+                project_id: "workspace-a".to_string(),
+                workspace_path: repo.to_string(),
+                name: "Workspace A".to_string(),
+            },
+            app: app.clone_for_background(),
+        }];
+
+        let vm = conversation_sidebar_vm_from_sources(&state, &sources);
+        let tasks = &vm.tasks_by_workspace["workspace-a"];
+
+        assert_eq!(tasks[0].task_id, "task-workflow");
+        assert_eq!(tasks[0].last_activity_at.as_deref(), Some("2000000000Z"));
+        assert_eq!(tasks[1].task_id, "task-direct");
+    }
+
+    #[test]
+    fn conversation_sidebar_orders_runs_and_latest_run_by_updated_at() {
+        let repo = temp_repo_root();
+        let app = App::new(repo.clone());
+        write_sidebar_task_fixture_with_updated_at(
+            &app,
+            "task-a",
+            "Task A",
+            "run-001",
+            "1000000000Z",
+            "3000000000Z",
+        );
+        write_sidebar_task_fixture_with_updated_at(
+            &app,
+            "task-a",
+            "Task A",
+            "run-002",
+            "2000000000Z",
+            "2500000000Z",
+        );
+        write_sidebar_conversation_metadata_fixture(&app, "task-a", "workflow", "2250000000Z");
+        let state = sasuke::config::StateConfig::default();
+        let sources = vec![ConversationWorkspaceSource {
+            workspace: ConversationWorkspaceVm {
+                project_id: "workspace-a".to_string(),
+                workspace_path: repo.to_string(),
+                name: "Workspace A".to_string(),
+            },
+            app: app.clone_for_background(),
+        }];
+
+        let vm = conversation_sidebar_vm_from_sources(&state, &sources);
+        let task = &vm.tasks_by_workspace["workspace-a"][0];
+
+        assert_eq!(
+            task.latest_run.as_ref().map(|run| run.run_id.as_str()),
+            Some("run-001")
+        );
+        assert_eq!(
+            task.runs
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run-001", "run-002"]
+        );
+        assert_eq!(task.last_activity_at.as_deref(), Some("2250000000Z"));
+    }
+
+    #[test]
+    fn conversation_sidebar_task_activity_uses_runtime_status_when_no_live_prompt_exists() {
+        let running = ConversationRunSummaryVm {
+            run_id: "run-001".to_string(),
+            status: "running".to_string(),
+            outcome: None,
+            started_at: "2026-07-31T00:00:00Z".to_string(),
+            updated_at: "2026-07-31T00:00:00Z".to_string(),
+            current_round: None,
+            current_node: None,
+            resumable: false,
+        };
+        let completed = ConversationRunSummaryVm {
+            status: "completed".to_string(),
+            ..running.clone()
+        };
+        let task_dir = Utf8Path::new("test/sidebar-task-without-live-prompt");
+
+        assert_eq!(
+            conversation_task_activity(task_dir, Some(&running)),
+            Some(ConversationTaskActivityVm {
+                phase: "runtime-active".to_string(),
+                stopping: false,
+            })
+        );
+        assert_eq!(conversation_task_activity(task_dir, Some(&completed)), None);
+    }
+
+    #[test]
+    fn conversation_sidebar_vm_prioritizes_last_workspace() {
+        let repo_a = temp_repo_root();
+        let repo_b = temp_repo_root();
+        let app_a = App::new(repo_a.clone());
+        let app_b = App::new(repo_b.clone());
+        let mut state = sasuke::config::StateConfig::default();
+        state.last_conversation_workspace = Some("workspace-b".to_string());
+        let sources = vec![
+            ConversationWorkspaceSource {
+                workspace: ConversationWorkspaceVm {
+                    project_id: "workspace-a".to_string(),
+                    workspace_path: repo_a.to_string(),
+                    name: "Workspace A".to_string(),
+                },
+                app: app_a.clone_for_background(),
+            },
+            ConversationWorkspaceSource {
+                workspace: ConversationWorkspaceVm {
+                    project_id: "workspace-b".to_string(),
+                    workspace_path: repo_b.to_string(),
+                    name: "Workspace B".to_string(),
+                },
+                app: app_b.clone_for_background(),
+            },
+        ];
+
+        let vm = conversation_sidebar_vm_from_sources(&state, &sources);
+
+        assert_eq!(vm.last_active_workspace_id.as_deref(), Some("workspace-b"));
+        assert_eq!(vm.workspaces[0].project_id, "workspace-b");
+        assert_eq!(vm.workspaces[1].project_id, "workspace-a");
+    }
+
+    #[test]
+    fn conversation_workspace_vms_returns_only_workspace_metadata() {
+        let mut state = sasuke::config::StateConfig::default();
+        state.conversation_workspaces = vec![
+            sasuke::config::ConversationWorkspaceEntry {
+                project_id: "workspace-a".to_string(),
+                workspace_path: "D:/ws/A".to_string(),
+                name: "Workspace A".to_string(),
+                added_at: "2026-07-26T00:00:00Z".to_string(),
+            },
+            sasuke::config::ConversationWorkspaceEntry {
+                project_id: "workspace-b".to_string(),
+                workspace_path: "D:/ws/B".to_string(),
+                name: "Workspace B".to_string(),
+                added_at: "2026-07-26T00:01:00Z".to_string(),
+            },
+        ];
+        state.last_conversation_workspace = Some("workspace-b".to_string());
+
+        let workspaces = conversation_workspace_vms(&state);
+
+        assert_eq!(workspaces.len(), 2);
+        assert_eq!(workspaces[0].project_id, "workspace-b");
+        assert_eq!(workspaces[1].project_id, "workspace-a");
+    }
+
+    #[test]
+    fn conversation_sidebar_keeps_task_when_run_history_is_unreadable() {
+        let repo = temp_repo_root();
+        let app = App::new(repo.clone());
+        write_sidebar_task_fixture(
+            &app,
+            "task-broken-run",
+            "Broken run history",
+            "run-001",
+            "2026-07-26T00:00:00Z",
+        );
+        std::fs::write(
+            app.paths
+                .run_file("task-broken-run", "run-001")
+                .as_std_path(),
+            "{invalid-json",
+        )
+        .unwrap();
+        let state = sasuke::config::StateConfig::default();
+        let sources = vec![ConversationWorkspaceSource {
+            workspace: ConversationWorkspaceVm {
+                project_id: "workspace-a".to_string(),
+                workspace_path: repo.to_string(),
+                name: "Workspace A".to_string(),
+            },
+            app: app.clone_for_background(),
+        }];
+
+        let vm = conversation_sidebar_vm_from_sources(&state, &sources);
+
+        let task = &vm.tasks_by_workspace["workspace-a"][0];
+        assert_eq!(task.task_id, "task-broken-run");
+        assert!(task.latest_run.is_none());
+        assert!(task.runs.is_empty());
+    }
+
+    #[test]
+    fn conversation_run_vm_keeps_assets_out_of_session_dto_and_exposes_leaf_counts() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_conversation_assets_fixture(&app);
+
+        let vm = conversation_run_vm(
+            &app,
+            "project-001",
+            "task-046",
+            "run-060",
+            Some("round-001/测试/attempt-002"),
+        )
+        .unwrap();
+
+        assert_eq!(vm.task_uuid.as_deref(), Some("task-046-fixture-uuid"));
+        assert!(
+            vm.selected_session.is_none(),
+            "run aggregate must not query selected ACP正文"
+        );
+        let serialized = serde_json::to_value(&vm).unwrap();
+        assert!(serialized.get("title").is_none());
+        assert!(serialized.get("autoTitle").is_none());
+        let task = conversation_task_row_vm(&app, "project-001", "task-046", false, None).unwrap();
+        assert_eq!(task.title, "中文节点资源回归");
+        assert_eq!(task.task_uuid.as_deref(), Some("task-046-fixture-uuid"));
+        assert_eq!(
+            serde_json::to_value(&task).unwrap()["taskUuid"],
+            "task-046-fixture-uuid"
+        );
+
+        let leaf = vm.session_tree.rounds[0].nodes[0]
+            .attempts
+            .iter()
+            .find(|leaf| leaf.attempt_id == "attempt-002")
+            .unwrap();
+        assert_eq!(leaf.artifact_count, 1);
+        assert_eq!(leaf.attachment_count, 1);
+    }
+
+    #[test]
+    fn direct_conversation_run_vm_keeps_prompt_queue_on_stopped_leaf() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_conversation_assets_fixture(&app);
+        write_sidebar_conversation_metadata_fixture(
+            &app,
+            "task-046",
+            "direct",
+            "2026-08-07T00:00:00Z",
+        );
+        let attempt_dir =
+            app.paths
+                .attempt_dir("task-046", "run-060", "round-001", "测试", "attempt-002");
+        enqueue_prompt(&attempt_dir, "persist after stop".to_string(), Vec::new()).unwrap();
+
+        let vm = conversation_run_vm(
+            &app,
+            "project-001",
+            "task-046",
+            "run-060",
+            Some("round-001/测试/attempt-002"),
+        )
+        .unwrap();
+        let leaf = find_leaf_by_key(
+            &vm.session_tree.rounds,
+            vm.session_tree.selected_session_key.as_deref().unwrap(),
+        )
+        .unwrap();
+        let queue = leaf.lifecycle.prompt_queue.as_ref().unwrap();
+
+        assert_eq!(leaf.lifecycle.composer.mode, "normal");
+        assert_eq!(leaf.lifecycle.composer.submit_target, "acp-prompt");
+        assert_eq!(leaf.lifecycle.continue_kind, None);
+        assert!(!leaf.lifecycle.runtime.continuable);
+        assert_eq!(queue.items.len(), 1);
+        assert_eq!(queue.items[0].content, "persist after stop");
+    }
+
+    #[test]
+    fn conversation_run_vm_ignores_unreadable_timeline_for_non_selected_session() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_conversation_assets_fixture(&app);
+        let attempt_dir =
+            app.paths
+                .attempt_dir("task-046", "run-060", "round-001", "测试", "attempt-001");
+        std::fs::create_dir_all(attempt_dir.as_std_path()).unwrap();
+        sasuke::storage::write_json(
+            &app.paths
+                .node_file("task-046", "run-060", "round-001", "测试", "attempt-001"),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "node_id": "测试",
+                "node_type": "worker",
+                "run_id": "run-060",
+                "round_id": "round-001",
+                "attempt_id": "attempt-001",
+                "status": "completed",
+                "outcome": "success",
+                "started_at": "2026-06-15T00:00:00Z",
+                "finished_at": "2026-06-15T00:00:01Z",
+                "manual_check_pending": false,
+                "resolved_config": {}
+            }),
+        )
+        .unwrap();
+        std::fs::create_dir_all(attempt_dir.join("acp.timeline.jsonl").as_std_path()).unwrap();
+
+        let vm = conversation_run_vm(
+            &app,
+            "project-001",
+            "task-046",
+            "run-060",
+            Some("round-001/测试/attempt-002"),
+        )
+        .unwrap();
+
+        assert_eq!(vm.session_tree.rounds[0].nodes[0].attempts.len(), 2);
+        assert_eq!(
+            vm.session_tree.selected_session_key.as_deref(),
+            Some("round-001/测试/attempt-002")
+        );
+    }
+
+    #[test]
+    fn conversation_run_summary_does_not_reconstruct_default_session_timeline() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_conversation_assets_fixture(&app);
+        let timeline_path =
+            app.paths
+                .acp_timeline_file("task-046", "run-060", "round-001", "测试", "attempt-002");
+        std::fs::create_dir_all(timeline_path.as_std_path()).unwrap();
+
+        let vm = conversation_run_vm(&app, "project-001", "task-046", "run-060", None).unwrap();
+
+        assert_eq!(
+            vm.session_tree.selected_session_key.as_deref(),
+            Some("round-001/测试/attempt-002")
+        );
+        assert!(vm.selected_session.is_none());
+    }
+
+    #[test]
+    fn conversation_run_summary_projects_established_session_without_reading_large_timeline() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_conversation_assets_fixture(&app);
+        let attempt_dir =
+            app.paths
+                .attempt_dir("task-046", "run-060", "round-001", "测试", "attempt-002");
+        std::fs::write(
+            attempt_dir.join("acp.timeline.jsonl").as_std_path(),
+            vec![b'x'; 9 * 1024 * 1024],
+        )
+        .unwrap();
+        sasuke::storage::write_json(
+            &attempt_dir.join("worker-ref.json"),
+            &json!({
+                "version": "0.1",
+                "provider": "codex-acp",
+                "mode": "new",
+                "continue_ref": { "acpSessionId": "session-established" }
+            }),
+        )
+        .unwrap();
+
+        let vm = conversation_run_vm(&app, "project-001", "task-046", "run-060", None).unwrap();
+        let selected_leaf = find_leaf_by_key(
+            &vm.session_tree.rounds,
+            vm.session_tree.selected_session_key.as_deref().unwrap(),
+        )
+        .unwrap();
+
+        assert!(vm.selected_session.is_none());
+        assert!(selected_leaf.session_established);
+        assert_eq!(
+            selected_leaf.session_id.as_deref(),
+            Some("session-established")
+        );
+    }
+
+    #[test]
+    fn conversation_run_summary_does_not_treat_outbound_session_new_as_established() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_conversation_assets_fixture(&app);
+        let attempt_dir =
+            app.paths
+                .attempt_dir("task-046", "run-060", "round-001", "测试", "attempt-002");
+        std::fs::write(
+            attempt_dir.join("acp.raw.jsonl").as_std_path(),
+            r#"{"direction":"outbound","frame":{"method":"session/new"}}"#,
+        )
+        .unwrap();
+
+        let vm = conversation_run_vm(&app, "project-001", "task-046", "run-060", None).unwrap();
+        let selected_leaf = find_leaf_by_key(
+            &vm.session_tree.rounds,
+            vm.session_tree.selected_session_key.as_deref().unwrap(),
+        )
+        .unwrap();
+
+        assert!(!selected_leaf.session_established);
+        assert!(selected_leaf.session_id.is_none());
+    }
+
+    #[test]
+    fn lifecycle_projection_does_not_read_timeline_detail() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_conversation_assets_fixture(&app);
+        let timeline_path =
+            app.paths
+                .acp_timeline_file("task-046", "run-060", "round-001", "测试", "attempt-002");
+        std::fs::create_dir_all(timeline_path.as_std_path()).unwrap();
+
+        let lifecycle = conversation_attempt_lifecycle_vm(
+            &app,
+            "task-046",
+            "run-060",
+            "round-001",
+            "测试",
+            "attempt-002",
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(lifecycle.runtime.status, "completed");
+        assert_eq!(lifecycle.runtime.phase, "terminal");
+    }
+
+    #[test]
+    fn lifecycle_projection_carries_current_turn_error_without_timeline_detail() {
+        let app = App::new(temp_repo_root());
+        write_conversation_assets_fixture(&app);
+        let snapshot =
+            app.paths
+                .acp_snapshot_file("task-046", "run-060", "round-001", "测试", "attempt-002");
+        let mut metadata: serde_json::Value =
+            sasuke::storage::read_json(&snapshot).unwrap_or_else(|_| json!({}));
+        let error = sasuke::runtime_error::manual_runtime_error_info(
+            sasuke::runtime_error::RuntimeErrorDomain::Provider,
+            "acp.session-request-failed",
+            "active writer",
+            json!({"method": "session/resume"}),
+        );
+        metadata["acpRevision"] = json!(7);
+        metadata["turnId"] = json!("failed-turn");
+        metadata["latestTurnStatus"] = json!("failed");
+        metadata["liveTurnActivity"] = json!("idle");
+        metadata["turnError"] = serde_json::to_value(&error).unwrap();
+        sasuke::storage::write_json(&snapshot, &metadata).unwrap();
+        let timeline =
+            app.paths
+                .acp_timeline_file("task-046", "run-060", "round-001", "测试", "attempt-002");
+        std::fs::create_dir_all(timeline).unwrap();
+        let lifecycle = conversation_attempt_lifecycle_vm(
+            &app,
+            "task-046",
+            "run-060",
+            "round-001",
+            "测试",
+            "attempt-002",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(lifecycle.acp.revision, 7);
+        assert_eq!(lifecycle.acp.turn_id.as_deref(), Some("failed-turn"));
+        assert_eq!(lifecycle.acp.turn_error.as_ref(), Some(&error));
+    }
+
+    #[test]
+    fn conversation_session_tree_orders_nodes_by_round_trace() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_trace_order_fixture(&app);
+
+        let vm = conversation_run_vm(&app, "project-001", "task-trace", "run-001", None).unwrap();
+
+        let node_ids = vm.session_tree.rounds[0]
+            .nodes
+            .iter()
+            .map(|node| node.node_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(node_ids, vec!["方案", "开发", "验收"]);
+    }
+
+    #[test]
+    fn conversation_run_vm_exposes_terminal_control_failure_message() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_trace_order_fixture(&app);
+        std::fs::write(
+            app.paths
+                .run_events_file("task-trace", "run-001")
+                .as_std_path(),
+            r#"{"version":"0.1","type":"workflow_control_limit_exceeded","timestamp":"2026-07-08T00:00:03Z","data":{"taskId":"task-trace","runId":"run-001","roundId":"round-001","nodeId":"验收","attemptId":"attempt-001","stage":"completed","status":"completed","summary":"max rounds exceeded for $new-round: 2 > 1","pauseReason":null,"controlFailure":{"limit":1,"message":"max rounds exceeded for $new-round: 2 > 1","proposedCount":2,"reasonKind":"max_rounds_exceeded","target":"$new-round"}}}"#,
+        )
+        .unwrap();
+
+        let vm = conversation_run_vm(&app, "project-001", "task-trace", "run-001", None).unwrap();
+
+        assert_eq!(
+            vm.runtime_error_message.as_deref(),
+            Some("Round 数已达上限：max rounds exceeded for $new-round: 2 > 1")
+        );
+    }
+
+    #[test]
+    fn conversation_run_vm_exposes_runtime_abnormal_pause_error() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_trace_order_fixture(&app);
+        sasuke::storage::write_json(
+            &app.paths.run_file("task-trace", "run-001"),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "id": "run-001",
+                "task_id": "task-trace",
+                "status": "paused",
+                "outcome": null,
+                "started_at": "2026-07-08T00:00:00Z",
+                "updated_at": "2026-07-08T00:00:03Z",
+                "workflow_snapshot": "workflow.snapshot.json",
+                "current_round": "round-001",
+                "current_node": "验收",
+                "current_attempt": "attempt-001",
+                "new_rounds_opened": 0,
+                "pause_reason": "runtime-abnormal"
+            }),
+        )
+        .unwrap();
+        std::fs::write(
+            app.paths
+                .run_events_file("task-trace", "run-001")
+                .as_std_path(),
+            r#"{"version":"0.1","type":"run_started","timestamp":"2026-07-08T00:00:00Z","data":{"taskId":"task-trace","runId":"run-001"}}
+{"version":"0.1","type":"run_paused","timestamp":"2026-07-08T00:00:03Z","data":{"taskId":"task-trace","runId":"run-001","pauseReason":"runtime-abnormal","controlFailure":{"runtimeError":{"code":{"domain":"config","code":"acp.session-config-value-unavailable"},"domain":"config","recovery":"manual","retryPolicy":null,"params":{"category":"config","configId":"reasoning_effort","value":"high","availableValues":[]},"diagnostic":"ACP session config value `high` is unavailable for `reasoning_effort`","raw":null}}}}"#,
+        )
+        .unwrap();
+
+        let vm = conversation_run_vm(&app, "project-001", "task-trace", "run-001", None).unwrap();
+
+        assert_eq!(
+            vm.runtime_error_message.as_deref(),
+            Some("ACP session config value `high` is unavailable for `reasoning_effort`")
+        );
+        let runtime_error = vm.runtime_error.as_ref().unwrap();
+        assert_eq!(
+            runtime_error.code.code,
+            "acp.session-config-value-unavailable"
+        );
+        assert_eq!(
+            runtime_error
+                .params
+                .get("configId")
+                .and_then(serde_json::Value::as_str),
+            Some("reasoning_effort")
+        );
+        assert_eq!(
+            runtime_error
+                .params
+                .get("availableValues")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn conversation_run_vm_exposes_worktree_creation_failure() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_trace_order_fixture(&app);
+        sasuke::storage::write_json(
+            &app.paths.run_file("task-trace", "run-001"),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "id": "run-001",
+                "task_id": "task-trace",
+                "status": "paused",
+                "outcome": null,
+                "started_at": "2026-07-08T00:00:00Z",
+                "updated_at": "2026-07-08T00:00:03Z",
+                "workflow_snapshot": "workflow.snapshot.json",
+                "current_round": "round-001",
+                "current_node": "验收",
+                "current_attempt": "attempt-001",
+                "new_rounds_opened": 0,
+                "pause_reason": "runtime-abnormal"
+            }),
+        )
+        .unwrap();
+        std::fs::write(
+            app.paths
+                .run_events_file("task-trace", "run-001")
+                .as_std_path(),
+            r#"{"version":"0.1","type":"run_paused","timestamp":"2026-07-08T00:00:03Z","data":{"taskId":"task-trace","runId":"run-001","pauseReason":"runtime-abnormal","controlFailure":{"runtimeError":{"code":{"domain":"workspace","code":"workspace.worktree-create-failed"},"domain":"workspace","recovery":"manual","retryPolicy":null,"params":{"branch":"sasuke/conversation/conflict"},"diagnostic":"git worktree add failed: branch already exists","raw":null}}}}"#,
+        )
+        .unwrap();
+
+        let vm = conversation_run_vm(&app, "project-001", "task-trace", "run-001", None).unwrap();
+        let runtime_error = vm.runtime_error.as_ref().unwrap();
+
+        assert_eq!(runtime_error.code.code, "workspace.worktree-create-failed");
+        assert_eq!(
+            runtime_error
+                .params
+                .get("branch")
+                .and_then(serde_json::Value::as_str),
+            Some("sasuke/conversation/conflict")
+        );
+    }
+
+    #[test]
+    fn conversation_run_vm_does_not_project_runtime_error_after_resume() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_trace_order_fixture(&app);
+        sasuke::storage::write_json(
+            &app.paths.run_file("task-trace", "run-001"),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "id": "run-001",
+                "task_id": "task-trace",
+                "status": "completed",
+                "outcome": "success",
+                "started_at": "2026-07-08T00:00:00Z",
+                "updated_at": "2026-07-08T00:00:04Z",
+                "workflow_snapshot": "workflow.snapshot.json",
+                "current_round": "round-001",
+                "current_node": "验收",
+                "current_attempt": "attempt-001",
+                "new_rounds_opened": 0,
+                "pause_reason": null
+            }),
+        )
+        .unwrap();
+        std::fs::write(
+            app.paths.run_events_file("task-trace", "run-001").as_std_path(),
+            r#"{"version":"0.1","type":"run_paused","timestamp":"2026-07-08T00:00:03Z","data":{"taskId":"task-trace","runId":"run-001","pauseReason":"runtime-abnormal","controlFailure":{"runtimeError":{"code":{"domain":"config","code":"acp.session-config-value-unavailable"},"domain":"config","recovery":"manual","retryPolicy":null,"params":{"category":"thought_level","configId":"reasoning_effort","value":"high","availableValues":[]},"diagnostic":"ACP session config value `high` is unavailable for `reasoning_effort`","raw":null}}}}"#,
+        )
+        .unwrap();
+
+        let vm = conversation_run_vm(&app, "project-001", "task-trace", "run-001", None).unwrap();
+
+        assert!(vm.runtime_error.is_none());
+        assert!(vm.runtime_error_message.is_none());
+    }
+
+    #[test]
+    fn conversation_run_vm_does_not_fall_back_past_current_pause_event() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_trace_order_fixture(&app);
+        sasuke::storage::write_json(
+            &app.paths.run_file("task-trace", "run-001"),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "id": "run-001",
+                "task_id": "task-trace",
+                "status": "paused",
+                "outcome": null,
+                "started_at": "2026-07-08T00:00:00Z",
+                "updated_at": "2026-07-08T00:00:04Z",
+                "workflow_snapshot": "workflow.snapshot.json",
+                "current_round": "round-001",
+                "current_node": "验收",
+                "current_attempt": "attempt-001",
+                "new_rounds_opened": 0,
+                "pause_reason": "runtime-abnormal"
+            }),
+        )
+        .unwrap();
+        let historical_pause = r#"{"version":"0.1","type":"run_paused","timestamp":"2026-07-08T00:00:03Z","data":{"taskId":"task-trace","runId":"run-001","pauseReason":"runtime-abnormal","controlFailure":{"runtimeError":{"code":{"domain":"config","code":"acp.session-config-value-unavailable"},"domain":"config","recovery":"manual","retryPolicy":null,"params":{"category":"thought_level","configId":"reasoning_effort","value":"high","availableValues":[]},"diagnostic":"ACP session config value `high` is unavailable for `reasoning_effort`","raw":null}}}}"#;
+        let current_pause = r#"{"version":"0.1","type":"run_paused","timestamp":"2026-07-08T00:00:04Z","data":{"taskId":"task-trace","runId":"run-001","pauseReason":"runtime-abnormal"}}"#;
+        std::fs::write(
+            app.paths
+                .run_events_file("task-trace", "run-001")
+                .as_std_path(),
+            format!("{historical_pause}\n{current_pause}"),
+        )
+        .unwrap();
+
+        let vm = conversation_run_vm(&app, "project-001", "task-trace", "run-001", None).unwrap();
+
+        assert!(vm.runtime_error.is_none());
+        assert!(vm.runtime_error_message.is_none());
+    }
+
+    #[test]
+    fn conversation_run_vm_does_not_project_runtime_error_for_other_pause_reason() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_trace_order_fixture(&app);
+        sasuke::storage::write_json(
+            &app.paths.run_file("task-trace", "run-001"),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "id": "run-001",
+                "task_id": "task-trace",
+                "status": "paused",
+                "outcome": null,
+                "started_at": "2026-07-08T00:00:00Z",
+                "updated_at": "2026-07-08T00:00:04Z",
+                "workflow_snapshot": "workflow.snapshot.json",
+                "current_round": "round-001",
+                "current_node": "验收",
+                "current_attempt": "attempt-001",
+                "new_rounds_opened": 0,
+                "pause_reason": "process-interrupted"
+            }),
+        )
+        .unwrap();
+        std::fs::write(
+            app.paths.run_events_file("task-trace", "run-001").as_std_path(),
+            r#"{"version":"0.1","type":"run_paused","timestamp":"2026-07-08T00:00:03Z","data":{"taskId":"task-trace","runId":"run-001","pauseReason":"runtime-abnormal","controlFailure":{"runtimeError":{"code":{"domain":"config","code":"acp.session-config-value-unavailable"},"domain":"config","recovery":"manual","retryPolicy":null,"params":{"category":"thought_level","configId":"reasoning_effort","value":"high","availableValues":[]},"diagnostic":"ACP session config value `high` is unavailable for `reasoning_effort`","raw":null}}}}"#,
+        )
+        .unwrap();
+
+        let vm = conversation_run_vm(&app, "project-001", "task-trace", "run-001", None).unwrap();
+
+        assert!(vm.runtime_error.is_none());
+        assert!(vm.runtime_error_message.is_none());
+    }
+
+    #[test]
+    fn conversation_run_vm_restores_manual_check_pending_from_node_state() {
+        let repo_root = temp_repo_root();
+        let app = App::new(repo_root);
+        write_conversation_assets_fixture(&app);
+        write_manual_check_pause_overrides(&app);
+
+        let vm = conversation_run_vm(
+            &app,
+            "project-001",
+            "task-046",
+            "run-060",
+            Some("round-001/测试/attempt-002"),
+        )
+        .unwrap();
+
+        let leaf = vm.session_tree.rounds[0].nodes[0]
+            .attempts
+            .iter()
+            .find(|leaf| leaf.attempt_id == "attempt-002")
+            .unwrap();
+        assert!(leaf.manual_check_pending);
+        assert_eq!(leaf.lifecycle.continue_kind, None);
+        assert_eq!(leaf.lifecycle.composer.mode, "normal");
+        assert_eq!(leaf.lifecycle.composer.submit_target, "acp-prompt");
+        assert!(!leaf.lifecycle.composer.lock_input);
+        assert!(
+            vm.active_sessions
+                .iter()
+                .any(|session| session.node_id == "测试" && session.manual_check_pending)
+        );
+    }
+
+    fn temp_repo_root() -> Utf8PathBuf {
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "sasuke-conversation-assets-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        Utf8PathBuf::from_path_buf(root).unwrap()
+    }
+
+    fn short_temp_repo_root() -> Utf8PathBuf {
+        let mut root = std::env::temp_dir();
+        root.push(format!("gb-vm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        Utf8PathBuf::from_path_buf(root).unwrap()
+    }
+
+    fn write_sidebar_task_fixture(
+        app: &App,
+        task_id: &str,
+        title: &str,
+        run_id: &str,
+        started_at: &str,
+    ) {
+        write_sidebar_task_fixture_with_updated_at(
+            app, task_id, title, run_id, started_at, started_at,
+        );
+    }
+
+    fn write_sidebar_task_fixture_with_updated_at(
+        app: &App,
+        task_id: &str,
+        title: &str,
+        run_id: &str,
+        started_at: &str,
+        updated_at: &str,
+    ) {
+        std::fs::create_dir_all(app.paths.task_dir(task_id).as_std_path()).unwrap();
+        sasuke::storage::write_json(
+            &app.paths.task_file(task_id),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "id": task_id,
+                "title": title,
+                "description": null
+            }),
+        )
+        .unwrap();
+        sasuke::storage::write_json(
+            &app.paths.run_file(task_id, run_id),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "id": run_id,
+                "task_id": task_id,
+                "status": "completed",
+                "outcome": "success",
+                "started_at": started_at,
+                "updated_at": updated_at,
+                "workflow_snapshot": "workflow.snapshot.json",
+                "current_round": null,
+                "current_node": null,
+                "current_attempt": null,
+                "new_rounds_opened": 0,
+                "pause_reason": null
+            }),
+        )
+        .unwrap();
+        let authoring_dir = app.paths.task_dir(task_id).join("authoring");
+        std::fs::create_dir_all(authoring_dir.as_std_path()).unwrap();
+        sasuke::storage::write_json(
+            &authoring_dir.join("conversation.json"),
+            &json!({
+                "version": "1",
+                "source": "conversation-ui",
+                "runMode": "auto"
+            }),
+        )
+        .unwrap();
+    }
+
+    fn write_sidebar_conversation_metadata_fixture(
+        app: &App,
+        task_id: &str,
+        run_mode: &str,
+        last_activity_at: &str,
+    ) {
+        let authoring_dir = app.paths.task_dir(task_id).join("authoring");
+        std::fs::create_dir_all(authoring_dir.as_std_path()).unwrap();
+        sasuke::storage::write_json(
+            &authoring_dir.join("conversation.json"),
+            &json!({
+                "version": "1",
+                "source": "conversation-ui",
+                "runMode": run_mode,
+                "workflowTemplateId": null,
+                "includeOptionalEntry": null,
+                "directConfig": null,
+                "agentIdentity": null,
+                "titleAutoGenerated": false,
+                "initialAttachmentNames": null,
+                "createdAt": last_activity_at,
+                "lastActivityAt": last_activity_at
+            }),
+        )
+        .unwrap();
+    }
+
+    fn write_dynamic_lifecycle_fixture(
+        app: &App,
+        run_status: &str,
+        run_pause_reason: serde_json::Value,
+        dynamic_node_status: &str,
+        current_dynamic_node_ids: Vec<&str>,
+    ) {
+        write_dynamic_lifecycle_fixture_with_cancelled_session(
+            app,
+            run_status,
+            run_pause_reason,
+            dynamic_node_status,
+            current_dynamic_node_ids,
+            dynamic_node_status == "paused",
+        );
+    }
+
+    fn write_dynamic_lifecycle_fixture_with_cancelled_session(
+        app: &App,
+        run_status: &str,
+        run_pause_reason: serde_json::Value,
+        dynamic_node_status: &str,
+        current_dynamic_node_ids: Vec<&str>,
+        cancelled_session: bool,
+    ) {
+        let task_id = "task-dyn";
+        let run_id = "run-dyn";
+        let round_id = "round-001";
+        let outer_node_id = "ai-dynamic";
+        let outer_attempt_id = "attempt-001";
+        let dynamic_node_id = "good-morning";
+        sasuke::storage::write_json(
+            &app.paths.task_file(task_id),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "id": task_id,
+                "title": "Dynamic lifecycle",
+                "description": null
+            }),
+        )
+        .unwrap();
+        sasuke::storage::write_json(
+            &app.paths.run_file(task_id, run_id),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "id": run_id,
+                "task_id": task_id,
+                "status": run_status,
+                "outcome": null,
+                "started_at": "2026-06-15T00:00:00Z",
+                "updated_at": "2026-06-15T00:00:02Z",
+                "workflow_snapshot": "workflow.snapshot.json",
+                "current_round": round_id,
+                "current_node": outer_node_id,
+                "current_attempt": outer_attempt_id,
+                "new_rounds_opened": 0,
+                "pause_reason": run_pause_reason.clone(),
+                "execution": {
+                    "revision": 1,
+                    "phase": if run_status == "paused" { "paused" } else { "starting-node" },
+                    "locator": {
+                        "roundId": round_id,
+                        "nodeId": outer_node_id,
+                        "attemptId": outer_attempt_id
+                    },
+                    "updatedAt": "2026-06-15T00:00:02Z"
+                }
+            }),
+        )
+        .unwrap();
+        sasuke::storage::write_json(
+            &app.paths.round_file(task_id, run_id, round_id),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "id": round_id,
+                "run_id": run_id,
+                "index": 1,
+                "status": run_status,
+                "outcome": null,
+                "trigger": "initial",
+                "started_at": "2026-06-15T00:00:00Z",
+                "trace": []
+            }),
+        )
+        .unwrap();
+        sasuke::storage::write_json(
+            &app.paths
+                .node_file(task_id, run_id, round_id, outer_node_id, outer_attempt_id),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "node_id": outer_node_id,
+                "node_type": "ai-dynamic",
+                "run_id": run_id,
+                "round_id": round_id,
+                "attempt_id": outer_attempt_id,
+                "status": run_status,
+                "outcome": null,
+                "started_at": "2026-06-15T00:00:00Z",
+                "finished_at": null,
+                "manual_check_pending": false,
+                "resolved_config": {}
+            }),
+        )
+        .unwrap();
+        let dynamic_run = json!({
+            "version": sasuke::domain::VERSION,
+            "id": "dynamic-run-001",
+            "parentRunId": run_id,
+            "parentRoundId": round_id,
+            "parentNodeId": outer_node_id,
+            "parentAttemptId": outer_attempt_id,
+            "status": run_status,
+            "outcome": null,
+            "pauseReason": run_pause_reason.clone(),
+            "startedAt": "2026-06-15T00:00:00Z",
+            "updatedAt": "2026-06-15T00:00:02Z",
+            "control": {},
+            "allowedWorkflowSnapshots": [],
+            "currentNodeIds": current_dynamic_node_ids
+        });
+        let dynamic_node = json!({
+            "version": sasuke::domain::VERSION,
+            "id": dynamic_node_id,
+            "dynamicRunId": "dynamic-run-001",
+            "kind": "worker",
+            "title": "Good morning",
+            "task": "Say good morning",
+            "status": dynamic_node_status,
+            "outcome": if dynamic_node_status == "completed" { json!("success") } else { json!(null) },
+            "runtimeExecutionId": if run_status == "running" && dynamic_node_status == "running" { json!("execution-good-morning") } else { json!(null) },
+            "runtimeExecutionPhase": match dynamic_node_status {
+                "paused" => json!("paused"),
+                "completed" => json!("terminal"),
+                "ready" => json!(null),
+                _ => json!("starting-node"),
+            },
+            "runtimeLifecycleRevision": if dynamic_node_status == "ready" { 0 } else { 1 },
+            "runtimeLifecycleUpdatedAt": if dynamic_node_status == "ready" { json!(null) } else { json!("2026-06-15T00:00:02Z") },
+            "groupId": null,
+            "chainId": dynamic_node_id,
+            "depth": 1,
+            "dependsOn": [],
+            "workspaceId": "workspace-main",
+            "provider": "claude-acp",
+            "profile": null,
+            "permissionMode": null,
+            "model": null,
+            "sessionMode": "new",
+            "continueFromNodeId": null,
+            "workflowId": null,
+            "workflowSnapshotId": null,
+            "childRunId": null,
+            "startedAt": "2026-06-15T00:00:00Z",
+            "finishedAt": if dynamic_node_status == "paused" || dynamic_node_status == "completed" { json!("2026-06-15T00:00:02Z") } else { json!(null) }
+        });
+        sasuke::storage::write_json(
+            &app.paths.dynamic_graph_file(
+                task_id,
+                run_id,
+                round_id,
+                outer_node_id,
+                outer_attempt_id,
+            ),
+            &json!({
+                "version": sasuke::dynamic_store::CURRENT_DYNAMIC_GRAPH_VERSION,
+                "run": dynamic_run,
+                "nodes": [dynamic_node],
+                "groups": [],
+                "workspaces": [{
+                    "version": sasuke::domain::VERSION,
+                    "id": "workspace-main",
+                    "dynamicRunId": "dynamic-run-001",
+                    "kind": "main",
+                    "ownership": "user",
+                    "repoRoot": app.paths.repo_root,
+                    "path": app.paths.repo_root,
+                    "branch": null,
+                    "parentWorkspaceId": null,
+                    "createdByGroupId": null,
+                    "forkCommit": "test-head",
+                    "checkpointCommit": null,
+                    "status": "active",
+                    "createdAt": "2026-06-15T00:00:00Z",
+                    "updatedAt": "2026-06-15T00:00:00Z"
+                }],
+                "proposals": []
+            }),
+        )
+        .unwrap();
+        sasuke::storage::write_json(
+            &app.paths
+                .dynamic_run_file(task_id, run_id, round_id, outer_node_id, outer_attempt_id),
+            &dynamic_run,
+        )
+        .unwrap();
+        sasuke::storage::write_json(
+            &app.paths.dynamic_node_file(
+                task_id,
+                run_id,
+                round_id,
+                outer_node_id,
+                outer_attempt_id,
+                dynamic_node_id,
+            ),
+            &dynamic_node,
+        )
+        .unwrap();
+        if cancelled_session {
+            sasuke::storage::write_json(
+                &app.paths
+                    .dynamic_node_attempt_dir(
+                        task_id,
+                        run_id,
+                        round_id,
+                        outer_node_id,
+                        outer_attempt_id,
+                        dynamic_node_id,
+                        "attempt-001",
+                    )
+                    .join("acp.session.json"),
+                &json!({
+                    "status": "cancelled",
+                    "stopReason": "cancelled",
+                    "sessionId": "session-good-morning",
+                    "messages": []
+                }),
+            )
+            .unwrap();
+        }
+    }
+
+    fn write_dynamic_node_pause_details(app: &App, pause_reason: &str, diagnostic: Option<&str>) {
+        let graph_path = app.paths.dynamic_graph_file(
+            "task-dyn",
+            "run-dyn",
+            "round-001",
+            "ai-dynamic",
+            "attempt-001",
+        );
+        let mut graph: serde_json::Value = sasuke::storage::read_json(&graph_path).unwrap();
+        graph["nodes"][0]["pauseReason"] = json!(pause_reason);
+        graph["nodes"][0]["runtimeError"] = diagnostic.map_or(json!(null), |diagnostic| {
+            json!({
+                "code": { "domain": "provider", "code": "provider.acp-error" },
+                "domain": "provider",
+                "recovery": "manual",
+                "retryPolicy": null,
+                "params": { "method": "session/set_config_option" },
+                "diagnostic": diagnostic,
+                "raw": null
+            })
+        });
+        sasuke::storage::write_json(&graph_path, &graph).unwrap();
+    }
+
+    fn write_conversation_assets_fixture(app: &App) {
+        let task_id = "task-046";
+        let run_id = "run-060";
+        let round_id = "round-001";
+        let node_id = "测试";
+        let attempt_id = "attempt-002";
+
+        std::fs::create_dir_all(app.paths.task_dir(task_id).as_std_path()).unwrap();
+        sasuke::storage::write_json(
+            &app.paths.task_file(task_id),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "id": task_id,
+                "uuid": "task-046-fixture-uuid",
+                "title": "中文节点资源回归",
+                "description": null
+            }),
+        )
+        .unwrap();
+        sasuke::storage::write_json(
+            &app.paths.run_file(task_id, run_id),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "id": run_id,
+                "task_id": task_id,
+                "status": "completed",
+                "outcome": "success",
+                "started_at": "2026-06-15T00:00:00Z",
+                "updated_at": "2026-06-15T00:00:02Z",
+                "workflow_snapshot": "workflow.snapshot.json",
+                "current_round": round_id,
+                "current_node": node_id,
+                "current_attempt": attempt_id,
+                "new_rounds_opened": 0,
+                "pause_reason": null
+            }),
+        )
+        .unwrap();
+        sasuke::storage::write_json(
+            &app.paths.round_file(task_id, run_id, round_id),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "id": round_id,
+                "run_id": run_id,
+                "index": 1,
+                "status": "completed",
+                "outcome": "success",
+                "trigger": "initial",
+                "started_at": "2026-06-15T00:00:00Z",
+                "trace": [
+                    {
+                        "sequence": 1,
+                        "node_id": node_id,
+                        "attempt_id": attempt_id,
+                        "from_node_id": null,
+                        "edge_outcome": null,
+                        "entered_at": "2026-06-15T00:00:00Z"
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+        sasuke::storage::write_json(
+            &app.paths
+                .node_file(task_id, run_id, round_id, node_id, attempt_id),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "node_id": node_id,
+                "node_type": "worker",
+                "run_id": run_id,
+                "round_id": round_id,
+                "attempt_id": attempt_id,
+                "status": "completed",
+                "outcome": "success",
+                "started_at": "2026-06-15T00:00:00Z",
+                "finished_at": "2026-06-15T00:00:02Z",
+                "manual_check_pending": false,
+                "resolved_config": {}
+            }),
+        )
+        .unwrap();
+
+        let artifacts_dir = app
+            .paths
+            .artifacts_dir(task_id, run_id, round_id, node_id, attempt_id);
+        std::fs::create_dir_all(artifacts_dir.as_std_path()).unwrap();
+        std::fs::write(
+            artifacts_dir.join("测试-result.json").as_std_path(),
+            r#"{"result":true}"#,
+        )
+        .unwrap();
+
+        let attachments_dir = app
+            .paths
+            .attachments_dir(task_id, run_id, round_id, node_id, attempt_id);
+        std::fs::create_dir_all(attachments_dir.as_std_path()).unwrap();
+        std::fs::write(attachments_dir.join("test-report.md").as_std_path(), "ok").unwrap();
+    }
+
+    fn write_trace_order_fixture(app: &App) {
+        let task_id = "task-trace";
+        let run_id = "run-001";
+        let round_id = "round-001";
+        std::fs::create_dir_all(app.paths.task_dir(task_id).as_std_path()).unwrap();
+        sasuke::storage::write_json(
+            &app.paths.task_file(task_id),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "id": task_id,
+                "title": "Trace order",
+                "description": null
+            }),
+        )
+        .unwrap();
+        sasuke::storage::write_json(
+            &app.paths.run_file(task_id, run_id),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "id": run_id,
+                "task_id": task_id,
+                "status": "completed",
+                "outcome": "failure",
+                "started_at": "2026-07-08T00:00:00Z",
+                "updated_at": "2026-07-08T00:00:03Z",
+                "workflow_snapshot": "workflow.snapshot.json",
+                "current_round": round_id,
+                "current_node": "验收",
+                "current_attempt": "attempt-001",
+                "new_rounds_opened": 0,
+                "pause_reason": null
+            }),
+        )
+        .unwrap();
+        sasuke::storage::write_json(
+            &app.paths.workflow_snapshot_file(task_id, run_id),
+            &json!({
+                "version": "0.1",
+                "id": "workflow-trace-order",
+                "entry": "方案",
+                "nodes": [
+                    { "type": "worker", "id": "开发", "provider": "claude-acp" },
+                    { "type": "worker", "id": "验收", "provider": "claude-acp" },
+                    { "type": "worker", "id": "方案", "provider": "claude-acp" }
+                ],
+                "edges": [
+                    { "from": "方案", "to": "开发", "on": "success" },
+                    { "from": "开发", "to": "验收", "on": "success" },
+                    { "from": "验收", "to": "$end", "on": "success" }
+                ]
+            }),
+        )
+        .unwrap();
+        sasuke::storage::write_json(
+            &app.paths.round_file(task_id, run_id, round_id),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "id": round_id,
+                "run_id": run_id,
+                "index": 1,
+                "status": "completed",
+                "outcome": "failure",
+                "trigger": "initial",
+                "started_at": "2026-07-08T00:00:00Z",
+                "trace": [
+                    { "sequence": 1, "node_id": "方案", "attempt_id": "attempt-001", "from_node_id": null, "edge_outcome": null, "entered_at": "2026-07-08T00:00:00Z" },
+                    { "sequence": 2, "node_id": "开发", "attempt_id": "attempt-001", "from_node_id": "方案", "edge_outcome": "success", "entered_at": "2026-07-08T00:00:01Z" },
+                    { "sequence": 3, "node_id": "验收", "attempt_id": "attempt-001", "from_node_id": "开发", "edge_outcome": "success", "entered_at": "2026-07-08T00:00:02Z" }
+                ]
+            }),
+        )
+        .unwrap();
+        for (node_id, status, outcome) in [
+            ("方案", "completed", "success"),
+            ("开发", "completed", "success"),
+            ("验收", "completed", "failure"),
+        ] {
+            sasuke::storage::write_json(
+                &app.paths
+                    .node_file(task_id, run_id, round_id, node_id, "attempt-001"),
+                &json!({
+                    "version": sasuke::domain::VERSION,
+                    "node_id": node_id,
+                    "node_type": "worker",
+                    "run_id": run_id,
+                    "round_id": round_id,
+                    "attempt_id": "attempt-001",
+                    "status": status,
+                    "outcome": outcome,
+                    "started_at": "2026-07-08T00:00:00Z",
+                    "finished_at": "2026-07-08T00:00:01Z",
+                    "manual_check_pending": false,
+                    "resolved_config": {}
+                }),
+            )
+            .unwrap();
+        }
+    }
+
+    fn write_manual_check_pause_overrides(app: &App) {
+        let task_id = "task-046";
+        let run_id = "run-060";
+        let round_id = "round-001";
+        let node_id = "测试";
+        let attempt_id = "attempt-002";
+        sasuke::storage::write_json(
+            &app.paths.run_file(task_id, run_id),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "id": run_id,
+                "task_id": task_id,
+                "status": "paused",
+                "outcome": null,
+                "started_at": "2026-06-15T00:00:00Z",
+                "updated_at": "2026-06-15T00:00:02Z",
+                "workflow_snapshot": "workflow.snapshot.json",
+                "current_round": round_id,
+                "current_node": node_id,
+                "current_attempt": attempt_id,
+                "new_rounds_opened": 0,
+                "pause_reason": "waiting-for-user-input"
+            }),
+        )
+        .unwrap();
+        sasuke::storage::write_json(
+            &app.paths.round_file(task_id, run_id, round_id),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "id": round_id,
+                "run_id": run_id,
+                "index": 1,
+                "status": "paused",
+                "outcome": null,
+                "trigger": "initial",
+                "started_at": "2026-06-15T00:00:00Z",
+                "trace": [
+                    {
+                        "sequence": 1,
+                        "node_id": node_id,
+                        "attempt_id": attempt_id,
+                        "from_node_id": null,
+                        "edge_outcome": null,
+                        "entered_at": "2026-06-15T00:00:00Z"
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+        sasuke::storage::write_json(
+            &app.paths
+                .node_file(task_id, run_id, round_id, node_id, attempt_id),
+            &json!({
+                "version": sasuke::domain::VERSION,
+                "node_id": node_id,
+                "node_type": "worker",
+                "run_id": run_id,
+                "round_id": round_id,
+                "attempt_id": attempt_id,
+                "status": "paused",
+                "outcome": null,
+                "started_at": "2026-06-15T00:00:00Z",
+                "finished_at": "2026-06-15T00:00:02Z",
+                "manual_check_pending": true,
+                "resolved_config": {}
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn scheduled_task_title_uses_first_instruction_line_and_truncates() {
+        assert_eq!(
+            super::scheduled_task_title("  每天整理日报  \n补充说明"),
+            "每天整理日报"
+        );
+        assert_eq!(super::scheduled_task_title(""), "");
+        assert_eq!(
+            super::scheduled_task_title(&"x".repeat(60)).chars().count(),
+            49
+        );
+    }
+
+    #[test]
+    fn scheduled_task_management_returns_typed_schedule_without_display_labels() {
+        let definition = sasuke::scheduler::ScheduledTaskDefinition::new(
+            "project-a",
+            "scheduled-1",
+            "direct",
+            sasuke::scheduler::ScheduleSpec::repeat(
+                sasuke::scheduler::RepeatPreset::Daily,
+                9,
+                0,
+                "Asia/Shanghai",
+            )
+            .unwrap(),
+            sasuke::scheduler::OverlapPolicy::SkipWhenRunning,
+        )
+        .unwrap();
+        let value =
+            serde_json::to_value(super::ScheduledTaskVm::from_definition(&definition, None))
+                .unwrap();
+        assert_eq!(value["schedule"]["kind"], "Repeat");
+        assert_eq!(value["schedule"]["timezone"], "Asia/Shanghai");
+        assert!(value.get("scheduleLabel").is_none());
+        assert!(value.get("timezoneLabel").is_none());
+        assert!(value.get("lastTriggerLabel").is_none());
+    }
+
+    #[test]
+    fn scheduled_task_vm_next_at_uses_persisted_next_run_at_not_realtime_recompute() {
+        let definition = sasuke::scheduler::ScheduledTaskDefinition::new(
+            "project-a",
+            "scheduled-1",
+            "direct",
+            sasuke::scheduler::ScheduleSpec::every(3, "minutes", chrono::Utc::now()).unwrap(),
+            sasuke::scheduler::OverlapPolicy::SkipWhenRunning,
+        )
+        .unwrap();
+        // 模拟数据库持久化的 next_run_at（与 now 实时重算的结果不同）。
+        let persisted = chrono::Utc::now() + chrono::Duration::days(7);
+
+        let vm = super::ScheduledTaskVm::from_definition(&definition, Some(persisted));
+        assert_eq!(vm.next_at.as_deref(), Some(persisted.to_rfc3339().as_str()));
+
+        // 不传 next_run_at（None）时 next_at 为 None，而不是回退到 now 实时算。
+        let vm_none = super::ScheduledTaskVm::from_definition(&definition, None);
+        assert!(vm_none.next_at.is_none());
+    }
+
+    #[test]
+    fn scheduled_task_management_aggregates_all_workspaces_and_can_filter_one() {
+        let app_a = App::new(short_temp_repo_root());
+        let app_b = App::new(short_temp_repo_root());
+        let definition_a = sasuke::scheduler::ScheduledTaskDefinition::new(
+            "workspace-a",
+            "scheduled-a",
+            "direct",
+            sasuke::scheduler::ScheduleSpec::at(
+                chrono::Utc.with_ymd_and_hms(2026, 8, 1, 1, 0, 0).unwrap(),
+            ),
+            sasuke::scheduler::OverlapPolicy::SkipWhenRunning,
+        )
+        .unwrap();
+        let definition_b = sasuke::scheduler::ScheduledTaskDefinition::new(
+            "workspace-b",
+            "scheduled-b",
+            "workflow",
+            sasuke::scheduler::ScheduleSpec::at(
+                chrono::Utc.with_ymd_and_hms(2026, 8, 2, 1, 0, 0).unwrap(),
+            ),
+            sasuke::scheduler::OverlapPolicy::SkipWhenRunning,
+        )
+        .unwrap();
+        sasuke::scheduler::db::ScheduledTaskDatabase::open(app_a.paths.scheduler_db_path())
+            .unwrap()
+            .create_job(
+                &definition_a,
+                sasuke::scheduler::db::derived_next_run_at(&definition_a),
+            )
+            .unwrap();
+        sasuke::scheduler::db::ScheduledTaskDatabase::open(app_b.paths.scheduler_db_path())
+            .unwrap()
+            .create_job(
+                &definition_b,
+                sasuke::scheduler::db::derived_next_run_at(&definition_b),
+            )
+            .unwrap();
+        let sources = vec![
+            ConversationWorkspaceSource {
+                workspace: ConversationWorkspaceVm {
+                    project_id: "workspace-a".to_string(),
+                    workspace_path: app_a.paths.repo_root.to_string(),
+                    name: "Workspace A".to_string(),
+                },
+                app: app_a,
+            },
+            ConversationWorkspaceSource {
+                workspace: ConversationWorkspaceVm {
+                    project_id: "workspace-b".to_string(),
+                    workspace_path: app_b.paths.repo_root.to_string(),
+                    name: "Workspace B".to_string(),
+                },
+                app: app_b,
+            },
+        ];
+
+        let all = scheduled_task_vms_from_sources(&sources, None).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].workspace_name, "Workspace A");
+        assert_eq!(all[1].workspace_name, "Workspace B");
+
+        let filtered = scheduled_task_vms_from_sources(&sources, Some("workspace-b")).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "scheduled-b");
+    }
+}
+
+pub fn update_task_metadata_vm(
+    app: &App,
+    project_id: &str,
+    task_id: &str,
+    title: &str,
+    description: Option<&str>,
+    pinned: bool,
+    pin_order: Option<usize>,
+) -> anyhow::Result<ConversationTaskRowVm> {
+    app.update_task_metadata(task_id, title, description)?;
+    conversation_task_row_vm(app, project_id, task_id, pinned, pin_order)
+}
