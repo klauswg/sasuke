@@ -1,0 +1,242 @@
+import { Bot, Boxes, ChevronsUpDown, Command, Settings } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import type { AppConfigVm, ConversationPage, ConversationSidebarVm, ConversationTaskRowVm, DesktopPlatform, DesktopUiMode, DesktopWindowFrameStyle, PrimaryModule } from '../types';
+import { Button } from '@/components/ui/button';
+import { Separator } from '@/components/ui/separator';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+import { WorkspaceShell } from '@/components/workspace/WorkspaceShell';
+import type { ConversationSidebarWorkspaceRevealRequest } from '@/components/conversation/ConversationSidebar';
+import type { ConversationWorkspaceStore } from '@/components/workspace/right-workspace-context';
+import { AppTitleBar } from './AppTitleBar';
+import { cn } from '@/lib/utils';
+import { ThemeIcon, useThemeWallpaperSurface } from '@/components/theme/ThemeAssetsContext';
+
+interface ShellProps {
+  uiMode: DesktopUiMode;
+  active: PrimaryModule;
+  conversationPage: ConversationPage;
+  conversationSidebar: ConversationSidebarVm;
+  appName: string;
+  feedbackEnabled?: boolean;
+  platform?: DesktopPlatform | null;
+  windowFrameStyle?: DesktopWindowFrameStyle;
+  appConfig: AppConfigVm;
+  repoRoot?: string;
+  needsWorkspace?: boolean;
+  showSettingsUpdateDot?: boolean;
+  sidebarCollapsed: boolean;
+  onSelect: (module: PrimaryModule) => void;
+  onSelectConversation: (page: ConversationPage) => void;
+  onToggleSidebar: () => void;
+  onOpenPersonalAnalytics: () => void;
+  onChooseWorkspace: () => void;
+  onConversationNew: () => void;
+  onConversationSearch: () => void;
+  onConversationPauseRun?: (projectId: string, taskId: string, runId: string) => void | Promise<void>;
+  onConversationRenameTask: (projectId: string, taskId: string, title: string) => void;
+  onConversationDeleteTask: (projectId: string, taskId: string, taskUuid?: string | null) => void;
+  onConversationPinTask: (projectId: string, taskId: string) => void;
+  onConversationUnpinTask: (projectId: string, taskId: string) => void;
+  onConversationNewInWorkspace: (projectId: string) => void;
+  onConversationAddWorkspace?: () => void;
+  onConversationRemoveWorkspace?: (projectId: string) => Promise<void>;
+  onConversationRetrySidebar: () => void;
+  onConversationRequestWorkspaceTasks: (projectId: string, cursor?: string | null) => void;
+  onConversationRequestPinnedTasks: (cursor?: string | null) => void;
+  onConversationRequestTaskRuns: (task: Pick<ConversationTaskRowVm, 'projectId' | 'taskId' | 'taskUuid'>, cursor?: string | null) => void;
+  activeWorkspaceId?: string | null;
+  defaultExpandedWorkspaceId?: string | null;
+  workspaceRevealRequest?: ConversationSidebarWorkspaceRevealRequest | null;
+  conversationTaskUuid?: string | null;
+  sourceControlWorkspacePath?: string | null;
+  conversationWorkspaceStore: ConversationWorkspaceStore;
+  children: React.ReactNode;
+}
+
+export function Shell({ uiMode, active, conversationPage, conversationSidebar, appName, feedbackEnabled, platform, windowFrameStyle = 'native-compositor', appConfig, repoRoot, needsWorkspace, showSettingsUpdateDot = false, sidebarCollapsed, onSelect, onSelectConversation, onToggleSidebar, onOpenPersonalAnalytics, onChooseWorkspace, onConversationNew, onConversationSearch, onConversationPauseRun, onConversationRenameTask, onConversationDeleteTask, onConversationPinTask, onConversationUnpinTask, onConversationNewInWorkspace, onConversationAddWorkspace, onConversationRemoveWorkspace, onConversationRetrySidebar, onConversationRequestWorkspaceTasks, onConversationRequestPinnedTasks, onConversationRequestTaskRuns, activeWorkspaceId, defaultExpandedWorkspaceId, workspaceRevealRequest, conversationTaskUuid, sourceControlWorkspacePath, conversationWorkspaceStore, children }: ShellProps) {
+  useThemeWallpaperSurface();
+  if (uiMode === 'conversation') {
+    return (
+      <WorkspaceShell
+        appName={appName}
+        feedbackEnabled={feedbackEnabled}
+        platform={platform}
+        windowFrameStyle={windowFrameStyle}
+        appConfig={appConfig}
+        vm={conversationSidebar}
+        active={conversationPage}
+        sidebarCollapsed={sidebarCollapsed}
+        onSelect={onSelectConversation}
+        onToggleSidebar={onToggleSidebar}
+        onOpenPersonalAnalytics={onOpenPersonalAnalytics}
+        onNewConversation={onConversationNew}
+        onSearch={onConversationSearch}
+        onPauseRun={onConversationPauseRun}
+        onPinTask={onConversationPinTask}
+        onUnpinTask={onConversationUnpinTask}
+        onRenameTask={onConversationRenameTask}
+        onDeleteTask={onConversationDeleteTask}
+        onNewConversationInWorkspace={onConversationNewInWorkspace}
+        onAddWorkspace={onConversationAddWorkspace}
+        onRemoveWorkspace={onConversationRemoveWorkspace}
+        onRetryBootstrap={onConversationRetrySidebar}
+        onRequestWorkspaceTasks={onConversationRequestWorkspaceTasks}
+        onRequestPinnedTasks={onConversationRequestPinnedTasks}
+        onRequestTaskRuns={onConversationRequestTaskRuns}
+        activeWorkspaceId={activeWorkspaceId}
+        defaultExpandedWorkspaceId={defaultExpandedWorkspaceId}
+        workspaceRevealRequest={workspaceRevealRequest}
+        conversationTaskUuid={conversationTaskUuid}
+        sourceControlWorkspacePath={sourceControlWorkspacePath}
+        conversationWorkspaceStore={conversationWorkspaceStore}
+      >
+        {children}
+      </WorkspaceShell>
+    );
+  }
+  return (
+    <WorkbenchShell
+      active={active}
+      appName={appName}
+      feedbackEnabled={feedbackEnabled}
+      platform={platform}
+      windowFrameStyle={windowFrameStyle}
+      repoRoot={repoRoot}
+      needsWorkspace={needsWorkspace}
+      showSettingsUpdateDot={showSettingsUpdateDot}
+      sidebarCollapsed={sidebarCollapsed}
+      onSelect={onSelect}
+      onToggleSidebar={onToggleSidebar}
+      onOpenPersonalAnalytics={onOpenPersonalAnalytics}
+      onChooseWorkspace={onChooseWorkspace}
+    >
+      {children}
+    </WorkbenchShell>
+  );
+}
+
+// ── WorkbenchShell ──
+
+interface WorkbenchShellProps {
+  active: PrimaryModule;
+  appName: string;
+  feedbackEnabled?: boolean;
+  platform?: DesktopPlatform | null;
+  windowFrameStyle: DesktopWindowFrameStyle;
+  repoRoot?: string;
+  needsWorkspace?: boolean;
+  showSettingsUpdateDot?: boolean;
+  sidebarCollapsed: boolean;
+  onSelect: (module: PrimaryModule) => void;
+  onToggleSidebar: () => void;
+  onOpenPersonalAnalytics: () => void;
+  onChooseWorkspace: () => void;
+  children: React.ReactNode;
+}
+
+function WorkbenchShell({ active, appName, feedbackEnabled, platform, windowFrameStyle, repoRoot, needsWorkspace, showSettingsUpdateDot = false, onSelect, onChooseWorkspace, children, sidebarCollapsed, onToggleSidebar, onOpenPersonalAnalytics }: WorkbenchShellProps) {
+  const { t } = useTranslation();
+  return (
+    <TooltipProvider>
+      <div
+        className="app-window-shell flex h-screen flex-col bg-gold-workspace text-foreground"
+        data-theme-role="shell"
+        data-theme-wallpaper-slot="app"
+        data-window-frame-style={windowFrameStyle}
+        onContextMenu={(event) => event.preventDefault()}
+      >
+        <AppTitleBar
+          appName={appName}
+          feedbackEnabled={feedbackEnabled}
+          platform={platform}
+          sidebarCollapsed={sidebarCollapsed}
+          onToggleSidebar={onToggleSidebar}
+          onOpenPersonalAnalytics={onOpenPersonalAnalytics}
+        />
+        <div className="flex min-h-0 flex-1 bg-sidebar">
+          <div
+            className={cn(
+              'shrink-0 overflow-hidden transition-[width] duration-250 ease-out',
+              sidebarCollapsed && 'pointer-events-none',
+            )}
+            style={{ width: sidebarCollapsed ? 0 : 256 }}
+          >
+            <aside
+              data-theme-role="sidebar"
+              className={cn(
+                'flex min-h-0 h-full w-64 flex-col gap-5 bg-sidebar px-5 py-7 text-sidebar-foreground transition-opacity duration-200 ease-out',
+                sidebarCollapsed ? 'opacity-0' : 'opacity-100',
+              )}
+            >
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button variant="outline" className="h-auto justify-between gap-3 border-sidebar-border bg-transparent p-3 text-left hover:bg-sidebar-accent" onClick={onChooseWorkspace}>
+                    <span className="min-w-0">
+                      <span className="block truncate text-xs text-muted-foreground">{needsWorkspace ? t('common.workspace') : (repoRoot ?? t('common.workspace'))}</span>
+                      <small className="mt-1 block text-xs font-semibold text-primary">{t('common.selectWorkspace')}</small>
+                    </span>
+                    <ChevronsUpDown className="size-4 shrink-0 text-muted-foreground" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent className="max-w-[360px] whitespace-pre-wrap break-words" sideOffset={6}>{needsWorkspace ? t('common.selectWorkspace') : (repoRoot ?? t('common.switchWorkspace'))}</TooltipContent>
+              </Tooltip>
+
+              <nav className="mt-6 flex flex-1 flex-col gap-2">
+                <ShellNavButton active={active === 'task-orchestration'} href="/tasks" icon={<ThemeIcon slot="entity.task" fallback={Command} aria-hidden="true" />} label={t('common.taskOrchestration')} onClick={() => onSelect('task-orchestration')} />
+                <ShellNavButton active={active === 'agent-management'} href="/agents" icon={<ThemeIcon slot="navigation.agent" fallback={Bot} aria-hidden="true" />} label={t('common.agentManagement')} onClick={() => onSelect('agent-management')} />
+                <ShellNavButton active={active === 'knowledge-base'} href="/contexts" icon={<ThemeIcon slot="navigation.context" fallback={Boxes} aria-hidden="true" />} label={t('common.contextManagement')} onClick={() => onSelect('knowledge-base')} />
+              </nav>
+
+              <Separator />
+              <ShellNavButton active={active === 'settings'} href="/settings" icon={<ThemeIcon slot="navigation.settings" fallback={Settings} aria-hidden="true" />} label={t('common.settings')} trailing={showSettingsUpdateDot ? <UpdateDot /> : null} onClick={() => onSelect('settings')} />
+            </aside>
+          </div>
+          <main className="relative z-10 flex min-w-0 flex-1 flex-col overflow-hidden rounded-tl-2xl border-l border-t border-workspace-divider bg-gold-workspace [box-shadow:var(--workspace-main-surface-shadow)]">{children}</main>
+        </div>
+      </div>
+    </TooltipProvider>
+  );
+}
+
+// ── Shared helpers ──
+
+function handleNavLinkClick(event: React.MouseEvent<HTMLAnchorElement>, onClick?: () => void) {
+  if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  onClick?.();
+}
+
+function ShellNavButton({ active, disabled, href, icon, label, trailing, onClick }: { active?: boolean; disabled?: boolean; href?: string; icon: React.ReactNode; label: string; trailing?: React.ReactNode; onClick?: () => void }) {
+  const className = cn(
+    'h-10 justify-between rounded-lg px-3 text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
+    active && 'bg-sidebar-accent text-sidebar-accent-foreground',
+  );
+  const content = (
+    <>
+      <span className="flex items-center gap-3">
+        <span className="[&_svg]:size-4">{icon}</span>
+        <span className="text-sm">{label}</span>
+      </span>
+      {trailing ? <span className="flex items-center text-xs">{trailing}</span> : null}
+    </>
+  );
+  const button = href && !disabled ? (
+    <Button variant="ghost" className={className} data-theme-role="navigation-item" data-selected={active} asChild>
+      <a href={href} onClick={(event) => handleNavLinkClick(event, onClick)}>{content}</a>
+    </Button>
+  ) : (
+    <Button variant="ghost" disabled={disabled} className={className} data-theme-role="navigation-item" data-selected={active} onClick={onClick}>{content}</Button>
+  );
+
+  if (!disabled) return button;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{button}</TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+function UpdateDot() {
+  return <span className="size-2 rounded-full bg-destructive" aria-hidden="true" />;
+}
