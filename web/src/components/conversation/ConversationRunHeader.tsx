@@ -1,0 +1,141 @@
+import { AlarmClock, Eye, RotateCcw, Workflow, ChevronDown } from 'lucide-react';
+import type { ReactNode } from 'react';
+import { useTranslation } from 'react-i18next';
+import type { ConversationRunVm, ConversationSessionLeafVm } from '../../types';
+import { Button } from '@/components/ui/button';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { cn } from '@/lib/utils';
+import { runtimeStatusDotClass } from '@/lib/runtime-status-dot';
+import { EditableConversationTitle } from '@/components/conversation/EditableConversationTitle';
+
+interface ConversationRunHeaderProps {
+  run: ConversationRunVm;
+  taskTitle: string;
+  onRerun: () => void;
+  onEditWorkflow: () => void;
+  onViewWorkflow: () => void;
+  onSessionSwitcherOpenChange: (open: boolean) => void;
+  sessionSwitcherOpen: boolean;
+  sessionSwitcher: ReactNode;
+  selectedSessionLeaf?: ConversationSessionLeafVm | null;
+  canViewWorkflow?: boolean;
+  canEditWorkflow?: boolean;
+  onTitleChange?: (title: string) => void;
+}
+
+export function ConversationRunHeader({
+  run,
+  taskTitle,
+  onRerun,
+  onEditWorkflow,
+  onViewWorkflow,
+  onSessionSwitcherOpenChange,
+  sessionSwitcherOpen,
+  sessionSwitcher,
+  selectedSessionLeaf,
+  canViewWorkflow,
+  canEditWorkflow,
+  onTitleChange,
+}: ConversationRunHeaderProps) {
+  const { t } = useTranslation();
+  const isRunning = run.runStatus === 'running';
+  const isDirect = run.runMode === 'direct';
+  const selectedSessionDisplay = selectedSessionLeaf?.runtimeDisplay;
+  const selectedSessionDotClass = runtimeStatusDotClass(selectedSessionDisplay?.tone);
+
+  return (
+    <div className="shrink-0 bg-content-header px-5 py-0.5">
+      <div className="flex min-w-0 items-center gap-3">
+        {run.scheduledTaskId ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="inline-flex shrink-0 items-center text-foreground" aria-label={t('scheduled.conversationMarker')}>
+                <AlarmClock className="size-3.5" />
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>{t('scheduled.conversationMarker')}</TooltipContent>
+          </Tooltip>
+        ) : null}
+        <EditableConversationTitle
+          title={taskTitle}
+          metadata={!isDirect ? run.runId : null}
+          className="flex-1"
+          onTitleChange={onTitleChange}
+        />
+
+        {/* Session switcher toggle */}
+        {!isDirect ? (
+          <Popover open={sessionSwitcherOpen} onOpenChange={onSessionSwitcherOpenChange}>
+            <PopoverTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 gap-1.5 px-2 text-xs font-normal"
+                aria-expanded={sessionSwitcherOpen}
+              >
+                {selectedSessionLeaf ? (
+                  <span
+                    aria-hidden="true"
+                    className="relative inline-flex size-3 shrink-0 items-center justify-center rounded-full border border-background/80"
+                  >
+                    <span className={cn('relative inline-block size-2 rounded-full', selectedSessionDotClass)} />
+                  </span>
+                ) : null}
+                <span className="truncate text-muted-foreground">
+                  {run.sessionTree.selectedSessionKey ?? t('conversation.runtime.sessionSwitcher')}
+                </span>
+                <ChevronDown className={cn('size-3 transition-transform', sessionSwitcherOpen && 'rotate-180')} />
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent
+              align="end"
+              sideOffset={4}
+              collisionPadding={12}
+              className="w-64 overflow-hidden p-0"
+            >
+              {sessionSwitcher}
+            </PopoverContent>
+          </Popover>
+        ) : null}
+
+        {/* Actions */}
+        <div className="flex shrink-0 items-center gap-1">
+          {canViewWorkflow ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="ghost" size="icon" className="size-5.5" aria-label={t('conversation.runtime.viewWorkflow')} onClick={onViewWorkflow}>
+                  <Eye className="size-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{t('conversation.runtime.viewWorkflow')}</TooltipContent>
+            </Tooltip>
+          ) : null}
+
+          {canEditWorkflow ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="ghost" size="icon" className="size-5.5" aria-label={t('conversation.runtime.editWorkflow')} onClick={onEditWorkflow}>
+                  <Workflow className="size-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{t('conversation.runtime.editWorkflow')}</TooltipContent>
+            </Tooltip>
+          ) : null}
+
+          {!isDirect ? <Tooltip>
+            <TooltipTrigger asChild>
+              <Button variant="ghost" size="icon" className="size-5.5" aria-label={isRunning ? t('conversation.runtime.rerunConfirmAction') : t('conversation.runtime.rerun')} onClick={onRerun}>
+                <RotateCcw className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>
+              {isRunning ? t('conversation.runtime.rerunConfirmAction') : t('conversation.runtime.rerun')}
+            </TooltipContent>
+          </Tooltip> : null}
+
+        </div>
+      </div>
+    </div>
+  );
+}
