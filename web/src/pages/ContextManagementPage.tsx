@@ -1,0 +1,2079 @@
+import { useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import type { TFunction } from 'i18next';
+import { ArrowLeft, Check, ChevronsUpDown, CircleHelp, Edit, Eye, FileText, FolderOpen, Library, Loader2, Pencil, Plus, RefreshCw, Search, Trash2 } from 'lucide-react';
+import { useForm } from 'react-hook-form';
+import { useTranslation } from 'react-i18next';
+import {
+  createProfile, deleteProfile, getProfile, getProfiles, importProfilesFromFolder, updateProfile,
+  listMcpServers, addMcpServer, updateMcpServer, deleteMcpServer,
+  toggleMcpServer, checkMcpServerHealth, listMcpTools,
+  listSkills, listProjectSkills, readSkill, writeSkill, deleteSkill, getSkillSyncStatus,
+  checkSkillNameConflict, updateSkillSyncTargets, listSkillFiles, readSkillFile,
+  getConversationWorkspaces, doctorAgent,
+} from '../api';
+import { displayAppError } from '../i18n';
+import type {
+  AppErrorVm, ImportedProfileRecord, ImportProfilesResult, ProfileFieldFallback, ProfileInput, ProfileListVm, ProfileScope, ProfileVm,
+  McpServerVm, SkillListVm, SkillMetaVm, SkillContentVm, SkillFileEntryVm, AgentRegistryVm, ToolInfo,
+} from '../types';
+import { EntitySection } from '@/components/EntitySection';
+import { McpServerCard } from '@/components/McpServerCard';
+import { EmptyState, Page, PageContent, PageHeader } from '@/components/PageScaffold';
+import { SkillAgentOverflow } from '@/components/SkillAgentOverflow';
+import { SkillSyncTargetSelector } from '@/components/SkillSyncTargetSelector';
+import { Markdown, MarkdownResourceLinkProvider, type MarkdownResourceLinkHandler } from '@/components/prompt-kit/markdown';
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { useReadOnlyExperience } from '@/components/ReadOnlyExperience';
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from '@/components/ui/form';
+import { Input } from '@/components/ui/input';
+import { Pagination, PaginationContent, PaginationItem, PaginationLink } from '@/components/ui/pagination';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from '@/components/ui/sheet';
+import { Switch } from '@/components/ui/switch';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Textarea } from '@/components/ui/textarea';
+import { cn } from '@/lib/utils';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+import { formatLocalDateTime } from '@/lib/datetime';
+import { useWebviewMeasuredContainer } from '@/hooks/use-webview-measured-container';
+import { agentIconClass, agentIconSrc } from '@/lib/agent-icons';
+import { configuredSkillAgents, selectableSyncAgents, skillAvailableAgentTypes, skillSourceAgents, type ConfiguredSkillAgentMeta } from '@/lib/skill-agent-display';
+import {
+  buildSkillSaveRequest,
+  createEmptySkillForm,
+  createSkillFormFromContent,
+  filterSkillSyncTargets,
+  resolveSkillRelativeHref,
+  resolveSkillPathFrom,
+  type SkillFormState,
+  type SkillSheetMode,
+} from '@/lib/skill-sheet-form';
+import { skillStorageHint } from '@/lib/skill-storage-hint';
+import { readRememberedSkillProjectWorkspace, rememberSkillProjectWorkspace } from '@/lib/skill-workspace-memory';
+import { initialProfileImportState, profileImportReducer } from '@/lib/profile-import-state';
+
+type ProfileSheetMode = 'view' | 'create' | 'edit';
+type ContextTab = 'profiles' | 'mcp' | 'skills';
+type ProfileListTab = 'built-in' | 'custom';
+const pageSizes = [6, 12, 24];
+
+interface ContextManagementPageProps {
+  initialTab?: 'profiles' | 'mcp' | 'skills';
+  agentRegistry: AgentRegistryVm | null;
+  onAgentRegistryChange: (registry: AgentRegistryVm) => void;
+}
+
+function EntityRefreshButton({ label, loading, onRefresh }: { label: string; loading: boolean; onRefresh: () => void }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button variant="outline" size="icon" className="size-8" disabled={loading} onClick={onRefresh} aria-label={label}>
+          <RefreshCw className={cn('size-4', loading && 'animate-spin')} />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+export function ContextManagementPage({ agentRegistry, onAgentRegistryChange, initialTab = 'profiles' }: ContextManagementPageProps) {
+  const readOnly = useReadOnlyExperience();
+  const measuredProfileListRef = useWebviewMeasuredContainer<HTMLDivElement>('profile-list');
+  const { t } = useTranslation();
+  const [vm, setVm] = useState<ProfileListVm | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<ContextTab>(initialTab);
+  const [profileListTab, setProfileListTab] = useState<ProfileListTab>(readOnly ? 'built-in' : 'custom');
+  const [builtInQuery, setBuiltInQuery] = useState('');
+  const [customQuery, setCustomQuery] = useState('');
+  const [pageIndex, setPageIndex] = useState(0);
+  const [pageSize, setPageSize] = useState(6);
+  const [sheetMode, setSheetMode] = useState<ProfileSheetMode | null>(null);
+  const [selectedProfile, setSelectedProfile] = useState<ProfileVm | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<ProfileVm | null>(null);
+  const [deleteError, setDeleteError] = useState<unknown>(null);
+  const [deleteConfirmationError, setDeleteConfirmationError] = useState<AppErrorVm | null>(null);
+  const [deleting, setDeleting] = useState(false);
+
+  // ── Profile import state ──
+  const [profileImport, dispatchProfileImport] = useReducer(
+    profileImportReducer,
+    initialProfileImportState,
+  );
+
+  // ── MCP state ──
+  const [mcpServers, setMcpServers] = useState<McpServerVm[]>([]);
+  const [mcpLoading, setMcpLoading] = useState(false);
+  const [mcpError, setMcpError] = useState<string | null>(null);
+  const mcpErrorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // 自动清除 mcpError：6 秒后自动消失
+  useEffect(() => {
+    if (mcpError) {
+      if (mcpErrorTimerRef.current) clearTimeout(mcpErrorTimerRef.current);
+      mcpErrorTimerRef.current = setTimeout(() => setMcpError(null), 6000);
+    }
+    return () => {
+      if (mcpErrorTimerRef.current) clearTimeout(mcpErrorTimerRef.current);
+    };
+  }, [mcpError]);
+  const [mcpQuery, setMcpQuery] = useState('');
+  const [mcpListTab, setMcpListTab] = useState<'custom' | 'built-in'>('custom');
+  const [mcpSheetOpen, setMcpSheetOpen] = useState(false);
+  const [mcpEditTarget, setMcpEditTarget] = useState<McpServerVm | null>(null);
+  const [mcpJsonContent, setMcpJsonContent] = useState('');
+  const [mcpTransportTab, setMcpTransportTab] = useState<'stdio' | 'http' | 'sse'>('stdio');
+  const [mcpSaving, setMcpSaving] = useState(false);
+  const [mcpDeleteTarget, setMcpDeleteTarget] = useState<McpServerVm | null>(null);
+  const [mcpCheckTarget, setMcpCheckTarget] = useState<string | null>(null);
+  const [mcpHealth, setMcpHealth] = useState<Record<string, { status: string; message?: string | null }>>({});
+  const [toolsSheetServer, setToolsSheetServer] = useState<McpServerVm | null>(null);
+  const [toolsList, setToolsList] = useState<ToolInfo[] | null>(null);
+  const [toolsLoading, setToolsLoading] = useState(false);
+  const [toolsError, setToolsError] = useState<string | null>(null);
+  const [toolsFetchingId, setToolsFetchingId] = useState<string | null>(null);
+
+  const builtInMcpServers = useMemo(() => mcpServers.filter((s) => s.managed), [mcpServers]);
+  const customMcpServers = useMemo(() => mcpServers.filter((s) => !s.managed), [mcpServers]);
+  const currentSectionMcpServers = mcpListTab === 'built-in' ? builtInMcpServers : customMcpServers;
+
+  const filteredMcpServers = useMemo(() => {
+    const q = mcpQuery.trim().toLowerCase();
+    const source = mcpListTab === 'built-in' ? builtInMcpServers : customMcpServers;
+    if (!q) return source;
+    return source.filter((s) => s.name.toLowerCase().includes(q) || (s.command ?? s.url ?? '').toLowerCase().includes(q));
+  }, [builtInMcpServers, customMcpServers, mcpListTab, mcpQuery]);
+
+  // ── SKILL state ──
+  const [skillList, setSkillList] = useState<SkillListVm | null>(null);
+  const [projectSkills, setProjectSkills] = useState<SkillMetaVm[]>([]);
+  const [skillLoading, setSkillLoading] = useState(false);
+  const [skillError, setSkillError] = useState<string | null>(null);
+  const skillErrorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [skillSheetMode, setSkillSheetMode] = useState<SkillSheetMode | null>(null);
+  const [skillEditTarget, setSkillEditTarget] = useState<SkillMetaVm | null>(null);
+  const [skillSheetContent, setSkillSheetContent] = useState<SkillContentVm | null>(null);
+  const [skillDeleteTarget, setSkillDeleteTarget] = useState<SkillMetaVm | null>(null);
+  const [skillDeleting, setSkillDeleting] = useState(false);
+  const [skillSyncPendingKey, setSkillSyncPendingKey] = useState<string | null>(null);
+  const [skillEditWsPath, setSkillEditWsPath] = useState<string | null>(null);
+  const [mcpDiagnosingAgent, setMcpDiagnosingAgent] = useState<string | null>(null);
+
+  const [skillTab, setSkillTab] = useState<'global' | 'project'>('global');
+  const [skillQuery, setSkillQuery] = useState('');
+  const [skillAgentFilter, setSkillAgentFilter] = useState<string>('all');
+  const [selectedWorkspace, setSelectedWorkspace] = useState<string>('');
+  const [workspaces, setWorkspaces] = useState<Array<{ projectId: string; workspacePath: string; name: string }>>([]);
+  const needsSkillContext = activeTab === 'skills' || skillSheetMode === 'create';
+
+  useEffect(() => {
+    if (skillError) {
+      if (skillErrorTimerRef.current) clearTimeout(skillErrorTimerRef.current);
+      skillErrorTimerRef.current = setTimeout(() => setSkillError(null), 6000);
+    }
+    return () => {
+      if (skillErrorTimerRef.current) clearTimeout(skillErrorTimerRef.current);
+    };
+  }, [skillError]);
+
+  const configuredAgents = useMemo(
+    () => configuredSkillAgents(agentRegistry),
+    [agentRegistry],
+  );
+
+  useEffect(() => {
+    if (skillAgentFilter === 'all') {
+      return;
+    }
+    if (!configuredAgents.some((agent) => agent.agentType === skillAgentFilter)) {
+      setSkillAgentFilter('all');
+    }
+  }, [configuredAgents, skillAgentFilter]);
+
+  const filteredSkills = useMemo(() => {
+    if (skillTab === 'project' && !selectedWorkspace) return [];
+    const q = skillQuery.trim().toLowerCase();
+    let items = skillTab === 'global' ? (skillList?.global ?? []) : projectSkills;
+    if (q) {
+      items = items.filter((s) => s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q));
+    }
+    if (skillAgentFilter !== 'all') {
+      items = items.filter((skill) => skillAvailableAgentTypes(skill, configuredAgents).includes(skillAgentFilter));
+    }
+    return items;
+  }, [configuredAgents, projectSkills, skillAgentFilter, skillList, skillQuery, skillTab, selectedWorkspace]);
+
+  // 选择 workspace 时加载该项目 SKILL
+  const loadProjectSkills = async (wsPath: string) => {
+    if (!wsPath) { setProjectSkills([]); return; }
+    setSkillLoading(true);
+    try { setProjectSkills(await listProjectSkills(wsPath)); } catch { setProjectSkills([]); }
+    finally { setSkillLoading(false); }
+  };
+
+  useEffect(() => {
+    setSelectedWorkspace((current) => {
+      if (current && workspaces.some((workspace) => workspace.workspacePath === current)) {
+        return current;
+      }
+      return readRememberedSkillProjectWorkspace(workspaces);
+    });
+  }, [workspaces]);
+
+  useEffect(() => {
+    if (skillTab !== 'project') {
+      return;
+    }
+    if (!selectedWorkspace) {
+      setProjectSkills([]);
+      return;
+    }
+    void loadProjectSkills(selectedWorkspace);
+  }, [selectedWorkspace, skillTab]);
+
+  const handleSkillSyncToggle = async (skill: SkillMetaVm, agentType: string) => {
+    const pendingKey = `${skill.source}:${skill.directoryPath}:${agentType}`;
+    if (skillSyncPendingKey) {
+      return;
+    }
+    const wsPath = skill.source === 'project' ? selectedWorkspace || null : null;
+    const nextTargets = new Set(skill.syncedAgentTypes);
+    if (nextTargets.has(agentType)) {
+      nextTargets.delete(agentType);
+    } else {
+      nextTargets.add(agentType);
+    }
+    setSkillSyncPendingKey(pendingKey);
+    try {
+      const next = await updateSkillSyncTargets(
+        skill.name,
+        skill.source,
+        wsPath,
+        skill.directoryPath,
+        [...nextTargets],
+      );
+      setSkillList(next);
+      if (skillTab === 'project' && selectedWorkspace) {
+        await loadProjectSkills(selectedWorkspace);
+      }
+    } catch (err) {
+      setSkillError(displayAppError(t, err));
+    } finally {
+      setSkillSyncPendingKey(null);
+    }
+  };
+
+  useEffect(() => {
+    if (!needsSkillContext) return;
+    getConversationWorkspaces().then(setWorkspaces).catch(() => setWorkspaces([]));
+  }, [needsSkillContext]);
+
+  const refresh = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      setVm(await getProfiles());
+    } catch (err) {
+      setError(displayAppError(t, err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const refreshMcp = async () => {
+    setMcpLoading(true);
+    setMcpError(null);
+    try {
+      const servers = await listMcpServers();
+      setMcpServers(servers);
+      // 健康状态由后端在启动时后台预探测并写入共享缓存，list 返回时已携带；
+      // 这里直接从 VM 回填，无需进入页面后再逐个触发网络检测。
+      const seed: Record<string, { status: string; message?: string | null }> = {};
+      for (const s of servers) {
+        if (s.healthStatus) seed[s.id] = { status: s.healthStatus, message: s.healthMessage };
+      }
+      setMcpHealth(seed);
+    } catch (err) { setMcpError(displayAppError(t, err)); }
+    finally { setMcpLoading(false); }
+  };
+  const refreshSkills = async () => {
+    setSkillLoading(true);
+    setSkillError(null);
+    try {
+      setSkillList(await listSkills());
+      if (skillTab === 'project' && selectedWorkspace) {
+        void loadProjectSkills(selectedWorkspace);
+      }
+    } catch (err) { setSkillError(displayAppError(t, err)); }
+    finally { setSkillLoading(false); }
+  };
+
+  useEffect(() => { void refresh(); }, [readOnly ? t : null]);
+  useEffect(() => {
+    if (readOnly && skillList) void refreshSkills();
+  }, [readOnly ? t : null]);
+  useEffect(() => { if (activeTab === 'mcp' && mcpServers.length === 0) void refreshMcp(); }, [activeTab]);
+  useEffect(() => {
+    if (activeTab !== 'skills') return;
+    if (!skillList) { void refreshSkills(); return; }
+    if (skillTab === 'project' && selectedWorkspace) { void loadProjectSkills(selectedWorkspace); }
+  }, [activeTab]);
+
+  const handleMcpSave = async () => {
+    setMcpSaving(true); setMcpError(null);
+    try {
+      // 对标 Zed: 先保存 settings.json
+      const result = mcpEditTarget
+        ? await updateMcpServer(mcpEditTarget.id, mcpJsonContent)
+        : await addMcpServer(mcpJsonContent);
+      setMcpServers(result);
+      const savedId = mcpEditTarget?.id ?? result.find((s) => !mcpServers.some((e) => e.id === s.id))?.id;
+      // 对标 Zed: 保存后立即验证，Modal 保持打开显示 "Connecting Server…"
+      if (!savedId) { setMcpSaving(false); setMcpSheetOpen(false); setMcpEditTarget(null); return; }
+      setMcpSaving(false);
+      setMcpCheckTarget(savedId);
+      try {
+        const h = await checkMcpServerHealth(savedId);
+        setMcpHealth((prev) => ({ ...prev, [savedId]: h }));
+        if (h.status === 'healthy') {
+          // 对标 Zed: Running → dismiss modal
+          setMcpSheetOpen(false); setMcpEditTarget(null);
+        } else {
+          // 对标 Zed: Error → 显示错误但保留 Sheet（可编辑重试）
+          setMcpError(h.message ?? 'Server health check failed');
+        }
+      } catch (err: unknown) {
+        setMcpError(displayAppError(t, err));
+        if (savedId) {
+          setMcpHealth((prev) => ({ ...prev, [savedId]: { status: 'unhealthy', message: displayAppError(t, err) } }));
+        }
+      } finally {
+        setMcpCheckTarget(null);
+      }
+    } catch (err: unknown) {
+      setMcpSaving(false);
+      setMcpError(displayAppError(t, err));
+    }
+  };
+
+  const dismissMcpSheet = () => {
+    setMcpSheetOpen(false);
+    setMcpEditTarget(null);
+    setMcpError(null);
+    setMcpCheckTarget(null);
+  };
+
+  const profiles = vm?.profiles ?? [];
+  const builtInProfiles = useMemo(() => {
+    const normalizedQuery = builtInQuery.trim().toLowerCase();
+    return profiles.filter((profile) => {
+      if (!profile.isBuiltIn) return false;
+      if (!normalizedQuery) return true;
+      return profileSearchText(profile).includes(normalizedQuery);
+    });
+  }, [profiles, builtInQuery]);
+  const customProfiles = useMemo(() => {
+    const normalizedQuery = customQuery.trim().toLowerCase();
+    return profiles.filter((profile) => {
+      if (profile.isBuiltIn) return false;
+      if (!normalizedQuery) return true;
+      return profileSearchText(profile).includes(normalizedQuery);
+    });
+  }, [profiles, customQuery]);
+  const pageCount = Math.max(1, Math.ceil(customProfiles.length / pageSize));
+  const safePageIndex = Math.min(pageIndex, pageCount - 1);
+  const pagedCustomProfiles = customProfiles.slice(safePageIndex * pageSize, safePageIndex * pageSize + pageSize);
+
+  useEffect(() => {
+    if (safePageIndex !== pageIndex) setPageIndex(safePageIndex);
+  }, [pageIndex, safePageIndex]);
+
+  const openSheet = (mode: ProfileSheetMode, profile?: ProfileVm) => {
+    setSheetMode(mode);
+    setSelectedProfile(profile ?? null);
+  };
+
+  useEffect(() => {
+    if (!readOnly || !sheetMode || !selectedProfile?.isBuiltIn) return;
+    let active = true;
+    void getProfile(selectedProfile.id).then((detail) => {
+      if (active) setSelectedProfile(detail);
+    }).catch((error) => { if (active) setError(displayAppError(t, error)); });
+    return () => { active = false; };
+  }, [readOnly, sheetMode, selectedProfile?.id, t]);
+
+  const openDeleteDialog = (profile: ProfileVm) => {
+    setDeleteTarget(profile);
+    setDeleteError(null);
+    setDeleteConfirmationError(null);
+  };
+
+  const closeProfileSheet = () => {
+    setSheetMode(null);
+    setSelectedProfile(null);
+    if (profileImport.surface === 'editing') {
+      dispatchProfileImport({ type: 'resume-result' });
+    }
+  };
+
+  const saveProfile = async (input: ProfileInput) => {
+    if (sheetMode === 'edit' && selectedProfile && !selectedProfile.isBuiltIn) {
+      const savedProfile = await updateProfile(selectedProfile.id, input);
+      if (profileImport.surface === 'editing') {
+        dispatchProfileImport({
+          type: 'profile-updated',
+          importedId: savedProfile.id,
+          name: savedProfile.name,
+        });
+      }
+    } else {
+      await createProfile(input);
+    }
+    closeProfileSheet();
+    await refresh();
+  };
+
+  const saveProfileAsNew = async (input: ProfileInput) => {
+    await createProfile(input);
+    closeProfileSheet();
+    await refresh();
+  };
+
+  const confirmDeleteProfile = async () => {
+    if (!deleteTarget || deleteTarget.isBuiltIn) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await deleteProfile(deleteTarget.id, Boolean(deleteConfirmationError));
+      setDeleteTarget(null);
+      setDeleteConfirmationError(null);
+      await refresh();
+    } catch (err) {
+      if (isDeleteConfirmationRequiredError(err)) {
+        setDeleteConfirmationError(err);
+        return;
+      }
+      setDeleteError(err);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  const handlePickImportFolder = async () => {
+    dispatchProfileImport({ type: 'begin-import' });
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const selected = await open({ directory: true, title: t('contextManagement.importPickFolderTitle') });
+      if (!selected) {
+        dispatchProfileImport({ type: 'cancel-import' });
+        return;
+      }
+      const folderPath = typeof selected === 'string' ? selected : selected[0];
+      const result = await importProfilesFromFolder(folderPath, profileImport.dynamicTemplate);
+      dispatchProfileImport({ type: 'import-succeeded', result });
+      await refresh();
+    } catch (err) {
+      dispatchProfileImport({ type: 'import-failed', error: displayAppError(t, err) });
+    }
+  };
+
+  const editImportedProfile = async (id: string) => {
+    dispatchProfileImport({ type: 'begin-edit' });
+    try {
+      const profile = await getProfile(id);
+      dispatchProfileImport({ type: 'edit-succeeded' });
+      openSheet('edit', profile);
+    } catch (err) {
+      dispatchProfileImport({ type: 'edit-failed', error: displayAppError(t, err) });
+    }
+  };
+
+  const listQuery = profileListTab === 'built-in' ? builtInQuery : customQuery;
+  const onQueryChange = (value: string) => {
+    if (profileListTab === 'built-in') {
+      setBuiltInQuery(value);
+      return;
+    }
+    setCustomQuery(value);
+    setPageIndex(0);
+  };
+
+  return (
+    <Page flush className="flex flex-col">
+      <PageHeader
+        variant="integrated"
+        icon={<Library />}
+        title={<span className="text-title">{t('contextManagement.title')}</span>}
+        navigationLabel={t('contextManagement.title')}
+        navigation={(
+          <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as ContextTab)}>
+            <TabsList variant="line" className="rounded-none">
+              <TabsTrigger value="profiles">{t('contextManagement.profileManagement')}</TabsTrigger>
+              <TabsTrigger value="mcp">{t('contextManagement.tabs.mcp', 'MCP 管理')}</TabsTrigger>
+              <TabsTrigger value="skills">{t('contextManagement.tabs.skills', 'SKILL 管理')}</TabsTrigger>
+            </TabsList>
+          </Tabs>
+        )}
+      />
+      {/* ── Profiles Tab ── */}
+      {activeTab === 'profiles' && (
+      <PageContent variant="after-navigation">
+        <EntitySection
+          tab={profileListTab}
+          onTabChange={(value) => setProfileListTab(value)}
+          tabs={[
+            { value: 'custom', label: t('contextManagement.customSectionTitle') },
+            { value: 'built-in', label: t('contextManagement.builtInSectionTitle') },
+          ]}
+          actions={
+            <>
+              <EntityRefreshButton label={t('common.refresh')} loading={loading} onRefresh={() => void refresh()} />
+              {!readOnly && <>
+                <Button variant="outline" disabled={loading || profileImport.importing} onClick={() => dispatchProfileImport({ type: 'open-settings' })}>
+                  <FolderOpen />{t('contextManagement.importProfile')}
+                </Button>
+                <Button onClick={() => openSheet('create')}><Plus />{t('contextManagement.addProfile')}</Button>
+              </>}
+            </>
+          }
+          toolbar={
+            <>
+              <div className="relative min-w-[240px] flex-1">
+                <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  className="pl-9"
+                  value={listQuery}
+                  onChange={(event) => onQueryChange(event.target.value)}
+                  placeholder={t('contextManagement.searchPlaceholder')}
+                />
+              </div>
+            </>
+          }
+          error={error}
+          footer={
+            profileListTab === 'custom' && customProfiles.length > 0 ? (
+              <div className="flex flex-wrap items-center justify-between gap-3 border-t px-4 py-3 text-sm text-muted-foreground">
+                <span>{t('contextManagement.customProfilesPageRange', {
+                  start: customProfiles.length ? safePageIndex * pageSize + 1 : 0,
+                  end: Math.min(customProfiles.length, (safePageIndex + 1) * pageSize),
+                  total: customProfiles.length,
+                })}</span>
+                <div className="flex items-center gap-2">
+                  <span>{t('common.pageSize')}</span>
+                  <PageSizePicker value={pageSize} onChange={(value) => { setPageSize(value); setPageIndex(0); }} />
+                  <ProfilePagination pageIndex={safePageIndex} pageCount={pageCount} onPageChange={setPageIndex} />
+                </div>
+              </div>
+            ) : null
+          }
+        >
+          {loading && !vm ? <EmptyState>{t('common.loading')}</EmptyState> : null}
+          {vm && profileListTab === 'built-in' ? (
+            <div ref={measuredProfileListRef} className="@container/profile-list">
+              <div className="grid gap-3 p-4 @2xl/profile-list:grid-cols-2 @6xl/profile-list:grid-cols-3">
+                {builtInProfiles.map((profile) => (
+                  <BuiltInProfileCard
+                    key={`${profile.scope}:${profile.id}`}
+                    profile={profile}
+                    onView={() => openSheet('view', profile)}
+                    onEdit={() => openSheet('edit', profile)}
+                  />
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {vm && profileListTab === 'custom' ? (
+            <div ref={measuredProfileListRef} className="@container/profile-list">
+              <div className="grid gap-3 p-4 @2xl/profile-list:grid-cols-2 @6xl/profile-list:grid-cols-3">
+                {pagedCustomProfiles.map((profile) => (
+                  <CustomProfileCard
+                    key={`${profile.scope}:${profile.id}`}
+                    profile={profile}
+                    onView={() => openSheet('view', profile)}
+                    onEdit={() => openSheet('edit', profile)}
+                    onDelete={() => openDeleteDialog(profile)}
+                  />
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {vm && profileListTab === 'built-in' && builtInProfiles.length === 0 ? <div className="p-5"><EmptyState>{t('contextManagement.emptyProfiles')}</EmptyState></div> : null}
+          {vm && profileListTab === 'custom' && customProfiles.length === 0 ? <div className="p-5"><EmptyState>{t('contextManagement.emptyProfiles')}</EmptyState></div> : null}
+        </EntitySection>
+      </PageContent>
+      )}
+      <ProfileSheet
+        mode={sheetMode}
+        profile={selectedProfile}
+        returnToImportResult={profileImport.surface === 'editing'}
+        onOpenChange={(open) => {
+          if (!open) {
+            closeProfileSheet();
+          }
+        }}
+        onSave={saveProfile}
+        onSaveAsNew={saveProfileAsNew}
+      />
+      <AlertDialog
+        open={Boolean(deleteTarget)}
+        onOpenChange={(open) => {
+          if (!open) {
+            setDeleteTarget(null);
+            setDeleteError(null);
+            setDeleteConfirmationError(null);
+          }
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('contextManagement.deleteProfileTitle')}</AlertDialogTitle>
+            {!deleteConfirmationError ? (
+              <AlertDialogDescription>
+                {t('contextManagement.deleteProfileDescription', { name: deleteTarget?.name ?? '' })}
+              </AlertDialogDescription>
+            ) : null}
+          </AlertDialogHeader>
+          {deleteConfirmationError ? (
+            <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              {deleteConfirmationMessage(t, deleteConfirmationError)}
+            </div>
+          ) : null}
+          {deleteError ? (
+            <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              {deleteDialogError(t, deleteError)}
+            </div>
+          ) : null}
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>{t('common.close')}</AlertDialogCancel>
+            <AlertDialogAction disabled={deleting || deleteTarget?.isBuiltIn} onClick={(event) => { event.preventDefault(); void confirmDeleteProfile(); }}>
+              {deleteConfirmationError ? t('contextManagement.confirmDeleteProfileAction') : t('contextManagement.deleteProfileAction')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* ── Profile Import Sheet Workflow ── */}
+      <Sheet
+        modal={false}
+        open={profileImport.surface === 'settings' || profileImport.surface === 'result'}
+        onOpenChange={(open) => {
+          if (open || profileImport.importing) return;
+          dispatchProfileImport({ type: profileImport.surface === 'result' ? 'close-result' : 'close-settings' });
+        }}
+      >
+        <SheetContent
+          data-slot={profileImport.surface === 'result' ? 'profile-import-result-sheet' : 'profile-import-settings-sheet'}
+          className="gap-0 overflow-hidden p-0"
+          resizeStorageKey="context-management/profile-import"
+          defaultSize={640}
+          minSize={420}
+          maxSize={880}
+          closeLabel={t('common.close')}
+        >
+          {profileImport.surface === 'result' && profileImport.result ? (
+            <ImportResultContent
+              result={profileImport.result}
+              error={profileImport.error}
+              onClose={() => dispatchProfileImport({ type: 'close-result' })}
+              onEdit={(id) => void editImportedProfile(id)}
+            />
+          ) : (
+            <>
+              <SheetHeader className="border-b px-5 py-4 text-left">
+                <SheetTitle>{t('contextManagement.importProfile')}</SheetTitle>
+                <SheetDescription>{t('contextManagement.importSettingsDescription')}</SheetDescription>
+              </SheetHeader>
+              <ScrollArea className="min-h-0 flex-1">
+                <div className="space-y-4 p-5">
+                  <div className="flex items-start justify-between gap-4 rounded-lg border px-3 py-3">
+                    <div className="space-y-1">
+                      <div className="text-sm font-medium">{t('contextManagement.dynamicTemplate')}</div>
+                      <p className="text-xs text-muted-foreground">{t('contextManagement.importDynamicTemplateDescription')}</p>
+                    </div>
+                    <Switch
+                      checked={profileImport.dynamicTemplate}
+                      onCheckedChange={(enabled) => dispatchProfileImport({ type: 'set-dynamic-template', enabled })}
+                    />
+                  </div>
+                  {profileImport.error ? (
+                    <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">{profileImport.error}</div>
+                  ) : null}
+                </div>
+              </ScrollArea>
+              <SheetFooter className="border-t px-5 py-4 sm:flex-row sm:justify-end">
+                <Button variant="outline" disabled={profileImport.importing} onClick={() => dispatchProfileImport({ type: 'close-settings' })}>{t('common.close')}</Button>
+                <Button disabled={profileImport.importing} onClick={() => void handlePickImportFolder()}>
+                  {profileImport.importing ? <Loader2 className="animate-spin" /> : <FolderOpen />}
+                  {profileImport.importing ? t('common.loading') : t('contextManagement.importPickFolder')}
+                </Button>
+              </SheetFooter>
+            </>
+          )}
+        </SheetContent>
+      </Sheet>
+
+      {/* ── MCP Tab Content ── */}
+      {activeTab === 'mcp' && (
+        <PageContent variant="after-navigation">
+          <EntitySection
+            tab={mcpListTab}
+            onTabChange={setMcpListTab}
+            tabs={[
+              { value: 'custom', label: t('contextManagement.mcp.customSectionTitle', '自定义 MCP') },
+              { value: 'built-in', label: t('contextManagement.mcp.builtInSectionTitle', '内置 MCP') },
+            ]}
+            actions={
+              <>
+                <span className="flex items-center gap-1.5 text-ui-caption text-muted-foreground">
+                  <span className="flex items-center gap-0.5"><span className="size-1.5 rounded-full bg-green-500" />{mcpServers.filter((s) => mcpHealth[s.id]?.status === 'healthy').length}</span>
+                  <span className="flex items-center gap-0.5"><span className="size-1.5 rounded-full bg-yellow-500" />{mcpServers.filter((s) => mcpHealth[s.id]?.status === 'auth_required').length}</span>
+                  <span className="flex items-center gap-0.5"><span className="size-1.5 rounded-full bg-red-500" />{mcpServers.filter((s) => mcpHealth[s.id]?.status === 'unhealthy').length}</span>
+                </span>
+                <EntityRefreshButton label={t('common.refresh')} loading={mcpLoading} onRefresh={() => void refreshMcp()} />
+                <Button size="sm" disabled={readOnly} onClick={() => { setMcpEditTarget(null); setMcpJsonContent(MCP_STDIO_TEMPLATE); setMcpTransportTab('stdio'); setMcpSheetOpen(true); }}><Plus className="size-4" />{t('contextManagement.mcp.addServer', '添加')}</Button>
+              </>
+            }
+            toolbar={
+              <div className="relative min-w-[240px] flex-1">
+                <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                <Input className="pl-9" placeholder={t('contextManagement.searchPlaceholder', '搜索…')} value={mcpQuery} onChange={(e) => setMcpQuery(e.target.value)} />
+              </div>
+            }
+            error={mcpError ? (
+              <div className="flex items-start gap-2">
+                <span className="flex-1">{mcpError}</span>
+                <button type="button" onClick={() => setMcpError(null)} className="shrink-0 rounded-sm opacity-70 transition-opacity hover:opacity-100" aria-label="Dismiss">✕</button>
+              </div>
+            ) : null}
+          >
+            {mcpLoading && mcpServers.length === 0 ? <div className="p-5"><EmptyState>{t('common.loading')}</EmptyState></div> : null}
+            <div className={readOnly ? 'grid grid-cols-[repeat(auto-fit,minmax(min(100%,20rem),1fr))] gap-3 p-4' : 'grid gap-3 p-4 md:grid-cols-2 xl:grid-cols-3'}>
+              {filteredMcpServers.map((s) => (
+                <McpServerCard
+                  key={s.id}
+                  server={s}
+                  health={mcpHealth[s.id]}
+                  isChecking={mcpCheckTarget === s.id}
+                  isToolsFetching={toolsFetchingId === s.id}
+                  onToggle={async (newEnabled) => {
+                    try { setMcpServers(await toggleMcpServer(s.id, newEnabled)); } catch (err) { setMcpError(displayAppError(t, err)); return; }
+                    if (newEnabled) {
+                      setMcpCheckTarget(s.id);
+                      try {
+                        const hh = await checkMcpServerHealth(s.id);
+                        setMcpHealth((prev) => ({ ...prev, [s.id]: hh }));
+                      } catch (err: unknown) {
+                        setMcpHealth((prev) => ({ ...prev, [s.id]: { status: 'unhealthy', message: displayAppError(t, err) } }));
+                      } finally { setMcpCheckTarget(null); }
+                    } else {
+                      setMcpHealth((prev) => { const n = { ...prev }; delete n[s.id]; return n; });
+                    }
+                  }}
+                  onHealthCheck={async () => {
+                    setMcpCheckTarget(s.id);
+                    try {
+                      const result = await checkMcpServerHealth(s.id);
+                      setMcpHealth((prev) => ({ ...prev, [s.id]: result }));
+                    } catch (err: unknown) {
+                      setMcpHealth((prev) => ({ ...prev, [s.id]: { status: 'unhealthy', message: displayAppError(t, err) } }));
+                    } finally { setMcpCheckTarget(null); }
+                  }}
+                  onShowTools={async () => {
+                    if (toolsFetchingId) return;
+                    setToolsFetchingId(s.id);
+                    setToolsSheetServer(s);
+                    setToolsList(null);
+                    setToolsError(null);
+                    setToolsLoading(true);
+                    try {
+                      const tools = await listMcpTools(s.id);
+                      setToolsList(tools);
+                      setToolsError(null);
+                    } catch (err: unknown) {
+                      setToolsError(displayAppError(t, err));
+                      setToolsList(null);
+                    } finally {
+                      setToolsLoading(false);
+                      setToolsFetchingId(null);
+                    }
+                  }}
+                  onEdit={s.managed ? undefined : () => { setMcpEditTarget(s); setMcpJsonContent(mcpServerToJson(s)); setMcpTransportTab(s.transport as 'stdio' | 'http' | 'sse'); setMcpSheetOpen(true); }}
+                  onDelete={s.managed ? undefined : () => setMcpDeleteTarget(s)}
+                  agentCompatLoading={!agentRegistry}
+                  agentCompatibility={(agentRegistry?.agents ?? []).filter((a) => !readOnly || a.mcpHttpSupported != null || a.mcpSseSupported != null).map((a) => ({
+                    agentType: a.agentType,
+                    label: a.displayName,
+                    iconKey: a.iconKey,
+                    mcpHttpSupported: a.mcpHttpSupported,
+                    mcpSseSupported: a.mcpSseSupported,
+                    diagnosticAvailable: a.diagnostic?.available,
+                    diagnosticReason: a.diagnostic?.reason,
+                  }))}
+                  diagnosingAgentType={mcpDiagnosingAgent}
+                  onDiagnoseAgent={async (agentType) => {
+                    if (mcpDiagnosingAgent) return;
+                    setMcpDiagnosingAgent(agentType);
+                    try {
+                      const registry = await doctorAgent(agentType);
+                      onAgentRegistryChange(registry);
+                    } catch {
+                      // 忽略诊断错误；用户可重试
+                    } finally {
+                      setMcpDiagnosingAgent(null);
+                    }
+                  }}
+                />
+              ))}
+            </div>
+            {!mcpLoading && currentSectionMcpServers.length === 0 ? <div className="p-5"><EmptyState>{t('contextManagement.mcp.emptyServers', '暂无 MCP 服务器')}</EmptyState></div> : null}
+            {!mcpLoading && currentSectionMcpServers.length > 0 && filteredMcpServers.length === 0 ? <div className="p-5"><EmptyState>{t('common.noResults', '无匹配结果')}</EmptyState></div> : null}
+          </EntitySection>
+        </PageContent>
+      )}
+
+      {/* ── SKILL Tab Content ── */}
+      {activeTab === 'skills' && (
+        <PageContent variant="after-navigation">
+          <EntitySection
+            tab={skillTab}
+            onTabChange={(nextTab) => { setSkillTab(nextTab); setSkillQuery(''); setSkillAgentFilter('all'); if (nextTab === 'global') setProjectSkills([]); }}
+            tabs={[
+              { value: 'global', label: t('contextManagement.skills.globalTab', '全局') },
+              { value: 'project', label: t('contextManagement.skills.projectTab', '项目') },
+            ]}
+            tabAccessory={skillTab === 'project' && workspaces.length > 0 ? (
+                <Select value={selectedWorkspace} onValueChange={(v) => { setSelectedWorkspace(v); rememberSkillProjectWorkspace(v); setSkillQuery(''); }}>
+                  <SelectTrigger className="h-8 w-44 text-xs">
+                    <SelectValue placeholder={t('contextManagement.skills.selectProject', '选择项目...')} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {workspaces.map((w) => (
+                      <SelectItem key={w.projectId} value={w.workspacePath}>{w.name}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+            ) : null}
+            actions={(
+              <>
+                <EntityRefreshButton label={t('common.refresh')} loading={skillLoading} onRefresh={() => void refreshSkills()} />
+                {!readOnly && <Button size="sm" onClick={() => { setSkillEditTarget(null); setSkillSheetContent(null); setSkillEditWsPath(null); setSkillSheetMode('create'); }}><Plus className="size-4" />{t('contextManagement.skills.createSkill', '创建')}</Button>}
+              </>
+            )}
+            toolbar={(skillTab === 'global' || selectedWorkspace) ? (
+              <>
+                <div className="relative min-w-[160px]">
+                  <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                  <Input className="h-8 pl-8 text-xs" placeholder={t('contextManagement.skills.searchPlaceholder', '搜索 SKILL...')} value={skillQuery} onChange={(e) => setSkillQuery(e.target.value)} />
+                </div>
+                {configuredAgents.length > 0 ? (
+                <Select value={skillAgentFilter} onValueChange={setSkillAgentFilter}>
+                  <SelectTrigger className="h-8 w-40 text-xs">
+                    <SelectValue placeholder={t('contextManagement.skills.agentFilterPlaceholder', '按 Agent 筛选')} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">{t('contextManagement.skills.allAgents', '全部 Agent')}</SelectItem>
+                    {configuredAgents.map((agent) => (
+                      <SelectItem key={agent.agentType} value={agent.agentType}>{agent.label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                ) : null}
+              </>
+            ) : undefined}
+            error={skillError}
+          >
+            {skillLoading && !skillList ? <div className="p-5"><EmptyState>{t('common.loading')}</EmptyState></div> : null}
+            {skillTab === 'project' && !selectedWorkspace ? <div className="p-5"><EmptyState>{t('contextManagement.skills.selectProjectEmpty', '选择项目以查看项目级 SKILL')}</EmptyState></div> : null}
+            {skillTab === 'global' && skillList && skillList.global.length === 0 ? <div className="p-5"><EmptyState>{t('contextManagement.skills.emptySkills', '暂无 SKILL')}</EmptyState></div> : null}
+            {skillTab === 'project' && selectedWorkspace && !skillLoading && projectSkills.length === 0 ? <div className="p-5"><EmptyState>{t('contextManagement.skills.emptySkills', '暂无 SKILL')}</EmptyState></div> : null}
+            {skillList && filteredSkills && filteredSkills.length === 0 && (skillQuery || skillAgentFilter !== 'all') ? <div className="p-5"><EmptyState>{t('common.noResults', '无匹配结果')}</EmptyState></div> : null}
+            <div className={readOnly ? 'grid grid-cols-[repeat(auto-fit,minmax(min(100%,20rem),1fr))] gap-3 p-4' : 'grid gap-3 p-4 md:grid-cols-2 xl:grid-cols-3'}>
+              {filteredSkills && filteredSkills.map((skill) => {
+                const sourceAgents = skillSourceAgents(skill, configuredAgents);
+                const syncAgents = selectableSyncAgents(skill, configuredAgents);
+                const syncedAgentTypes = new Set(skill.syncedAgentTypes);
+                return (
+                  <Card key={`${skill.source}:${skill.directoryPath}`} className="group flex h-44 gap-0 overflow-hidden border-border/50 py-0 transition-shadow hover:shadow-sm">
+                    <div className="h-28 shrink-0 px-4 py-3">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="truncate text-sm font-semibold">{skill.name}</span>
+                            <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-ui-micro font-normal text-muted-foreground">{skill.agentSource || '.sasuke'}</Badge>
+                          </div>
+                          <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-muted-foreground">{skill.description || <span className="italic text-muted-foreground/50">{t('contextManagement.skills.noDescription', '无描述')}</span>}</p>
+                        </div>
+                        <Badge variant="secondary" className="shrink-0 px-1.5 py-0 text-ui-micro font-normal">{skill.source === 'global' ? t('contextManagement.skills.globalBadge', 'Global') : t('contextManagement.skills.projectBadge', 'Project')}</Badge>
+                      </div>
+                    </div>
+                    <div className="mt-auto flex h-16 shrink-0 items-center justify-between gap-2 border-t border-border/30 px-2 py-1">
+                      <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden px-2">
+                        {sourceAgents.length === 0 ? <span className="max-w-20 shrink-0 truncate text-ui-caption text-muted-foreground">{skill.agentSource || '.sasuke'}</span> : null}
+                        <SkillAgentOverflow
+                          sourceAgents={sourceAgents}
+                          syncAgents={syncAgents}
+                          syncedAgentTypes={syncedAgentTypes}
+                          isPending={(agentType) => skillSyncPendingKey === `${skill.source}:${skill.directoryPath}:${agentType}`}
+                          onToggleAgent={(agentType) => { if (!readOnly) void handleSkillSyncToggle(skill, agentType); }}
+                        />
+                      </div>
+                      <div className="flex shrink-0 items-center gap-1">
+                        <TooltipProvider delayDuration={300}>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button size="icon" variant="ghost" className="size-8" onClick={async () => { try { const wsPath = skillTab === 'project' && selectedWorkspace ? selectedWorkspace : null; const c = await readSkill(skill.name, skill.source, wsPath, skill.directoryPath); setSkillEditTarget(skill); setSkillSheetContent(c); setSkillEditWsPath(wsPath); setSkillSheetMode('view'); } catch { /* ignore */ } }}>
+                                <Eye className="size-3.5" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">{t('common.detail')}</TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
+                        <TooltipProvider delayDuration={300}>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button hidden={readOnly} size="icon" variant="ghost" className="size-8" onClick={async () => { try { const wsPath = skillTab === 'project' && selectedWorkspace ? selectedWorkspace : null; const c = await readSkill(skill.name, skill.source, wsPath, skill.directoryPath); setSkillEditTarget(skill); setSkillSheetContent(c); setSkillEditWsPath(wsPath); setSkillSheetMode('edit'); } catch { /* ignore */ } }}>
+                                <Pencil className="size-3.5" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">{t('contextManagement.skills.editSkillAction', '编辑')}</TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
+                        <TooltipProvider delayDuration={300}>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button hidden={readOnly} size="icon" variant="ghost" className="size-8 text-muted-foreground hover:text-destructive" onClick={() => setSkillDeleteTarget(skill)}>
+                                <Trash2 className="size-3.5" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">{t('contextManagement.skills.deleteSkill', '删除 SKILL')}</TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
+                      </div>
+                    </div>
+                  </Card>
+                );
+              })}
+            </div>
+          </EntitySection>
+        </PageContent>
+      )}
+
+      <AlertDialog open={Boolean(skillDeleteTarget)} onOpenChange={(open) => { if (!open && !skillDeleting) setSkillDeleteTarget(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('contextManagement.skills.deleteSkill', '删除 SKILL')}</AlertDialogTitle>
+            <AlertDialogDescription>{t('contextManagement.skills.deleteDescription', '确定要删除这个 SKILL 吗？').replace('{name}', skillDeleteTarget?.name ?? '')}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={skillDeleting}>{t('common.close')}</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={skillDeleting || !skillDeleteTarget}
+              onClick={(event) => {
+                event.preventDefault();
+                if (!skillDeleteTarget) return;
+                const wsPath = skillDeleteTarget.source === 'project' ? selectedWorkspace || null : null;
+                setSkillDeleting(true);
+                deleteSkill(skillDeleteTarget.name, skillDeleteTarget.source, wsPath, skillDeleteTarget.directoryPath)
+                  .then(async (next) => {
+                    setSkillList(next);
+                    if (skillTab === 'project' && selectedWorkspace) {
+                      await loadProjectSkills(selectedWorkspace);
+                    }
+                    setSkillDeleteTarget(null);
+                  })
+                  .catch((err) => {
+                    setSkillError(displayAppError(t, err));
+                  })
+                  .finally(() => setSkillDeleting(false));
+              }}
+            >
+              {t('contextManagement.skills.deleteSkill', '删除 SKILL')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* ── MCP Sheet (JSON Editor) ── */}
+      <Sheet modal={false} open={mcpSheetOpen} onOpenChange={(open) => { if (!open) dismissMcpSheet(); }}>
+        <SheetContent className="gap-0 overflow-hidden" resizeStorageKey="context-management/mcp-sheet" defaultSize={720} minSize={520} maxSize={960}>
+          <SheetHeader className="border-b px-5 py-4">
+            <SheetTitle>{mcpEditTarget ? t('contextManagement.mcp.editServer', '配置 MCP 服务器') : t('contextManagement.mcp.addServer', '添加 MCP 服务器')}</SheetTitle>
+            <SheetDescription>{t('contextManagement.mcp.jsonEditorHint', '查看服务器文档了解所需的参数和环境变量')}</SheetDescription>
+          </SheetHeader>
+          <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-5 py-4">
+            {/* 对标 Zed render_tab_bar: 仅新增时显示 transport 选择，编辑时隐藏 */}
+            {!mcpEditTarget ? (
+            <div className="flex gap-1 border-b">
+              <button type="button" className={cn('px-3 py-2 text-sm font-medium border-b-2 transition-colors', mcpTransportTab === 'stdio' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground')} onClick={() => { setMcpTransportTab('stdio'); setMcpJsonContent(MCP_STDIO_TEMPLATE); }}>{t('contextManagement.mcp.localTab', '本地 (Stdio)')}</button>
+              <button type="button" className={cn('px-3 py-2 text-sm font-medium border-b-2 transition-colors', mcpTransportTab === 'http' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground')} onClick={() => { setMcpTransportTab('http'); setMcpJsonContent(MCP_HTTP_TEMPLATE); }}>{t('contextManagement.mcp.remoteTab', '远程 (HTTP)')}</button>
+              <button type="button" className={cn('px-3 py-2 text-sm font-medium border-b-2 transition-colors', mcpTransportTab === 'sse' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground')} onClick={() => { setMcpTransportTab('sse'); setMcpJsonContent(MCP_SSE_TEMPLATE); }}>{t('contextManagement.mcp.sseTab', '远程 (SSE)')}</button>
+            </div>
+            ) : null}
+            <textarea
+              className="min-h-72 w-full rounded-md border bg-muted/30 p-3 text-sm leading-relaxed outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              value={mcpJsonContent}
+              onChange={(e) => setMcpJsonContent(e.target.value)}
+              spellCheck={false}
+              disabled={!!mcpCheckTarget}
+            />
+            {/* 对标 Zed: 状态区域 — Connecting / Error */}
+            {mcpCheckTarget ? (
+              <div className="flex items-center gap-2 rounded-md bg-muted/30 px-3 py-2 text-sm text-muted-foreground">
+                <Loader2 className="size-4 animate-spin" />
+                {t('contextManagement.mcp.connecting', 'Connecting Server…')}
+              </div>
+            ) : null}
+            {mcpError ? <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"><span className="flex-1">{mcpError}</span><button type="button" onClick={() => setMcpError(null)} className="shrink-0 rounded-sm opacity-70 transition-opacity hover:opacity-100" aria-label="Dismiss">✕</button></div> : null}
+          </div>
+          <SheetFooter className="border-t px-5 py-4">
+            <Button variant="outline" onClick={dismissMcpSheet}>{mcpError ? t('common.close') : t('common.close')}</Button>
+            <Button disabled={mcpSaving || !!mcpCheckTarget || !mcpJsonContent.trim()} onClick={() => void handleMcpSave()}>{mcpSaving ? t('common.loading') : mcpCheckTarget ? t('contextManagement.mcp.connecting', 'Connecting…') : mcpEditTarget ? t('contextManagement.mcp.saveConfigure', '配置服务器') : t('contextManagement.mcp.saveServer', '添加服务器')}</Button>
+          </SheetFooter>
+        </SheetContent>
+      </Sheet>
+
+      {/* ── MCP Delete Dialog ── */}
+      <AlertDialog open={Boolean(mcpDeleteTarget)} onOpenChange={(open) => !open && setMcpDeleteTarget(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('contextManagement.mcp.deleteServer', '删除 MCP 服务器')}</AlertDialogTitle>
+            <AlertDialogDescription>{t('contextManagement.mcp.deleteDescription', '确定要删除 MCP 服务器吗？').replace('{name}', mcpDeleteTarget?.name ?? '')}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('common.close')}</AlertDialogCancel>
+            <AlertDialogAction onClick={async () => { if (!mcpDeleteTarget) return; try { setMcpServers(await deleteMcpServer(mcpDeleteTarget.id)); setMcpDeleteTarget(null); } catch (err) { setMcpError(displayAppError(t, err)); setMcpDeleteTarget(null); } }}>{t('contextManagement.mcp.deleteServer', '删除')}</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* ── MCP Tools Sheet ── */}
+      <Sheet modal={false} open={Boolean(toolsSheetServer)} onOpenChange={(open) => { if (!open) { setToolsSheetServer(null); setToolsList(null); setToolsError(null); setToolsLoading(false); } }}>
+        <SheetContent className="gap-0 overflow-hidden" resizeStorageKey="context-management/tools-sheet" defaultSize={560} minSize={420} maxSize={800}>
+          <SheetHeader className="border-b px-5 py-4">
+            <SheetTitle className="flex items-center gap-2">
+              <span className="truncate">{toolsSheetServer?.name ?? ''}</span>
+              <Badge variant="secondary" className="shrink-0 px-1.5 py-0 text-ui-micro font-normal">{toolsSheetServer?.transport === 'stdio' ? 'Stdio' : toolsSheetServer?.transport === 'sse' ? 'SSE' : 'HTTP'}</Badge>
+            </SheetTitle>
+          </SheetHeader>
+          <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-5 py-4">
+            {toolsLoading ? (
+              <div className="flex items-center justify-center gap-2 py-12 text-sm text-muted-foreground">
+                <Loader2 className="size-4 animate-spin" />
+                {t('contextManagement.mcp.loadingTools', '正在获取工具列表…')}
+              </div>
+            ) : toolsError ? (
+              <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">{toolsError}</div>
+            ) : toolsList && toolsList.length === 0 ? (
+              <div className="py-12 text-center text-sm text-muted-foreground">{t('contextManagement.mcp.emptyTools', '该服务器未提供任何工具')}</div>
+            ) : toolsList ? (
+              <>
+                <p className="text-xs text-muted-foreground">{t('contextManagement.mcp.toolCount', { count: toolsList.length, defaultValue: `共 ${toolsList.length} 个工具` })}</p>
+                <div className="space-y-2">
+                  {toolsList.map((tool) => (
+                    <div key={tool.name} className="rounded-lg border border-border/50 bg-card/40 px-4 py-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-sm font-medium">{tool.name}</p>
+                          {tool.description && (
+                            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{tool.description}</p>
+                          )}
+                        </div>
+                      </div>
+                      {tool.inputSchema && typeof tool.inputSchema === 'object' && Object.keys(tool.inputSchema as Record<string, unknown>).length > 0 && (
+                        <details className="mt-2">
+                          <summary className="cursor-pointer text-ui-caption text-muted-foreground hover:text-foreground">{t('contextManagement.mcp.parameterSchema', '参数 Schema')}</summary>
+                          <pre className="mt-1.5 overflow-x-auto rounded-md bg-muted/50 px-3 py-2 font-mono text-ui-caption leading-relaxed">{JSON.stringify(tool.inputSchema, null, 2)}</pre>
+                        </details>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : null}
+          </div>
+          <SheetFooter className="border-t px-5 py-4">
+            <Button variant="outline" onClick={() => { setToolsSheetServer(null); setToolsList(null); setToolsError(null); }}>{t('common.close')}</Button>
+          </SheetFooter>
+        </SheetContent>
+      </Sheet>
+
+      <SkillSheet
+        mode={skillSheetMode}
+        content={skillSheetContent}
+        editTarget={skillEditTarget}
+        editWorkspacePath={skillEditWsPath}
+        createSource={skillTab === 'global' ? 'global' : (selectedWorkspace ? `project:${selectedWorkspace}` : 'project')}
+        workspaces={workspaces}
+        configuredAgents={configuredAgents}
+        skillTab={skillTab}
+        selectedWorkspace={selectedWorkspace}
+        onOpenChange={(open) => { if (!open) setSkillSheetMode(null); }}
+        onSaved={(next) => setSkillList(next)}
+        onReloadProjectSkills={loadProjectSkills}
+        onError={setSkillError}
+      />
+
+    </Page>
+  );
+}
+
+type SkillWorkspaceOption = { projectId: string; workspacePath: string; name: string };
+
+function SkillSheet({
+  mode,
+  content,
+  editTarget,
+  editWorkspacePath,
+  createSource,
+  workspaces,
+  configuredAgents,
+  skillTab,
+  selectedWorkspace,
+  onOpenChange,
+  onSaved,
+  onReloadProjectSkills,
+  onError,
+}: {
+  mode: SkillSheetMode | null;
+  content: SkillContentVm | null;
+  editTarget: SkillMetaVm | null;
+  editWorkspacePath: string | null;
+  createSource: string;
+  workspaces: SkillWorkspaceOption[];
+  configuredAgents: ConfiguredSkillAgentMeta[];
+  skillTab: 'global' | 'project';
+  selectedWorkspace: string;
+  onOpenChange: (open: boolean) => void;
+  onSaved: (next: SkillListVm) => void;
+  onReloadProjectSkills: (workspacePath: string) => Promise<void>;
+  onError: (message: string) => void;
+}) {
+  const { t } = useTranslation();
+  const open = mode !== null;
+  const [form, setForm] = useState<SkillFormState>(() => createEmptySkillForm(createSource));
+  const [syncTargets, setSyncTargets] = useState<string[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [skillFiles, setSkillFiles] = useState<SkillFileEntryVm[]>([]);
+  const [skillFilesTruncated, setSkillFilesTruncated] = useState(false);
+  const [openSkillFile, setOpenSkillFile] = useState<{ path: string; content: string } | null>(null);
+  const [skillFileLoading, setSkillFileLoading] = useState(false);
+  const availableSyncAgents = useMemo(
+    () => selectableSyncAgents(mode === 'edit' ? editTarget : null, configuredAgents),
+    [configuredAgents, editTarget, mode],
+  );
+  const currentSkillStorageHint = useMemo(() => skillStorageHint({
+    source: form.source.startsWith('project:') ? 'project' : form.source,
+    editing: mode === 'edit',
+    directoryPath: editTarget?.directoryPath ?? null,
+    workspacePath: editWorkspacePath,
+    translate: (key, params) => t(key, params),
+  }), [editTarget?.directoryPath, editWorkspacePath, form.source, mode, t]);
+
+  useEffect(() => {
+    if (!open || !mode) return;
+    setSaving(false);
+    if (mode === 'create') {
+      setForm(createEmptySkillForm(createSource));
+      setSyncTargets(configuredAgents.map((agent) => agent.agentType));
+      return;
+    }
+    setForm(createSkillFormFromContent(content, editTarget?.source ?? createSource));
+    if (mode === 'view' || !editTarget) {
+      setSyncTargets([]);
+      return;
+    }
+    let active = true;
+    setSyncTargets([]);
+    getSkillSyncStatus(editTarget.name, editTarget.directoryPath, editWorkspacePath)
+      .then((statuses) => {
+        if (!active) return;
+        const configured = new Set(configuredAgents.map((agent) => agent.agentType));
+        setSyncTargets(statuses.filter((status) => status.isSynced).map((status) => status.agentType).filter((agentType) => configured.has(agentType)));
+      })
+      .catch(() => {
+        if (active) setSyncTargets([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [configuredAgents, content, createSource, editTarget, editWorkspacePath, mode, open]);
+
+  useEffect(() => {
+    setSyncTargets((current) => filterSkillSyncTargets(current, availableSyncAgents));
+  }, [availableSyncAgents]);
+
+  // 目录形式 skill：view 模式加载 skill 目录文件树
+  useEffect(() => {
+    if (!open || mode !== 'view' || !editTarget?.directoryPath) {
+      setSkillFiles([]);
+      setSkillFilesTruncated(false);
+      setOpenSkillFile(null);
+      return;
+    }
+    let active = true;
+    setSkillFiles([]);
+    setSkillFilesTruncated(false);
+    setOpenSkillFile(null);
+    listSkillFiles(editTarget.directoryPath, editWorkspacePath)
+      .then((result) => {
+        if (!active) return;
+        setSkillFiles(result.files);
+        setSkillFilesTruncated(result.truncated);
+      })
+      .catch(() => {
+        if (!active) return;
+        setSkillFiles([]);
+        setSkillFilesTruncated(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [open, mode, editTarget, editWorkspacePath]);
+
+  // skill 资源链接处理器：SKILL.md 及子文件中的相对引用（含 ../ 兄弟 skill）接入 skill 目录读取
+  const skillResourceLinkHandler = useMemo<MarkdownResourceLinkHandler | null>(() => {
+    if (mode !== 'view' || !editTarget?.directoryPath) return null;
+    return {
+      openLocalFile: async (rawHref) => {
+        const relative = resolveSkillRelativeHref(rawHref);
+        if (!relative) {
+          return { status: 'error' as const, error: { code: 'skill.file-path-empty', params: {} } };
+        }
+        // 子文件中的相对引用以当前打开文件所在目录为基准
+        const resolved = resolveSkillPathFrom(openSkillFile?.path ?? null, relative);
+        setSkillFileLoading(true);
+        try {
+          const result = await readSkillFile(editTarget.directoryPath, resolved, editWorkspacePath);
+          setOpenSkillFile({ path: result.path || resolved, content: result.content });
+          return { status: 'opened' as const };
+        } catch (err) {
+          onError(`${t('contextManagement.skills.fileLoadFailed', '读取文件失败')}: ${displayAppError(t, err)}`);
+          const appError = err as AppErrorVm;
+          return {
+            status: 'error' as const,
+            error: { code: appError?.code ?? 'skill.file-not-found', params: appError?.params ?? {} },
+          };
+        } finally {
+          setSkillFileLoading(false);
+        }
+      },
+    };
+  }, [mode, editTarget, editWorkspacePath, onError, t, openSkillFile?.path]);
+
+  // SKILL.md 正文已在上方渲染，文件列表中不再重复展示
+  const skillExtraFiles = useMemo(
+    () => skillFiles.filter((file) => file.path !== 'SKILL.md'),
+    [skillFiles],
+  );
+
+  const openSkillFileViewer = (relativePath: string) => {
+    void skillResourceLinkHandler?.openLocalFile(relativePath);
+  };
+
+  const save = async () => {
+    if (mode !== 'create' && mode !== 'edit') return;
+    setSaving(true);
+    try {
+      const request = buildSkillSaveRequest({
+        form,
+        mode,
+        editTarget,
+        editWorkspacePath,
+        syncTargets,
+      });
+      const conflicts = await checkSkillNameConflict(
+        request.name,
+        request.scope,
+        request.wsPath,
+        request.oldName,
+        request.directoryPath,
+        request.syncTargets,
+      );
+      if (conflicts.length > 0) {
+        onError(t('errors.skill.sync-conflict', { skillName: request.name, conflicts: conflicts.join('、') }));
+        return;
+      }
+      const next = await writeSkill(request.name, request.scope, request.content, request.wsPath, request.oldName, request.directoryPath, request.syncTargets);
+      onSaved(next);
+      if (skillTab === 'project' && selectedWorkspace) {
+        await onReloadProjectSkills(selectedWorkspace);
+      }
+      onOpenChange(false);
+    } catch (err) {
+      onError(displayAppError(t, err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Sheet modal={false} open={open} onOpenChange={onOpenChange}>
+      <SheetContent className="gap-0 overflow-hidden" resizeStorageKey="context-management/skill-sheet" defaultSize={720} minSize={520} maxSize={960}>
+        <SheetHeader className="border-b px-5 py-4">
+          <SheetTitle>{mode === 'create' ? t('contextManagement.skills.createSkill', '创建 SKILL') : mode === 'edit' ? t('contextManagement.skills.editSkillTitle', { name: editTarget?.name ?? '', defaultValue: `编辑 ${editTarget?.name ?? ''}` }) : editTarget?.name ?? t('common.detail')}</SheetTitle>
+        </SheetHeader>
+        <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-5 py-4">
+          {mode === 'view' ? (
+            openSkillFile ? (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <Button variant="ghost" size="sm" className="h-7 gap-1 px-2 text-xs" onClick={() => setOpenSkillFile(null)}>
+                    <ArrowLeft className="size-3.5" />{t('contextManagement.skills.backToSkill', '返回 SKILL.md')}
+                  </Button>
+                  <span className="truncate font-mono text-xs text-muted-foreground">{openSkillFile.path}</span>
+                </div>
+                <div className="rounded-lg border bg-card/50 p-4">
+                  {openSkillFile.path.toLowerCase().endsWith('.md') ? (
+                    <MarkdownResourceLinkProvider handler={skillResourceLinkHandler}><Markdown>{openSkillFile.content}</Markdown></MarkdownResourceLinkProvider>
+                  ) : (
+                    <pre className="overflow-x-auto whitespace-pre-wrap break-all font-mono text-xs leading-relaxed">{openSkillFile.content}</pre>
+                  )}
+                </div>
+              </div>
+            ) : (
+            <div className="space-y-4">
+              <div className="grid gap-2 text-sm">
+                <div><span className="text-muted-foreground">{t('contextManagement.skills.name', '名称')}:</span> {form.name}</div>
+                <div><span className="text-muted-foreground">{t('contextManagement.skills.description', '描述')}:</span> {form.description}</div>
+                <div><span className="text-muted-foreground">{t('contextManagement.scope', '范围')}:</span> {form.source === 'global' ? t('contextManagement.skills.globalBadge', 'Global') : t('contextManagement.skills.projectBadge', 'Project')}</div>
+              </div>
+              {skillExtraFiles.length > 0 && (
+                <div className="space-y-1">
+                  <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+                    {skillFileLoading && <Loader2 className="size-3 animate-spin" />}
+                    {t('contextManagement.skills.filesTitle', '目录文件')}
+                  </div>
+                  <div className="rounded-lg border bg-card/50 py-1">
+                    {skillExtraFiles.map((file) => {
+                      const depth = file.path.split('/').length - 1;
+                      const label = file.path.split('/').pop() ?? file.path;
+                      return file.isDir ? (
+                        <div key={file.path} className="flex items-center gap-1.5 py-1 pr-3 text-xs text-muted-foreground" style={{ paddingLeft: `${12 + depth * 14}px` }}>
+                          <FolderOpen className="size-3.5 shrink-0" /><span className="truncate">{label}</span>
+                        </div>
+                      ) : (
+                        <button
+                          key={file.path}
+                          type="button"
+                          disabled={skillFileLoading}
+                          className="flex w-full items-center gap-1.5 py-1 pr-3 text-left text-xs hover:bg-accent/60"
+                          style={{ paddingLeft: `${12 + depth * 14}px` }}
+                          onClick={() => openSkillFileViewer(file.path)}
+                        >
+                          <FileText className="size-3.5 shrink-0" /><span className="truncate">{label}</span>
+                        </button>
+                      );
+                    })}
+                    {skillFilesTruncated && (
+                      <p className="px-3 py-1 text-[11px] text-muted-foreground">
+                        {t('contextManagement.skills.filesTruncated', { count: skillFiles.length, defaultValue: `目录过大，仅显示前 ${skillFiles.length} 项。` })}
+                      </p>
+                    )}
+              <div className="rounded-lg border bg-card/50 p-4">
+                <MarkdownResourceLinkProvider handler={skillResourceLinkHandler}>
+                  <Markdown>{form.body || t('contextManagement.emptyContent', '暂无正文内容')}</Markdown>
+                </MarkdownResourceLinkProvider>
+              </div>
+                  </div>
+                </div>
+              )}
+            </div>
+            )
+          ) : (
+            <>
+              <div className="space-y-1">
+                <span id="skill-scope-label" className="text-sm font-medium">{t('contextManagement.scope', 'Scope')}</span>
+                <Select
+                  value={mode === 'edit' && editWorkspacePath ? `project:${editWorkspacePath}` : form.source}
+                  onValueChange={(source) => setForm((current) => ({ ...current, source }))}
+                  disabled={mode === 'edit'}
+                >
+                  <SelectTrigger className="h-10 w-full" aria-labelledby="skill-scope-label">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent align="start">
+                    {mode === 'edit' && editWorkspacePath ? (
+                      <SelectItem value={`project:${editWorkspacePath}`}>
+                        {t('contextManagement.skills.projectOption', { name: workspaces.find((workspace) => workspace.workspacePath === editWorkspacePath)?.name ?? editWorkspacePath, defaultValue: `${workspaces.find((workspace) => workspace.workspacePath === editWorkspacePath)?.name ?? editWorkspacePath} (project)` })}
+                      </SelectItem>
+                    ) : (
+                      <>
+                        {workspaces.map((workspace) => (
+                          <SelectItem key={workspace.projectId} value={`project:${workspace.workspacePath}`}>{t('contextManagement.skills.projectOption', { name: workspace.name, defaultValue: `${workspace.name} (project)` })}</SelectItem>
+                        ))}
+                        <SelectItem value="global">{t('contextManagement.skills.globalBadge', 'Global')}</SelectItem>
+                        {workspaces.length === 0 && <SelectItem value="project">{t('contextManagement.skills.projectBadge', 'Project')}</SelectItem>}
+                      </>
+                    )}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  {currentSkillStorageHint}
+                </p>
+              </div>
+              <label className="block space-y-1">
+                <span className="text-sm font-medium">{t('contextManagement.skills.name', '名称')}</span>
+                <input className="h-10 w-full rounded-md border bg-background px-3 text-sm" value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} />
+              </label>
+              <label className="block space-y-1">
+                <span className="text-sm font-medium">{t('contextManagement.skills.description', '描述')}</span>
+                <Textarea className="min-h-24 text-sm leading-relaxed" value={form.description} onChange={(event) => setForm((current) => ({ ...current, description: event.target.value }))} />
+              </label>
+              <SkillSyncTargetSelector agents={availableSyncAgents} value={syncTargets} onValueChange={setSyncTargets} />
+              <label className="block space-y-1">
+                <span className="text-sm font-medium">{t('contextManagement.skills.body', '正文 (Markdown)')}</span>
+                <textarea className="min-h-72 w-full rounded-md border bg-muted/30 p-3 text-sm leading-relaxed" value={form.body} onChange={(event) => setForm((current) => ({ ...current, body: event.target.value }))} />
+              </label>
+            </>
+          )}
+        </div>
+        <SheetFooter className="border-t px-5 py-4">
+          <Button variant="outline" onClick={() => onOpenChange(false)}>{t('common.close')}</Button>
+          {(mode === 'create' || mode === 'edit') && (
+            <Button disabled={saving || !form.name.trim()} onClick={() => void save()}>
+              {t('common.save')}
+            </Button>
+          )}
+        </SheetFooter>
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+function BuiltInProfileCard({ profile, onView, onEdit }: { profile: ProfileVm; onView: () => void; onEdit: () => void }) {
+  const readOnly = useReadOnlyExperience();
+  const { t } = useTranslation();
+  return (
+    <Card className="h-full min-h-52 gap-0 bg-card/45 py-0">
+      <CardHeader className="px-4 py-4 pb-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <CardTitle className="truncate text-base">{profile.name}</CardTitle>
+            <CardDescription className="mt-1 truncate font-mono text-xs">{profile.id}</CardDescription>
+          </div>
+          <Badge variant="secondary" className="shrink-0">{profileScopeLabel(t, profile.scope)}</Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="flex flex-1 flex-col px-4 pb-0">
+        <CardDescription className="line-clamp-3 leading-6">{profile.summary}</CardDescription>
+      </CardContent>
+      <CardFooter className="mt-auto flex-wrap justify-end gap-2 px-4 py-4 pt-3">
+        <Button variant="outline" size="sm" onClick={onView}><Eye />{t('common.detail')}</Button>
+        {!readOnly && <Button variant="outline" size="sm" onClick={onEdit}><Edit />{t('contextManagement.editProfile')}</Button>}
+      </CardFooter>
+    </Card>
+  );
+}
+
+function CustomProfileCard({ profile, onView, onEdit, onDelete }: { profile: ProfileVm; onView: () => void; onEdit: () => void; onDelete: () => void }) {
+  const readOnly = useReadOnlyExperience();
+  const { t } = useTranslation();
+  return (
+    <Card className="h-full min-h-52 gap-0 bg-card/50 py-0">
+      <CardHeader className="px-4 py-4 pb-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <CardTitle className="truncate text-base">{profile.name}</CardTitle>
+            <CardDescription className="mt-1 truncate font-mono text-xs">{profile.id}</CardDescription>
+          </div>
+          <Badge variant="outline" className="shrink-0">{profileScopeLabel(t, profile.scope)}</Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="flex flex-1 flex-col px-4 pb-0">
+        <CardDescription className="line-clamp-3 leading-6">{profile.summary}</CardDescription>
+        <dl className="mt-auto grid gap-1 pt-3 text-xs text-muted-foreground">
+          <div className="flex gap-1"><dt>{t('contextManagement.createdAt')}:</dt><dd>{formatLocalDateTime(profile.createdAt)}</dd></div>
+          <div className="flex gap-1"><dt>{t('contextManagement.updatedAt')}:</dt><dd>{formatLocalDateTime(profile.updatedAt)}</dd></div>
+        </dl>
+      </CardContent>
+      <CardFooter className="flex-wrap justify-end gap-2 px-4 py-4 pt-3">
+        <Button variant="outline" size="sm" onClick={onView}><Eye />{t('common.detail')}</Button>
+        {!readOnly && <Button variant="outline" size="sm" onClick={onEdit}><Edit />{t('contextManagement.editProfile')}</Button>}
+        <Button
+          variant="outline"
+          size="sm"
+          aria-label={t('contextManagement.deleteProfile', { name: profile.name })}
+          hidden={readOnly}
+          onClick={onDelete}
+        >
+          <Trash2 />
+          {t('contextManagement.deleteProfileShort')}
+        </Button>
+      </CardFooter>
+    </Card>
+  );
+}
+
+function ProfileSheet({ mode, profile, returnToImportResult, onOpenChange, onSave, onSaveAsNew }: { mode: ProfileSheetMode | null; profile: ProfileVm | null; returnToImportResult: boolean; onOpenChange: (open: boolean) => void; onSave: (input: ProfileInput) => Promise<void>; onSaveAsNew: (input: ProfileInput) => Promise<void> }) {
+  const { t } = useTranslation();
+  const editing = mode === 'create' || mode === 'edit';
+  const isBuiltIn = Boolean(profile?.isBuiltIn);
+  const [saving, setSaving] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [saveAsOpen, setSaveAsOpen] = useState(false);
+  const [saveAsName, setSaveAsName] = useState('');
+  const [saveAsError, setSaveAsError] = useState<string | null>(null);
+  const form = useForm<ProfileInput>({
+    defaultValues: profileInputDefaults(profile),
+  });
+
+  useEffect(() => {
+    form.reset(profileInputDefaults(profile));
+    setSubmitError(null);
+    setSaveAsOpen(false);
+    setSaveAsName(profile?.name ?? '');
+    setSaveAsError(null);
+  }, [form, mode, profile]);
+
+  const submit = async (input: ProfileInput) => {
+    setSaving(true);
+    setSubmitError(null);
+    try {
+      await onSave({ ...input, name: input.name.trim(), summary: input.summary.trim() });
+    } catch (err) {
+      setSubmitError(displayAppError(t, err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const openSaveAsDialog = () => {
+    setSaveAsError(null);
+    setSaveAsName((form.getValues('name') || profile?.name || '').trim());
+    setSaveAsOpen(true);
+  };
+
+  const confirmSaveAsNew = async () => {
+    const trimmedName = saveAsName.trim();
+    if (!trimmedName) {
+      setSaveAsError(t('contextManagement.profileRequired'));
+      return;
+    }
+    const values = form.getValues();
+    setSaving(true);
+    setSaveAsError(null);
+    setSubmitError(null);
+    try {
+      await onSaveAsNew({ ...values, name: trimmedName, summary: values.summary.trim() });
+      setSaveAsOpen(false);
+    } catch (err) {
+      setSaveAsError(displayAppError(t, err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <>
+      <Sheet modal={false} open={mode !== null} onOpenChange={onOpenChange}>
+        <SheetContent className="gap-0 overflow-hidden p-0" resizeStorageKey="context-management/profile-sheet" defaultSize={720} minSize={520} maxSize={960}>
+          <SheetHeader className="border-b px-5 py-4 text-left">
+            {returnToImportResult ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="mb-1 w-fit -ml-2 text-muted-foreground"
+                onClick={() => onOpenChange(false)}
+              >
+                <ArrowLeft />
+                {t('common.back')}
+              </Button>
+            ) : null}
+            <SheetTitle>{mode === 'create' ? t('contextManagement.createProfile') : mode === 'edit' ? t('contextManagement.editProfile') : profile?.name}</SheetTitle>
+            {editing ? (
+              <SheetDescription className={cn(!isBuiltIn && 'sr-only')}>
+                {isBuiltIn ? t('contextManagement.builtInReadonlyHint') : t('contextManagement.editDescription')}
+              </SheetDescription>
+            ) : (
+              <SheetDescription className={cn(!profile?.summary && 'sr-only')}>{profile?.summary || profile?.name}</SheetDescription>
+            )}
+          </SheetHeader>
+          <ScrollArea className="min-h-0 flex-1">
+            <div className="space-y-4 p-5">
+              {submitError ? <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">{submitError}</div> : null}
+              {editing ? (
+                <Form {...form}>
+                  <form id="profile-form" className="space-y-4" onSubmit={form.handleSubmit(submit)}>
+                    <FormField
+                      control={form.control}
+                      name="name"
+                      rules={{ required: t('contextManagement.profileRequired') }}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{t('contextManagement.name')}</FormLabel>
+                          <FormControl><Input {...field} /></FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name="summary"
+                      rules={{ required: t('contextManagement.profileRequired') }}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{t('contextManagement.summary')}</FormLabel>
+                          <FormControl><Textarea {...field} /></FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name="dynamicTemplate"
+                      render={({ field }) => (
+                        <FormItem className="flex items-center justify-between gap-4 rounded-lg border px-3 py-3">
+                          <div className="space-y-1">
+                            <div className="flex items-center gap-1.5">
+                              <FormLabel className="m-0">{t('contextManagement.dynamicTemplate')}</FormLabel>
+                              <TooltipProvider>
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <button
+                                      type="button"
+                                      className="text-muted-foreground transition-colors hover:text-foreground"
+                                      aria-label={t('contextManagement.dynamicTemplateHelpLabel')}
+                                    >
+                                      <CircleHelp className="size-4" />
+                                    </button>
+                                  </TooltipTrigger>
+                                  <TooltipContent side="top" align="start" className="max-w-sm space-y-2 p-3">
+                                    <p>{t('contextManagement.dynamicTemplateHelp')}</p>
+                                    <ul className="space-y-1 font-mono text-xs">
+                                      <li>{t('contextManagement.dynamicTemplateSurface')}</li>
+                                      <li>{t('contextManagement.dynamicTemplateCanRouteNext')}</li>
+                                      <li>{t('contextManagement.dynamicTemplateHasOutputContract')}</li>
+                                      <li>{t('contextManagement.dynamicTemplateSessionMode')}</li>
+                                    </ul>
+                                  </TooltipContent>
+                                </Tooltip>
+                              </TooltipProvider>
+                            </div>
+                            <p className="text-xs text-muted-foreground">{t('contextManagement.dynamicTemplateDescription')}</p>
+                          </div>
+                          <FormControl>
+                            <Switch checked={field.value} onCheckedChange={field.onChange} />
+                          </FormControl>
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name="content"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{t('contextManagement.content')}</FormLabel>
+                          <FormControl><Textarea className="min-h-72 text-sm leading-relaxed" {...field} /></FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  </form>
+                </Form>
+              ) : profile ? (
+                <div className="space-y-4">
+                  <Card className="bg-muted/15 py-0">
+                    <CardContent className="grid gap-3 p-3 text-sm md:grid-cols-2">
+                      <ProfileMeta label="ID" value={profile.id} />
+                      <ProfileMeta label={t('contextManagement.scope')} value={profileScopeLabel(t, profile.scope)} />
+                      <ProfileMeta label={t('contextManagement.dynamicTemplate')} value={profile.dynamicTemplate ? t('common.enabled') : t('common.disabled')} />
+                      <ProfileMeta label={t('contextManagement.createdAt')} value={formatLocalDateTime(profile.createdAt)} />
+                      <ProfileMeta label={t('contextManagement.updatedAt')} value={formatLocalDateTime(profile.updatedAt)} />
+                    </CardContent>
+                  </Card>
+                  <Card className="bg-card/40 py-0">
+                    <CardContent className="p-4">
+                      <Markdown>{profile.content || t('contextManagement.emptyContent')}</Markdown>
+                    </CardContent>
+                  </Card>
+                </div>
+              ) : null}
+            </div>
+          </ScrollArea>
+          <SheetFooter className="border-t px-5 py-4">
+            <Button variant="outline" onClick={() => onOpenChange(false)}>{t('common.close')}</Button>
+            {editing ? (
+              isBuiltIn && mode === 'edit'
+                ? <Button type="button" disabled={saving} onClick={openSaveAsDialog}>{t('contextManagement.saveAsNewProfile')}</Button>
+                : <Button type="submit" form="profile-form" disabled={saving}>{t('common.save')}</Button>
+            ) : null}
+          </SheetFooter>
+        </SheetContent>
+      </Sheet>
+      <Dialog open={saveAsOpen} onOpenChange={setSaveAsOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t('contextManagement.saveAsNewProfile')}</DialogTitle>
+            <DialogDescription>{t('contextManagement.saveAsNewProfileDescription')}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <Input value={saveAsName} onChange={(event) => setSaveAsName(event.target.value)} placeholder={t('contextManagement.name')} />
+            {saveAsError ? <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">{saveAsError}</div> : null}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setSaveAsOpen(false)}>{t('common.close')}</Button>
+            <Button disabled={saving} onClick={() => void confirmSaveAsNew()}>{t('contextManagement.saveAsNewProfile')}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+function ImportResultContent({ result, error, onClose, onEdit }: {
+  result: ImportProfilesResult;
+  error: string | null;
+  onClose: () => void;
+  onEdit: (id: string) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <>
+      <SheetHeader className="shrink-0 border-b px-5 py-4 text-left">
+        <SheetTitle>{t('contextManagement.importResultTitle')}</SheetTitle>
+        <SheetDescription>
+          {t('contextManagement.importResultSummary', {
+            total: result.totalScanned,
+            success: result.imported.length,
+            failed: result.failed.length,
+          })}
+        </SheetDescription>
+      </SheetHeader>
+      {result.truncated || error ? (
+        <div className="shrink-0 space-y-2 px-6 pb-4">
+          {result.truncated ? (
+            <div className="rounded-lg border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-700 dark:text-yellow-500">
+              {t('contextManagement.importTruncated')}
+            </div>
+          ) : null}
+          {error ? (
+            <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              {error}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      <ScrollArea data-slot="profile-import-result-list" className="min-h-0 w-full flex-1 overflow-hidden">
+        <div className="min-w-0 space-y-3 px-6 pb-4 pr-7">
+            {result.imported.length ? (
+              <div className="space-y-1.5">
+                <div className="text-xs font-medium text-muted-foreground">{t('contextManagement.importResultImported')}</div>
+                {result.imported.map((record) => (
+                  <div
+                    key={record.sourcePath}
+                    className="grid min-w-0 max-w-full gap-2 rounded-md border px-3 py-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
+                  >
+                    <div className="min-w-0 overflow-hidden">
+                      <div className="break-words text-sm font-medium">{record.name}</div>
+                      <div className="break-all text-xs text-muted-foreground">{record.sourcePath}</div>
+                      {record.fallbacks.length ? (
+                        <div className="mt-1 flex flex-wrap gap-1">
+                          {record.fallbacks.map((fb) => (
+                            <Badge key={fb} variant="outline" className="px-1.5 py-0 text-ui-micro font-normal text-muted-foreground">
+                              {t(`contextManagement.importFallback.${fb}`)}
+                            </Badge>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                    {record.importedId ? (
+                      <Button variant="ghost" size="sm" className="shrink-0 justify-self-start sm:justify-self-end" onClick={() => onEdit(record.importedId!)}>
+                        {t('contextManagement.editProfile')}
+                      </Button>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            {result.failed.length ? (
+              <div className="space-y-1.5">
+                <div className="text-xs font-medium text-muted-foreground">{t('contextManagement.importResultFailed')}</div>
+                {result.failed.map((record) => (
+                  <div key={record.sourcePath} className="min-w-0 max-w-full rounded-md border px-3 py-2">
+                    <div className="break-all text-sm font-medium">{record.name || record.sourcePath}</div>
+                    <div className="break-words text-xs text-destructive">
+                      {record.error ? t(`errors.profile.import.${record.error.code}`) : ''}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+        </div>
+      </ScrollArea>
+      <SheetFooter className="shrink-0 border-t px-5 py-4 sm:flex-row sm:justify-end">
+        <Button onClick={onClose}>{t('common.close')}</Button>
+      </SheetFooter>
+    </>
+  );
+}
+
+function ProfileMeta({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 space-y-1">
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className="truncate font-medium">{value}</p>
+    </div>
+  );
+}
+
+function PageSizePicker({ value, onChange }: { value: number; onChange: (value: number) => void }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button variant="outline" className="w-20 justify-between px-3 font-normal">
+          {value}
+          <ChevronsUpDown className="size-4 opacity-50" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent side="top" align="end" sideOffset={8} className="w-20 p-1">
+        <div className="grid gap-1">
+          {pageSizes.map((item) => (
+            <Button
+              key={item}
+              type="button"
+              variant="ghost"
+              className="justify-between px-2 font-normal"
+              onClick={() => { onChange(item); setOpen(false); }}
+            >
+              {item}
+              <Check className={cn('size-4', item === value ? 'opacity-100' : 'opacity-0')} />
+            </Button>
+          ))}
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+function ProfilePagination({ pageIndex, pageCount, onPageChange }: { pageIndex: number; pageCount: number; onPageChange: (value: number) => void }) {
+  const { t } = useTranslation();
+  const previousDisabled = pageIndex === 0;
+  const nextDisabled = pageIndex >= pageCount - 1;
+  return (
+    <Pagination className="w-auto">
+      <PaginationContent>
+        <PaginationItem>
+          <PaginationLink
+            href="#"
+            size="default"
+            aria-disabled={previousDisabled}
+            className={cn('px-3', previousDisabled && 'pointer-events-none opacity-50')}
+            onClick={(event) => { event.preventDefault(); if (!previousDisabled) onPageChange(Math.max(0, pageIndex - 1)); }}
+          >
+            {t('common.previousPage')}
+          </PaginationLink>
+        </PaginationItem>
+        <PaginationItem>
+          <PaginationLink
+            href="#"
+            isActive
+            aria-label={`Page ${pageIndex + 1}`}
+          >
+            {pageIndex + 1}
+          </PaginationLink>
+        </PaginationItem>
+        <PaginationItem>
+          <PaginationLink
+            href="#"
+            size="default"
+            aria-disabled={nextDisabled}
+            className={cn('px-3', nextDisabled && 'pointer-events-none opacity-50')}
+            onClick={(event) => { event.preventDefault(); if (!nextDisabled) onPageChange(Math.min(pageCount - 1, pageIndex + 1)); }}
+          >
+            {t('common.nextPage')}
+          </PaginationLink>
+        </PaginationItem>
+      </PaginationContent>
+    </Pagination>
+  );
+}
+
+function profileInputDefaults(profile: ProfileVm | null): ProfileInput {
+  return {
+    name: profile?.name ?? '',
+    summary: profile?.summarySource ?? profile?.summary ?? '',
+    content: profile?.content ?? '',
+    dynamicTemplate: profile?.dynamicTemplate ?? false,
+  };
+}
+
+function profileScopeLabel(t: (key: string) => string, scope: ProfileScope) {
+  switch (scope) {
+    case 'built-in':
+      return t('contextManagement.builtInScope');
+    case 'user':
+    default:
+      return t('contextManagement.userScope');
+  }
+}
+
+function deleteDialogError(t: TFunction, error: unknown) {
+  if (isAppErrorVm(error) && error.code === 'app.unexpected' && typeof error.params.message === 'string' && error.params.message.trim()) {
+    return error.params.message;
+  }
+  const message = displayAppError(t, error);
+  if (message !== t('errors.app.unexpected')) {
+    return message;
+  }
+  return rawErrorText(error) || message;
+}
+
+function deleteConfirmationMessage(t: TFunction, error: AppErrorVm) {
+  const targets = profileUsageTargets(t, error.params ?? {});
+  if (targets) {
+    return t('contextManagement.deleteProfileBlockedByReferences', { targets });
+  }
+  return t('contextManagement.deleteProfileConfirmationDescription');
+}
+
+function profileUsageTargets(t: TFunction, params: Record<string, unknown>) {
+  return [
+    numericParam(params.templateCount) > 0 ? t('contextManagement.profileUsageTemplateCount', { count: numericParam(params.templateCount) }) : null,
+    numericParam(params.taskCount) > 0 ? t('contextManagement.profileUsageTaskCount', { count: numericParam(params.taskCount) }) : null,
+    numericParam(params.runCount) > 0 ? t('contextManagement.profileUsageRunCount', { count: numericParam(params.runCount) }) : null,
+  ].filter(Boolean).join('、');
+}
+
+function rawErrorText(error: unknown) {
+  if (typeof error === 'string') {
+    return error;
+  }
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (!error || typeof error !== 'object') {
+    return '';
+  }
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return '';
+  }
+}
+
+function numericParam(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function isAppErrorVm(value: unknown): value is AppErrorVm {
+  return Boolean(value)
+    && typeof value === 'object'
+    && typeof (value as Partial<AppErrorVm>).code === 'string'
+    && typeof (value as Partial<AppErrorVm>).params === 'object'
+    && (value as Partial<AppErrorVm>).params !== null;
+}
+
+function isDeleteConfirmationRequiredError(value: unknown): value is AppErrorVm {
+  return isAppErrorVm(value) && value.code === 'profile.delete-confirmation-required';
+}
+
+function profileSearchText(profile: ProfileVm) {
+  return [profile.id, profile.name, profile.summary, profile.content, profile.scope].join('\n').toLowerCase();
+}
+
+// ── MCP JSON Templates & Helpers ──
+
+const MCP_STDIO_TEMPLATE = `{
+  /// Configure an MCP server that runs locally via stdin/stdout
+  ///
+  /// The name of your MCP server
+  "some-mcp-server": {
+    /// The command which runs the MCP server
+    "command": "",
+    /// The arguments to pass to the MCP server
+    "args": [],
+    /// The environment variables to set
+    "env": {}
+  }
+}`;
+
+const MCP_HTTP_TEMPLATE = `{
+  /// Configure an MCP server that you connect to over HTTP
+  ///
+  /// The name of your remote MCP server
+  "some-remote-server": {
+    /// The URL of the remote MCP server
+    "url": "https://example.com/mcp",
+    /// Any headers to send along
+    "headers": {
+      // "Authorization": "Bearer <token>"
+    },
+    /// Optional OAuth configuration for pre-registered clients
+    // "oauth": {
+    //   "clientId": "your-client-id"
+    // }
+  }
+}`;
+
+const MCP_SSE_TEMPLATE = `{
+  /// Configure an MCP server using Server-Sent Events (SSE) transport
+  ///
+  /// The name of your SSE MCP server
+  "some-sse-server": {
+    /// The transport type — must be "sse"
+    "type": "sse",
+    /// The URL of the SSE MCP server endpoint
+    "url": "https://example.com/mcp/sse",
+    /// Any headers to send along
+    "headers": {
+      // "Authorization": "Bearer <token>"
+    }
+  }
+}`;
+
+function mcpServerToJson(s: McpServerVm): string {
+  if (s.transport === 'sse') {
+    const headers = s.headers?.length
+      ? s.headers.map((h) => `"${h.key}": "${h.value}"`).join(',\n      ')
+      : '// "Authorization": "Bearer <token>"';
+    return `{
+  /// Configure an MCP server using Server-Sent Events (SSE) transport
+  "${s.name}": {
+    "type": "sse",
+    "url": "${s.url ?? ''}",
+    "headers": {
+      ${headers}
+    }
+  }
+}`;
+  }
+  if (s.transport === 'http') {
+    const headers = s.headers?.length
+      ? s.headers.map((h) => `"${h.key}": "${h.value}"`).join(',\n      ')
+      : '// "Authorization": "Bearer <token>"';
+    return `{
+  /// Configure an MCP server that you connect to over HTTP
+  "${s.name}": {
+    "url": "${s.url ?? ''}",
+    "headers": {
+      ${headers}
+    }
+  }
+}`;
+  }
+  const env = s.env?.length
+    ? s.env.map((e) => `"${e.key}": "${e.value}"`).join(',\n      ')
+    : '';
+  const args = s.args?.length
+    ? s.args.map((a) => `"${a}"`).join(', ')
+    : '';
+  return `{
+  /// Configure an MCP server that runs locally via stdin/stdout
+  "${s.name}": {
+    "command": "${s.command ?? ''}",
+    "args": [${args}],
+    "env": {
+      ${env}
+    }
+  }
+}`;
+}
