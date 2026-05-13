@@ -1,0 +1,124 @@
+import type { ConversationPage, DesktopUiMode, PrimaryModule, TaskPage } from './types';
+
+export interface AppRoute {
+  uiMode: DesktopUiMode;
+  module: PrimaryModule;
+  taskPage: TaskPage;
+  conversationPage: ConversationPage;
+}
+
+export const taskListPage: TaskPage = { kind: 'task-list' };
+export const conversationHomePage: ConversationPage = { kind: 'conversation-home' };
+
+export function routeFromPath(pathname: string): AppRoute {
+  const segments = pathname.split('/').filter(Boolean).map(decodeURIComponent);
+
+  if (segments.length === 0) {
+    return { uiMode: 'conversation', module: 'task-orchestration', taskPage: taskListPage, conversationPage: conversationHomePage };
+  }
+
+  // ── Conversation paths ──
+  if (segments[0] === 'chat') {
+    if (segments[1] === 'personal-analytics') return { uiMode: 'conversation', module: 'task-orchestration', taskPage: taskListPage, conversationPage: { kind: 'personal-analytics' } };
+    if (segments[1] === 'agents') return { uiMode: 'conversation', module: 'agent-management', taskPage: taskListPage, conversationPage: { kind: 'agents' } };
+    if (segments[1] === 'contexts') return { uiMode: 'conversation', module: 'knowledge-base', taskPage: taskListPage, conversationPage: { kind: 'contexts' } };
+    if (segments[1] === 'run-modes') return { uiMode: 'conversation', module: 'task-orchestration', taskPage: taskListPage, conversationPage: { kind: 'run-mode-management' } };
+    if (segments[1] === 'multica-tasks') return { uiMode: 'conversation', module: 'task-orchestration', taskPage: taskListPage, conversationPage: { kind: 'multica-tasks' } };
+    if (segments[1] === 'scheduled-tasks') {
+      if (segments[2] === 'new') return { uiMode: 'conversation', module: 'task-orchestration', taskPage: taskListPage, conversationPage: { kind: 'scheduled-task-create' } };
+      if (segments[2]) return { uiMode: 'conversation', module: 'task-orchestration', taskPage: taskListPage, conversationPage: { kind: 'scheduled-task-detail', projectId: '', scheduledTaskId: segments[2] } };
+      return { uiMode: 'conversation', module: 'task-orchestration', taskPage: taskListPage, conversationPage: { kind: 'scheduled-tasks' } };
+    }
+    if (segments[1] === 'projects' && segments[3] === 'tasks' && segments[5] === 'runs' && segments[6]) {
+      const roundId = segments[7] === 'rounds' ? segments[8] : undefined;
+      const legacyAttemptId = roundId && segments[9] === 'attempts' ? segments[10] : undefined;
+      const firstNodeId = roundId && segments[9] === 'nodes' ? segments[10] : undefined;
+      const firstAttemptId = firstNodeId && segments[11] === 'attempts' ? segments[12] : undefined;
+      const dynamicNodeId = firstAttemptId && segments[13] === 'dynamic' && segments[14] === 'nodes'
+        ? segments[15]
+        : undefined;
+      const dynamicAttemptId = dynamicNodeId && segments[16] === 'attempts' ? segments[17] : undefined;
+      return {
+        uiMode: 'conversation',
+        module: 'task-orchestration',
+        taskPage: taskListPage,
+        conversationPage: {
+          kind: 'conversation-run',
+          projectId: segments[2],
+          taskId: segments[4],
+          runId: segments[6],
+          roundId,
+          nodeId: dynamicNodeId ?? firstNodeId,
+          attemptId: dynamicAttemptId ?? firstAttemptId ?? legacyAttemptId,
+          outerNodeId: dynamicNodeId ? firstNodeId : undefined,
+          outerAttemptId: dynamicNodeId ? firstAttemptId : undefined,
+        },
+      };
+    }
+    return { uiMode: 'conversation', module: 'task-orchestration', taskPage: taskListPage, conversationPage: conversationHomePage };
+  }
+
+  // ── Workbench paths ──
+  const workbenchBase: Pick<AppRoute, 'uiMode' | 'conversationPage'> = { uiMode: 'workbench', conversationPage: conversationHomePage };
+  if (segments[0] === 'settings') return { ...workbenchBase, module: 'settings', taskPage: taskListPage };
+  if (segments[0] === 'agents') return { ...workbenchBase, module: 'agent-management', taskPage: taskListPage };
+  if (segments[0] === 'contexts') return { ...workbenchBase, module: 'knowledge-base', taskPage: taskListPage };
+  if (segments[0] !== 'tasks') return { ...workbenchBase, module: 'task-orchestration', taskPage: taskListPage };
+  if (!segments[1]) return { ...workbenchBase, module: 'task-orchestration', taskPage: taskListPage };
+  if (segments[2] === 'workflow') return { ...workbenchBase, module: 'task-orchestration', taskPage: { kind: 'workflow', taskId: segments[1] } };
+  return { ...workbenchBase, module: 'task-orchestration', taskPage: taskListPage };
+}
+
+export function pathFromRoute(module: PrimaryModule, taskPage: TaskPage, conversationPage?: ConversationPage) {
+  // ── Conversation paths ──
+  if (conversationPage) {
+    if (conversationPage.kind === 'personal-analytics') return '/chat/personal-analytics';
+    if (conversationPage.kind === 'agents') return '/chat/agents';
+    if (conversationPage.kind === 'contexts') return '/chat/contexts';
+    if (conversationPage.kind === 'run-mode-management') return '/chat/run-modes';
+    if (conversationPage.kind === 'multica-tasks') return '/chat/multica-tasks';
+    if (conversationPage.kind === 'scheduled-tasks') return '/chat/scheduled-tasks';
+    if (conversationPage.kind === 'scheduled-task-create') return '/chat/scheduled-tasks/new';
+    if (conversationPage.kind === 'scheduled-task-detail') return `/chat/scheduled-tasks/${encodeURIComponent(conversationPage.scheduledTaskId)}`;
+    if (conversationPage.kind === 'conversation-run') {
+      const base = `/chat/projects/${encodeURIComponent(conversationPage.projectId)}/tasks/${encodeURIComponent(conversationPage.taskId)}/runs/${encodeURIComponent(conversationPage.runId)}`;
+      if (!conversationPage.roundId) return base;
+      const round = `${base}/rounds/${encodeURIComponent(conversationPage.roundId)}`;
+      if (
+        conversationPage.outerNodeId &&
+        conversationPage.outerAttemptId &&
+        conversationPage.nodeId &&
+        conversationPage.attemptId
+      ) {
+        return `${round}/nodes/${encodeURIComponent(conversationPage.outerNodeId)}/attempts/${encodeURIComponent(conversationPage.outerAttemptId)}/dynamic/nodes/${encodeURIComponent(conversationPage.nodeId)}/attempts/${encodeURIComponent(conversationPage.attemptId)}`;
+      }
+      if (conversationPage.nodeId && conversationPage.attemptId) {
+        return `${round}/nodes/${encodeURIComponent(conversationPage.nodeId)}/attempts/${encodeURIComponent(conversationPage.attemptId)}`;
+      }
+      return conversationPage.attemptId ? `${round}/attempts/${encodeURIComponent(conversationPage.attemptId)}` : round;
+    }
+    return '/chat';
+  }
+  // ── Workbench paths ──
+  if (module === 'settings') return '/settings';
+  if (module === 'agent-management') return '/agents';
+  if (module === 'knowledge-base') return '/contexts';
+  if (taskPage.kind === 'workflow') return `/tasks/${encodeURIComponent(taskPage.taskId)}/workflow`;
+  return '/tasks';
+}
+
+export function replaceRoute(module: PrimaryModule, taskPage: TaskPage, conversationPage?: ConversationPage) {
+  updateHistory(module, taskPage, 'replace', conversationPage);
+}
+
+export function pushRoute(module: PrimaryModule, taskPage: TaskPage, conversationPage?: ConversationPage) {
+  updateHistory(module, taskPage, 'push', conversationPage);
+}
+
+function updateHistory(module: PrimaryModule, taskPage: TaskPage, mode: 'push' | 'replace', conversationPage?: ConversationPage) {
+  const nextPath = pathFromRoute(module, taskPage, conversationPage);
+  if (window.location.pathname === nextPath) return;
+  const nextUrl = `${nextPath}${window.location.search}${window.location.hash}`;
+  if (mode === 'push') window.history.pushState(null, '', nextUrl);
+  else window.history.replaceState(null, '', nextUrl);
+}
