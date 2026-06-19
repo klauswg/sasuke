@@ -1,0 +1,258 @@
+import { describe, expect, it } from 'vitest';
+import {
+  groupSelectableAgentOptions,
+  normalizeConfigOptionOverrides,
+  validateAutoConfig,
+  validateDirectConfig,
+  validateWorkflowTemplateForConversationStart,
+  validateWorkflowTemplateForConversationStartWithFreshProfiles,
+  workflowRepairTargetForTemplate,
+} from '../src/lib/run-mode-validation';
+import type { AgentRegistryVm, ProfileVm, WorkflowTemplateStore } from '../src/types';
+
+const t = (key: string, options?: Record<string, unknown>) => {
+  const messages: Record<string, string> = {
+    'conversation.home.selectWorkflowTemplate': '请选择工作流模板',
+    'conversation.validation.workflow.not-found': 'Selected workflow template not found',
+    'workflowEditor.validationPermissionModeUnavailable': `${options?.node} 节点的权限模式不属于当前 Agent。`,
+    'workflowEditor.validationNodeProfileRequired': `${options?.node} 节点未关联角色。`,
+    'workflowEditor.validationNodeProfileVisibilityChanged': `${options?.node} 节点关联的角色不存在或已删除，请重新设置。`,
+  };
+  return messages[key] ?? key;
+};
+
+const agentRegistry: AgentRegistryVm = {
+  agents: [{
+    agentType: 'claude-acp',
+    displayName: 'Claude',
+    command: 'claude',
+    args: [],
+    env: [],
+    iconKey: 'claude',
+    primaryAgentDir: '.claude',
+    projectPrimaryAgentDir: null,
+    compatibleAgentDirs: [],
+    supportsSystemPrompt: true,
+    externalSessionSyncSupported: false,
+    externalSessionSyncEnabled: false,
+    supportedModes: [{ id: 'ask', name: 'Ask' }],
+    supportedModels: [],
+    configOptions: [{
+      id: 'thought',
+      name: 'Thought',
+      description: '',
+      category: 'thought_level',
+      options: [{ value: 'high', name: 'High' }],
+    }],
+    diagnostic: { status: 'ok', available: true, reason: null, checkedAt: '' },
+  }],
+  catalog: [],
+};
+
+const profiles: ProfileVm[] = [{
+  id: 'profile-1',
+  name: '开发',
+  summary: '',
+  content: '',
+  dynamicTemplate: false,
+  scope: 'user',
+  isBuiltIn: false,
+  createdAt: '',
+  updatedAt: '',
+  path: '',
+}];
+
+const workflowTemplates: WorkflowTemplateStore = {
+  version: '1',
+  templates: [{
+    id: 'invalid-template',
+    name: '非法工作流',
+    isBuiltIn: false,
+    createdAt: '',
+    updatedAt: '',
+    workflow: {
+      version: '0.1',
+      id: 'invalid-workflow',
+      entry: 'ai-dynamic1',
+      control: {},
+      nodes: [{
+        id: 'ai-dynamic1',
+        type: 'ai-dynamic',
+        agentStrategy: { mode: 'fixed', provider: 'claude-acp', permissionMode: 'full_access' },
+        allowedProfiles: [],
+        allowedWorkflows: [],
+        control: {
+          maxDynamicNodes: 20,
+          maxFanout: 5,
+          maxDepth: 6,
+          maxParallel: 3,
+          maxGroupDepth: 1,
+          maxWorkflowInvocations: 10,
+          allowNestedDynamic: false,
+        },
+      }],
+      edges: [{ from: 'ai-dynamic1', to: '$end', on: 'success' }],
+    },
+  }],
+  lastUsedTemplateId: 'invalid-template',
+};
+
+describe('run mode validation', () => {
+  it('groups selectable Agents ahead of unavailable Agents while preserving catalog order', () => {
+    const agents = [
+      { agent: { ...agentRegistry.agents[0], agentType: 'unavailable-first' }, selectable: false, reason: 'Authentication required' },
+      { agent: { ...agentRegistry.agents[0], agentType: 'ready-first' }, selectable: true },
+      { agent: { ...agentRegistry.agents[0], agentType: 'unavailable-last' }, selectable: false, reason: 'Not installed' },
+      { agent: { ...agentRegistry.agents[0], agentType: 'ready-last' }, selectable: true },
+    ];
+
+    expect(groupSelectableAgentOptions(agents)).toMatchObject({
+      selectable: [
+        { agent: { agentType: 'ready-first' } },
+        { agent: { agentType: 'ready-last' } },
+      ],
+      unavailable: [
+        { agent: { agentType: 'unavailable-first' } },
+        { agent: { agentType: 'unavailable-last' } },
+      ],
+    });
+  });
+
+  it('normalizes stale config overrides without mutating the input', () => {
+    const overrides = { thought: 'high', removed: 'legacy' };
+    const snapshot = { ...overrides };
+    const normalized = normalizeConfigOptionOverrides(agentRegistry.agents[0], overrides);
+
+    expect(normalized).toEqual({
+      configOptions: { thought: 'high' },
+      removedOptionIds: ['removed'],
+    });
+    expect(overrides).toEqual(snapshot);
+  });
+
+  it('direct and auto validation tolerate stale overrides without mutation', () => {
+    const direct = { agentType: 'claude-acp', configOptions: { removed: 'legacy' } };
+    const auto = { agentType: 'claude-acp', configOptions: { removed: 'legacy' } };
+    const directSnapshot = structuredClone(direct);
+    const autoSnapshot = structuredClone(auto);
+
+    expect(validateDirectConfig(direct, agentRegistry, t)).toEqual([]);
+    expect(validateAutoConfig(auto, agentRegistry, null, t)).toEqual([]);
+    expect(direct).toEqual(directSnapshot);
+    expect(auto).toEqual(autoSnapshot);
+  });
+
+  it('allows dynamic agents to use the provider default model', () => {
+    const issues = validateAutoConfig({
+      agentStrategy: 'dynamic',
+      agentType: 'claude-acp',
+      bootstrapAgentType: 'claude-acp',
+      availableAgents: [{ provider: 'claude-acp' }],
+      routingPrompt: '',
+    }, agentRegistry, null, t);
+
+    expect(issues).toEqual([]);
+  });
+
+  it('blocks invalid workflow templates before starting quick conversation', () => {
+    const issues = validateWorkflowTemplateForConversationStart(
+      'invalid-template',
+      agentRegistry,
+      profiles,
+      workflowTemplates,
+      t,
+    );
+
+    expect(issues).toContain('ai-dynamic1 节点的权限模式不属于当前 Agent。');
+  });
+
+  it('locates the first invalid Worker for the workflow repair action', () => {
+    const templates: WorkflowTemplateStore = {
+      version: '1',
+      templates: [{
+        id: 'repair-template',
+        name: 'Repair',
+        isBuiltIn: true,
+        createdAt: '',
+        updatedAt: '',
+        workflow: {
+          version: '0.1',
+          id: 'repair-workflow',
+          entry: 'first',
+          control: {},
+          nodes: [
+            { id: 'first', type: 'worker', executionSlotId: 'slot-first', profile: 'profile-1' },
+            { id: 'second', type: 'worker', executionSlotId: 'slot-second', profile: 'profile-1' },
+          ],
+          edges: [{ from: 'first', to: 'second', on: 'success' }, { from: 'second', to: '$end', on: 'success' }],
+        },
+        modelBindings: { definitionRevision: '', bindingRevision: 0, bindings: [] },
+      }],
+      lastUsedTemplateId: 'repair-template',
+    };
+
+    expect(workflowRepairTargetForTemplate('repair-template', agentRegistry, profiles, templates, t)).toEqual({
+      workflowTemplateId: 'repair-template',
+      nodeId: 'first',
+    });
+  });
+
+  it('refreshes profiles before validating a workflow conversation start', async () => {
+    const freshProfile: ProfileVm = {
+      id: 'fresh-profile',
+      name: '新角色',
+      summary: '',
+      content: '',
+      dynamicTemplate: false,
+      scope: 'user',
+      isBuiltIn: false,
+      createdAt: '',
+      updatedAt: '',
+      path: '',
+    };
+    const templates: WorkflowTemplateStore = {
+      version: '1',
+      templates: [{
+        id: 'fresh-template',
+        name: '新角色工作流',
+        isBuiltIn: false,
+        createdAt: '',
+        updatedAt: '',
+        workflow: {
+          version: '0.1',
+          id: 'fresh-workflow',
+          entry: 'dev',
+          control: {},
+          nodes: [{
+            id: 'dev',
+            type: 'worker',
+            executionSlotId: 'slot-dev',
+            profile: freshProfile.id,
+          }],
+          edges: [{ from: 'dev', to: '$end', on: 'success' }],
+        },
+        modelBindings: { definitionRevision: '', bindingRevision: 0, bindings: [{ executionSlotId: 'slot-dev', agentId: 'claude-acp' }] },
+      }],
+      lastUsedTemplateId: 'fresh-template',
+    };
+
+    const staleIssues = validateWorkflowTemplateForConversationStart(
+      'fresh-template',
+      agentRegistry,
+      [],
+      templates,
+      t,
+    );
+    const freshIssues = await validateWorkflowTemplateForConversationStartWithFreshProfiles(
+      'fresh-template',
+      agentRegistry,
+      [],
+      async () => [freshProfile],
+      templates,
+      t,
+    );
+
+    expect(staleIssues).toContain('dev 节点关联的角色不存在或已删除，请重新设置。');
+    expect(freshIssues).toEqual([]);
+  });
+});
