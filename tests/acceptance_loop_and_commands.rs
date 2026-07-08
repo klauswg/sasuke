@@ -1,0 +1,242 @@
+use camino::Utf8PathBuf;
+use sasuke::app::App;
+use sasuke::config::ProviderDiagnosticSnapshot;
+use sasuke::domain::SessionMode;
+use sasuke::provider::{
+    AcpPromptAccepted, DoctorResult, OutputArtifactPayload, ProviderAdapter, ProviderCapabilities,
+    ProviderInfo, ProviderResultPayload, ProviderRunResult, ProviderRunStatus, SessionRef,
+    WorkerInvocation,
+};
+use tempfile::tempdir;
+
+#[derive(Clone, Default)]
+struct LoopingProvider {
+    call_count: std::sync::Arc<std::sync::Mutex<u32>>,
+}
+
+impl ProviderAdapter for LoopingProvider {
+    fn describe_provider(&self) -> ProviderInfo {
+        ProviderInfo {
+            provider_id: "fake".to_string(),
+            display_name: "Fake".to_string(),
+            capabilities: ProviderCapabilities {
+                supports_open_session: true,
+                supports_continue_session: true,
+                supports_system_prompt: true,
+                supports_raw_stream: false,
+            },
+            is_default: false,
+        }
+    }
+
+    fn doctor(&self) -> DoctorResult {
+        DoctorResult {
+            available: true,
+            reason: None,
+            capabilities: None,
+        }
+    }
+
+    fn run_worker(&self, req: WorkerInvocation) -> anyhow::Result<ProviderRunResult> {
+        let mut count = self.call_count.lock().unwrap();
+        *count += 1;
+        let payload = match req
+            .output_contract
+            .as_ref()
+            .map(|contract| contract.artifact.as_str())
+        {
+            Some("implementation-result") => OutputArtifactPayload {
+                name: "implementation-result".to_string(),
+                content: r#"{"summary":"implemented"}"#.to_string(),
+            },
+            Some("accept-result") if *count < 4 => OutputArtifactPayload {
+                name: "accept-result".to_string(),
+                content: r#"{"result":false,"reason":"not yet"}"#.to_string(),
+            },
+            Some("accept-result") => OutputArtifactPayload {
+                name: "accept-result".to_string(),
+                content: r#"{"result":true,"reason":"accepted"}"#.to_string(),
+            },
+            _ => unreachable!(),
+        };
+
+        Ok(ProviderRunResult {
+            status: ProviderRunStatus::Success,
+            exit_code: Some(0),
+            result_payload: Some(ProviderResultPayload {
+                output_artifact: Some(payload),
+            }),
+            worker_ref_seed: Some(SessionRef {
+                provider: "claude-acp".to_string(),
+                mode: SessionMode::New,
+                supports_open_session: true,
+                supports_continue_session: true,
+                continue_ref: Some(serde_json::json!({"sessionId": format!("session-{}", *count)})),
+                open_command: Some(format!("claude -c session-{}", *count)),
+            }),
+            stream_path: None,
+            runtime_error: None,
+            runtime_control_output: None,
+        })
+    }
+
+    fn run_worker_with_callbacks(
+        &self,
+        req: WorkerInvocation,
+        _live_update: Option<sasuke::provider::AcpLiveUpdate<'_>>,
+        _session_update: Option<sasuke::provider::AcpSessionUpdate<'_>>,
+        prompt_accepted: Option<AcpPromptAccepted<'_>>,
+    ) -> anyhow::Result<ProviderRunResult> {
+        if let Some(callback) = prompt_accepted {
+            callback(req.resume_prompt_id.as_deref().unwrap_or("test-prompt"))?;
+        }
+        self.run_worker(req)
+    }
+
+    fn open_session(&self, _worker_ref: &sasuke::domain::SessionRef) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn build_continue_command(
+        &self,
+        worker_ref: &sasuke::domain::SessionRef,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(worker_ref.open_command.clone())
+    }
+}
+
+#[test]
+fn acceptance_loop_creates_new_round_and_commands_work() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-001";
+
+    let sasuke_home = repo_root.join("sasuke-home");
+    unsafe { std::env::set_var("SASUKE_HOME", sasuke_home.as_str()) };
+    let app = App::with_provider(repo_root.clone(), Box::new(LoopingProvider::default()))
+        .with_provider_diagnostics_source(std::sync::Arc::new(|| {
+            Ok(std::collections::BTreeMap::from([(
+                "claude-acp".to_string(),
+                ProviderDiagnosticSnapshot {
+                    available: true,
+                    reason: None,
+                    checked_at: "2026-08-16T00:00:00Z".to_string(),
+                    capabilities: None,
+                },
+            )]))
+        }));
+
+    std::fs::create_dir_all(app.paths.task_dir(task_id).join("authoring").as_std_path()).unwrap();
+    let profiles = app.profiles().unwrap();
+    let dev_profile = profiles
+        .profiles
+        .iter()
+        .find(|profile| profile.name == "开发")
+        .unwrap()
+        .id
+        .clone();
+    let accept_profile = profiles
+        .profiles
+        .iter()
+        .find(|profile| profile.name == "验收")
+        .unwrap()
+        .id
+        .clone();
+    std::fs::write(
+        app.paths.requirement_file(task_id).as_std_path(),
+        "Implement feature",
+    )
+    .unwrap();
+    std::fs::write(
+        app.paths.workflow_file(task_id).as_std_path(),
+        format!(
+            r#"{{
+          "version": "0.1",
+          "id": "full-flow",
+          "entry": "dev",
+          "control": {{ "max_attempts": 1 }},
+          "nodes": [
+            {{"id":"dev","type":"worker","provider":"claude-acp","profile":"{}","goal":"Implement the requirement","output":{{"kind":"json","artifact":"implementation-result"}}}},
+            {{"id":"accept","type":"worker","provider":"claude-acp","profile":"{}","output":{{"kind":"json","artifact":"accept-result","schema":{{"result":"boolean","reason":"String"}}}},"success_condition":{{"expression":"$.result == true"}}}}
+          ],
+          "edges": [
+            {{"from":"dev","to":"accept","on":"success"}},
+            {{"from":"accept","to":"$end","on":"success"}},
+            {{"from":"accept","to":"$new-round","on":"failure","new_round_entry":"$entry"}}
+          ]
+        }}"#,
+            dev_profile, accept_profile
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        app.paths.task_file(task_id).as_std_path(),
+        r#"{"version":"0.1","id":"task-001"}"#,
+    )
+    .unwrap();
+    let migrated = app.task_authoring_workflow(task_id).unwrap();
+    assert!(migrated.workflow.nodes.iter().all(|node| match node {
+        sasuke::dsl::NodeDsl::Worker(worker) => worker.execution_slot_id.is_some(),
+        sasuke::dsl::NodeDsl::AiDynamic(_) => true,
+    }));
+    assert_eq!(migrated.model_bindings.bindings.len(), 2);
+    let persisted: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(app.paths.workflow_file(task_id).as_std_path()).unwrap(),
+    )
+    .unwrap();
+    assert!(persisted.get("workflow").is_some());
+    assert_eq!(
+        persisted["modelBindings"]["bindings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.id, "run-001");
+
+    let continued = app.run_status(task_id, "run-001").unwrap();
+    assert_eq!(
+        continued.outcome,
+        Some(sasuke::domain::RunOutcome::Success)
+    );
+    assert!(
+        app.paths
+            .round_dir(task_id, "run-001", "round-002")
+            .exists()
+    );
+
+    let command = app
+        .run_open_session(task_id, "run-001", "round-002", "accept", "attempt-001")
+        .unwrap();
+    assert!(command.starts_with("claude -c session-"));
+
+    let artifacts = app
+        .artifact_list(task_id, "run-001", "round-002", "accept", "attempt-001")
+        .unwrap();
+    assert!(artifacts.iter().any(|name| name == "accept-result"));
+    assert!(
+        app.artifact_show(
+            task_id,
+            "run-001",
+            "round-002",
+            "accept",
+            "attempt-001",
+            "accept-result"
+        )
+        .unwrap()
+        .contains("accepted")
+    );
+    assert!(
+        app.artifact_show(
+            task_id,
+            "run-001",
+            "round-002",
+            "accept",
+            "attempt-001",
+            "accept-result.json"
+        )
+        .unwrap()
+        .contains("accepted")
+    );
+}
