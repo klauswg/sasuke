@@ -1,0 +1,3881 @@
+use camino::Utf8PathBuf;
+use sasuke::app::App;
+use sasuke::config::ProviderDiagnosticSnapshot;
+use sasuke::domain::{PauseReason, RunOutcome, RunStatus, SessionMode};
+use sasuke::dsl::WorkflowValidationError;
+use sasuke::dynamic::{
+    DynamicCompletionSchemaPolicy, DynamicGraphState, DynamicGroupStatus, DynamicNodeKind,
+    DynamicNodeStatus, DynamicProposalValidationStatus, DynamicRunStatus, WorkspaceStatus,
+    dynamic_completion_effective_schema,
+};
+use sasuke::provider::{
+    AcpContentBlock, AcpLiveUpdate, AcpPromptAccepted, AcpSessionUpdate, DoctorResult,
+    OutputArtifactPayload, OutputEmissionMode, PromptVisibility, ProviderAdapter,
+    ProviderCapabilities, ProviderInfo, ProviderResultPayload, ProviderRunResult,
+    ProviderRunStatus, SessionRef, UserPromptRenderMode, WorkerInvocation, render_prompt_bundle,
+};
+use sasuke::runtime_error::{
+    DEFAULT_AUTO_RETRY_MAX_ATTEMPTS, RuntimeErrorDomain, auto_runtime_error_info,
+};
+use serde_json::json;
+use std::sync::{Arc, Mutex};
+use tempfile::tempdir;
+
+#[derive(Clone)]
+enum DynamicScenario {
+    DirectEnd,
+    NewRoundFeedback,
+    NewRoundAfterResume,
+    Fanout,
+    WorktreeFanout,
+    NestedFanout,
+    AcceptanceContinuation {
+        nested: bool,
+        fanout: bool,
+        end_after_fanout: bool,
+    },
+    InvalidWorkflowInvocation,
+    SingleWorktreeRepair,
+    FanoutRepair,
+    MultiValidationRepair,
+    DirtyWorkspaceRepair,
+    DirtyWorkspaceNoCommit,
+    StaleFanoutRepair,
+    MergeAcceptanceProfileRepair,
+    ParseRepair,
+    MissingArtifactRepair,
+    SessionContinuePrompt,
+    InvalidSessionContinue,
+    ProviderRuntimeError,
+    MergePauseThenContinue,
+    WorkflowInvocation {
+        workflow_id: Arc<Mutex<String>>,
+    },
+    WorkflowInvocationPauseThenContinue {
+        workflow_id: Arc<Mutex<String>>,
+    },
+}
+
+#[derive(Clone)]
+struct DynamicProvider {
+    scenario: DynamicScenario,
+    invocations: Arc<Mutex<Vec<WorkerInvocation>>>,
+}
+
+impl DynamicProvider {
+    fn new(scenario: DynamicScenario) -> Self {
+        Self {
+            scenario,
+            invocations: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn fanout() -> Self {
+        Self::new(DynamicScenario::Fanout)
+    }
+
+    fn direct_end() -> Self {
+        Self::new(DynamicScenario::DirectEnd)
+    }
+
+    fn new_round_feedback() -> Self {
+        Self::new(DynamicScenario::NewRoundFeedback)
+    }
+
+    fn worktree_fanout() -> Self {
+        Self::new(DynamicScenario::WorktreeFanout)
+    }
+
+    fn nested_fanout() -> Self {
+        Self::new(DynamicScenario::NestedFanout)
+    }
+
+    fn invalid_workflow_invocation() -> Self {
+        Self::new(DynamicScenario::InvalidWorkflowInvocation)
+    }
+
+    fn single_worktree_repair() -> Self {
+        Self::new(DynamicScenario::SingleWorktreeRepair)
+    }
+
+    fn fanout_repair() -> Self {
+        Self::new(DynamicScenario::FanoutRepair)
+    }
+
+    fn multi_validation_repair() -> Self {
+        Self::new(DynamicScenario::MultiValidationRepair)
+    }
+
+    fn merge_acceptance_profile_repair() -> Self {
+        Self::new(DynamicScenario::MergeAcceptanceProfileRepair)
+    }
+
+    fn parse_repair() -> Self {
+        Self::new(DynamicScenario::ParseRepair)
+    }
+
+    fn missing_artifact_repair() -> Self {
+        Self::new(DynamicScenario::MissingArtifactRepair)
+    }
+
+    fn session_continue_prompt() -> Self {
+        Self::new(DynamicScenario::SessionContinuePrompt)
+    }
+
+    fn invalid_session_continue() -> Self {
+        Self::new(DynamicScenario::InvalidSessionContinue)
+    }
+
+    fn provider_runtime_error() -> Self {
+        Self::new(DynamicScenario::ProviderRuntimeError)
+    }
+
+    fn merge_pause_then_continue() -> Self {
+        Self::new(DynamicScenario::MergePauseThenContinue)
+    }
+
+    fn workflow_invocation(workflow_id: Arc<Mutex<String>>) -> Self {
+        Self::new(DynamicScenario::WorkflowInvocation { workflow_id })
+    }
+
+    fn workflow_invocation_pause_then_continue(workflow_id: Arc<Mutex<String>>) -> Self {
+        Self::new(DynamicScenario::WorkflowInvocationPauseThenContinue { workflow_id })
+    }
+}
+
+impl ProviderAdapter for DynamicProvider {
+    fn describe_provider(&self) -> ProviderInfo {
+        ProviderInfo {
+            provider_id: "fake".to_string(),
+            display_name: "Fake".to_string(),
+            capabilities: ProviderCapabilities {
+                supports_open_session: true,
+                supports_continue_session: true,
+                supports_system_prompt: true,
+                supports_raw_stream: false,
+            },
+            is_default: false,
+        }
+    }
+
+    fn doctor(&self) -> DoctorResult {
+        DoctorResult {
+            available: true,
+            reason: None,
+            capabilities: None,
+        }
+    }
+
+    fn run_worker(&self, req: WorkerInvocation) -> anyhow::Result<ProviderRunResult> {
+        self.run_worker_once(req)
+    }
+
+    fn run_worker_with_callbacks(
+        &self,
+        req: WorkerInvocation,
+        _live_update: Option<AcpLiveUpdate<'_>>,
+        _session_update: Option<AcpSessionUpdate<'_>>,
+        prompt_accepted: Option<AcpPromptAccepted<'_>>,
+    ) -> anyhow::Result<ProviderRunResult> {
+        let prompt_id = req
+            .resume_prompt_id
+            .as_deref()
+            .filter(|prompt_id| !prompt_id.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("acp.prompt-turn-id-required"))?;
+        if let Some(callback) = prompt_accepted {
+            callback(prompt_id)?;
+        }
+        if req.output_contract.as_ref().is_some_and(|contract| {
+            contract.emission_mode == OutputEmissionMode::PostTurnProjection
+        }) {
+            let resumed_control_turn = matches!(
+                req.user_prompt_render_mode,
+                UserPromptRenderMode::RuntimeFinalize | UserPromptRenderMode::RuntimeRepair
+            );
+            if !resumed_control_turn {
+                let work_result = self.run_worker_once(req.clone())?;
+                if work_result.runtime_error.is_some()
+                    || work_result.status != ProviderRunStatus::Success
+                {
+                    return Ok(work_result);
+                }
+            }
+
+            let mut finalize_req = req;
+            finalize_req
+                .output_contract
+                .as_mut()
+                .expect("post-turn projection requires output contract")
+                .emission_mode = OutputEmissionMode::InlineControl;
+            finalize_req.session_mode = SessionMode::Continue;
+            finalize_req.resume_prompt_visibility = PromptVisibility::Hidden;
+            finalize_req.task_input_attachment_paths.clear();
+            finalize_req.user_input_attachment_paths.clear();
+            if !resumed_control_turn {
+                finalize_req.resume_prompt = Some("finalize artifact".to_string());
+                finalize_req.resume_prompt_id = Some(format!(
+                    "artifact-finalize-{}",
+                    finalize_req.runtime_context.attempt_id
+                ));
+                finalize_req.user_prompt_render_mode = UserPromptRenderMode::RuntimeFinalize;
+            }
+            return self.run_worker_once(finalize_req);
+        }
+
+        self.run_worker_once(req)
+    }
+
+    fn open_session(&self, _worker_ref: &sasuke::domain::SessionRef) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn build_continue_command(
+        &self,
+        worker_ref: &sasuke::domain::SessionRef,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(worker_ref.open_command.clone())
+    }
+}
+
+fn with_available_claude_diagnostics(app: App) -> App {
+    app.with_provider_diagnostics_source(Arc::new(|| {
+        Ok(std::collections::BTreeMap::from([(
+            "claude-acp".to_string(),
+            ProviderDiagnosticSnapshot {
+                available: true,
+                reason: None,
+                checked_at: "2026-08-17T00:00:00Z".to_string(),
+                capabilities: None,
+            },
+        )]))
+    }))
+}
+
+impl DynamicProvider {
+    fn run_worker_once(&self, req: WorkerInvocation) -> anyhow::Result<ProviderRunResult> {
+        anyhow::ensure!(
+            req.resume_prompt_id
+                .as_deref()
+                .is_some_and(|prompt_id| !prompt_id.trim().is_empty()),
+            "acp.prompt-turn-id-required"
+        );
+        self.invocations.lock().unwrap().push(req.clone());
+        if let DynamicScenario::AcceptanceContinuation { nested, fanout, .. } = self.scenario {
+            let id = req.runtime_context.node_id.as_str();
+            if id.ends_with("-merge") || id.ends_with("-accept") {
+                std::fs::create_dir_all(&req.runtime_context.attachments_dir)?;
+                std::fs::write(
+                    req.runtime_context
+                        .attachments_dir
+                        .join(format!("{id}-report.md")),
+                    "group evidence",
+                )?;
+            }
+            if id == "after-group" || id == "next-0" || id == "next-1" {
+                let graph_path = req
+                    .runtime_context
+                    .attachments_dir
+                    .ancestors()
+                    .nth(4)
+                    .unwrap()
+                    .join("graph.json");
+                let graph: DynamicGraphState = sasuke::storage::read_json(&graph_path)?;
+                let exited_id = if nested {
+                    "group-branch-a"
+                } else {
+                    "group-core"
+                };
+                let exited = graph
+                    .groups
+                    .iter()
+                    .find(|group| group.id == exited_id)
+                    .unwrap();
+                assert_eq!(exited.status, DynamicGroupStatus::Closed);
+                for workspace_id in &exited.child_workspace_ids {
+                    assert_eq!(
+                        graph
+                            .workspaces
+                            .iter()
+                            .find(|workspace| &workspace.id == workspace_id)
+                            .unwrap()
+                            .status,
+                        WorkspaceStatus::Released
+                    );
+                }
+                if nested {
+                    let parent = graph
+                        .groups
+                        .iter()
+                        .find(|group| group.id == "group-core")
+                        .unwrap();
+                    assert_eq!(parent.status, DynamicGroupStatus::Open);
+                    assert!(parent.merge_node_id.is_none());
+                    assert!(
+                        !parent
+                            .terminal_node_ids
+                            .iter()
+                            .any(|terminal| terminal == "group-branch-a-accept"
+                                || terminal == "group-next-accept")
+                    );
+                }
+                let target = graph
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == exited.target_workspace_id)
+                    .unwrap();
+                assert_eq!(
+                    target.status,
+                    if id.starts_with("next-") {
+                        WorkspaceStatus::Frozen
+                    } else {
+                        WorkspaceStatus::Active
+                    }
+                );
+                if is_business_invocation(&req) {
+                    let prompt = render_prompt_bundle(&req)?;
+                    let evidence_group = if fanout && id == "after-group" {
+                        "group-next"
+                    } else {
+                        exited_id
+                    };
+                    assert!(
+                        prompt
+                            .user_prompt
+                            .contains(&format!("{evidence_group}-accept-report.md")),
+                        "{id} {:?}: {}",
+                        req.user_prompt_render_mode,
+                        prompt.user_prompt
+                    );
+                    assert!(
+                        prompt
+                            .user_prompt
+                            .contains(&format!("{evidence_group}-merge-report.md"))
+                    );
+                }
+            }
+        }
+        if matches!(self.scenario, DynamicScenario::ProviderRuntimeError) {
+            return Ok(ProviderRunResult {
+                status: ProviderRunStatus::Failure,
+                exit_code: None,
+                result_payload: None,
+                worker_ref_seed: None,
+                stream_path: None,
+                runtime_error: Some(auto_runtime_error_info(
+                    RuntimeErrorDomain::Provider,
+                    "provider.server-unavailable",
+                    "provider is temporarily unavailable",
+                    json!({}),
+                )),
+                runtime_control_output: None,
+            });
+        }
+        let (status, output_artifact) = match (
+            &self.scenario,
+            req.runtime_context.run_id.as_str(),
+            req.runtime_context.node_id.as_str(),
+            req.session_mode,
+        ) {
+            (DynamicScenario::NewRoundAfterResume, _, "bootstrap", SessionMode::New)
+                if req.runtime_context.round_id == "round-001"
+                    && self
+                        .invocations
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|invocation| {
+                            invocation.runtime_context.round_id == "round-001"
+                                && invocation.runtime_context.node_id == "bootstrap"
+                        })
+                        .count()
+                        == 1 =>
+            {
+                (ProviderRunStatus::Interrupted, None)
+            }
+            (
+                DynamicScenario::WorkflowInvocationPauseThenContinue { .. },
+                "run-002",
+                "child",
+                SessionMode::New,
+            ) => (ProviderRunStatus::Interrupted, None),
+            (DynamicScenario::MergePauseThenContinue, _, "group-core-merge", SessionMode::New) => {
+                (ProviderRunStatus::Interrupted, None)
+            }
+            _ => {
+                let output_artifact = match self.dynamic_artifact_for(&req) {
+                    Some(content) => Some(OutputArtifactPayload {
+                        name: req
+                            .output_contract
+                            .as_ref()
+                            .map(|contract| contract.artifact.clone())
+                            .unwrap_or_else(|| "dynamic-node-completion".to_string()),
+                        content,
+                    }),
+                    None => None,
+                };
+                (ProviderRunStatus::Success, output_artifact)
+            }
+        };
+
+        Ok(ProviderRunResult {
+            status,
+            exit_code: Some(0),
+            result_payload: Some(ProviderResultPayload { output_artifact }),
+            worker_ref_seed: Some(SessionRef {
+                provider: "claude-acp".to_string(),
+                mode: req.session_mode,
+                supports_open_session: true,
+                supports_continue_session: true,
+                continue_ref: Some(serde_json::json!({
+                    "sessionId": format!("{}-{}", req.runtime_context.node_id, req.runtime_context.attempt_id)
+                })),
+                open_command: Some(format!(
+                    "claude -c {}-{}",
+                    req.runtime_context.node_id, req.runtime_context.attempt_id
+                )),
+            }),
+            stream_path: None,
+            runtime_error: None,
+            runtime_control_output: if matches!(self.scenario, DynamicScenario::StaleFanoutRepair)
+                && req.runtime_context.node_id == "bootstrap"
+                && self
+                    .invocations
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|invocation| invocation.runtime_context.node_id == "bootstrap")
+                    .count()
+                    == 2
+            {
+                Some(sasuke::provider::RuntimeControlOutput {
+                    artifact_name: "dynamic-node-completion".to_string(),
+                    source: sasuke::acp::client::AcpPromptMessageSource {
+                        branch_id: "root".to_string(),
+                        item_id: "invalid-repair".to_string(),
+                    },
+                    span: sasuke::artifacts::json_artifact_display_span(
+                        "{\"kind\":\"dynamic-node-completion\"",
+                    )
+                    .unwrap(),
+                })
+            } else {
+                None
+            },
+        })
+    }
+
+    fn dynamic_artifact_for(&self, req: &WorkerInvocation) -> Option<String> {
+        if req.output_contract.is_none() {
+            return None;
+        }
+        let is_runtime_repair = req.user_prompt_render_mode == UserPromptRenderMode::RuntimeRepair;
+        let profile = req.profile.as_deref().unwrap_or("profile");
+        if let DynamicScenario::AcceptanceContinuation {
+            nested,
+            fanout,
+            end_after_fanout,
+        } = self.scenario
+        {
+            let id = req.runtime_context.node_id.as_str();
+            let exit = if nested {
+                "group-branch-a-accept"
+            } else {
+                "group-core-accept"
+            };
+            return Some(match id {
+                "bootstrap" => fanout_completion(profile),
+                "branch-a" if nested => nested_fanout_completion(profile),
+                id if id == exit && fanout => {
+                    let mut completion: serde_json::Value = serde_json::from_str(&fanout_completion(profile)).unwrap();
+                    completion["next"]["groupId"] = json!("group-next");
+                    for (index, node) in completion["next"]["nodes"].as_array_mut().unwrap().iter_mut().enumerate() {
+                        node["id"] = json!(format!("next-{index}"));
+                        node["dependsOn"] = json!([]);
+                    }
+                    completion.to_string()
+                }
+                "group-next-accept" if end_after_fanout => end_completion("continuation finished"),
+                id if id == exit || id == "group-next-accept" => json!({
+                    "version": "0.1", "kind": "dynamic-node-completion", "status": "success",
+                    "summary": "continue after acceptance", "next": { "type": "single", "node": {
+                        "id": "after-group", "kind": "worker", "title": "Continue", "task": "Finish remaining work"
+                    }}
+                }).to_string(),
+                "after-group" => end_completion("continuation finished"),
+                "group-core-accept" => end_completion("parent group accepted"),
+                _ => end_completion("branch done"),
+            });
+        }
+        match (&self.scenario, req.runtime_context.node_id.as_str()) {
+            (DynamicScenario::DirectEnd, "bootstrap") => Some(end_completion("outer handoff")),
+            (
+                DynamicScenario::NewRoundFeedback | DynamicScenario::NewRoundAfterResume,
+                "bootstrap",
+            ) => Some(if req.runtime_context.round_id == "round-001" {
+                end_completion("round handoff")
+            } else {
+                new_round_revision_completion()
+            }),
+            (
+                DynamicScenario::NewRoundFeedback | DynamicScenario::NewRoundAfterResume,
+                "revision",
+            ) => Some(end_completion("revision completed")),
+            (
+                DynamicScenario::NewRoundFeedback | DynamicScenario::NewRoundAfterResume,
+                "accept",
+            ) => Some(
+                if req.runtime_context.round_id == "round-001" {
+                    r#"{"result":false,"reason":"ROUND_ONE_REVISION_REQUIRED"}"#
+                } else {
+                    r#"{"result":true,"reason":"accepted"}"#
+                }
+                .to_string(),
+            ),
+            (DynamicScenario::Fanout, "bootstrap") => Some(fanout_completion(profile)),
+            (DynamicScenario::Fanout, "branch-a" | "branch-b") => {
+                Some(end_completion("branch done"))
+            }
+            (DynamicScenario::WorktreeFanout, "bootstrap") => {
+                Some(worktree_fanout_completion(profile))
+            }
+            (DynamicScenario::WorktreeFanout, "branch-a" | "branch-b") => {
+                std::fs::write(
+                    req.workspace_dir
+                        .join(format!("{}.txt", req.runtime_context.node_id)),
+                    format!("{} done", req.runtime_context.node_id),
+                )
+                .unwrap();
+                Some(end_completion("branch done"))
+            }
+            (DynamicScenario::NestedFanout, "bootstrap") => Some(fanout_completion(profile)),
+            (DynamicScenario::NestedFanout, "branch-a") => Some(nested_fanout_completion(profile)),
+            (DynamicScenario::NestedFanout, "branch-b" | "branch-a-1" | "branch-a-2") => {
+                Some(end_completion("branch done"))
+            }
+            (DynamicScenario::NestedFanout, "group-branch-a-accept") => {
+                Some(end_completion("child group accepted"))
+            }
+            (DynamicScenario::NestedFanout, "group-core-accept") => {
+                Some(end_completion("parent group accepted"))
+            }
+            (DynamicScenario::InvalidWorkflowInvocation, "bootstrap") => {
+                Some(invalid_workflow_invocation_completion(profile))
+            }
+            (DynamicScenario::SingleWorktreeRepair, "bootstrap") => {
+                if is_runtime_repair {
+                    Some(fanout_completion(profile))
+                } else {
+                    Some(single_worktree_completion())
+                }
+            }
+            (DynamicScenario::SingleWorktreeRepair, "branch-a" | "branch-b") => {
+                Some(end_completion("branch done"))
+            }
+            (DynamicScenario::FanoutRepair, "bootstrap") => {
+                if is_runtime_repair {
+                    Some(fanout_completion(profile))
+                } else {
+                    Some(too_many_fanout_branches_completion(profile))
+                }
+            }
+            (DynamicScenario::FanoutRepair, "branch-a" | "branch-b") => {
+                Some(end_completion("branch done"))
+            }
+            (DynamicScenario::MultiValidationRepair, "bootstrap") => {
+                if is_runtime_repair {
+                    Some(fanout_completion(profile))
+                } else {
+                    Some(invalid_profile_and_overflow_completion())
+                }
+            }
+            (DynamicScenario::DirtyWorkspaceRepair, "bootstrap") => {
+                if is_runtime_repair {
+                    fixture_git(&req.workspace_dir, &["add", "foundation.txt"]);
+                    fixture_git(
+                        &req.workspace_dir,
+                        &[
+                            "-c",
+                            "user.name=Test",
+                            "-c",
+                            "user.email=test@example.com",
+                            "commit",
+                            "-m",
+                            "feat: prepare foundation",
+                        ],
+                    );
+                    Some(fanout_completion(profile))
+                } else {
+                    std::fs::write(
+                        req.workspace_dir.join("foundation.txt"),
+                        "shared foundation\n",
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        req.workspace_dir.join("local-reference.txt"),
+                        "user reference\n",
+                    )
+                    .unwrap();
+                    Some(invalid_profile_and_overflow_completion())
+                }
+            }
+            (DynamicScenario::DirtyWorkspaceRepair, "branch-a" | "branch-b") => {
+                assert_eq!(
+                    std::fs::read_to_string(req.workspace_dir.join("foundation.txt"))
+                        .unwrap()
+                        .trim(),
+                    "shared foundation"
+                );
+                assert!(!req.workspace_dir.join("local-reference.txt").exists());
+                Some(end_completion("branch inherited committed foundation"))
+            }
+            (
+                DynamicScenario::DirtyWorkspaceNoCommit | DynamicScenario::StaleFanoutRepair,
+                "bootstrap",
+            ) => {
+                let count = self
+                    .invocations
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|invocation| invocation.runtime_context.node_id == "bootstrap")
+                    .count();
+                match count {
+                    1 => {
+                        std::fs::write(
+                            req.workspace_dir.join("local-reference.txt"),
+                            "user reference\n",
+                        )
+                        .unwrap();
+                        Some(fanout_completion(profile))
+                    }
+                    2 if matches!(self.scenario, DynamicScenario::StaleFanoutRepair) => None,
+                    2 => Some(invalid_profile_and_overflow_completion()),
+                    _ if matches!(self.scenario, DynamicScenario::StaleFanoutRepair) => {
+                        Some(end_completion("fresh completion after invalid repair"))
+                    }
+                    _ => Some(fanout_completion(profile)),
+                }
+            }
+            (DynamicScenario::MergeAcceptanceProfileRepair, "bootstrap") => {
+                if is_runtime_repair {
+                    Some(fanout_completion(profile))
+                } else {
+                    Some(merge_acceptance_profile_completion())
+                }
+            }
+            (DynamicScenario::ParseRepair, "bootstrap") => {
+                if is_runtime_repair {
+                    Some(fanout_completion(profile))
+                } else {
+                    Some(missing_merge_task_completion())
+                }
+            }
+            (DynamicScenario::MissingArtifactRepair, "bootstrap") => {
+                if is_runtime_repair {
+                    Some(fanout_completion(profile))
+                } else {
+                    Some(String::new())
+                }
+            }
+            (DynamicScenario::MissingArtifactRepair, "branch-a" | "branch-b") => {
+                Some(end_completion("branch done"))
+            }
+            (DynamicScenario::MultiValidationRepair, "branch-a" | "branch-b") => {
+                Some(end_completion("branch done"))
+            }
+            (DynamicScenario::DirtyWorkspaceNoCommit, "branch-a" | "branch-b") => {
+                Some(end_completion("branch uses existing baseline"))
+            }
+            (DynamicScenario::MergeAcceptanceProfileRepair, "branch-a" | "branch-b") => {
+                Some(end_completion("branch done"))
+            }
+            (DynamicScenario::ParseRepair, "branch-a" | "branch-b") => {
+                Some(end_completion("branch done"))
+            }
+            (DynamicScenario::SessionContinuePrompt, "bootstrap") => {
+                Some(session_continue_fanout_completion())
+            }
+            (DynamicScenario::SessionContinuePrompt, "branch-a") => {
+                Some(end_completion("branch A done"))
+            }
+            (DynamicScenario::SessionContinuePrompt, "branch-b") => {
+                Some(session_continue_single_completion())
+            }
+            (DynamicScenario::SessionContinuePrompt, "branch-c") => {
+                Some(end_completion("branch C done"))
+            }
+            (DynamicScenario::InvalidSessionContinue, "bootstrap") => {
+                Some(invalid_session_continue_completion())
+            }
+            (DynamicScenario::MergePauseThenContinue, "bootstrap") => {
+                Some(fanout_completion(profile))
+            }
+            (DynamicScenario::MergePauseThenContinue, "branch-a" | "branch-b") => {
+                Some(end_completion("branch done"))
+            }
+            (DynamicScenario::WorkflowInvocation { workflow_id }, "bootstrap")
+            | (DynamicScenario::WorkflowInvocationPauseThenContinue { workflow_id }, "bootstrap") =>
+            {
+                let workflow_id = workflow_id.lock().unwrap().clone();
+                Some(workflow_invocation_completion(&workflow_id))
+            }
+            (_, node_id) if node_id.ends_with("-accept") => Some(end_completion("accepted")),
+            _ => None,
+        }
+    }
+}
+
+fn fanout_completion(_profile: &str) -> String {
+    r#"{
+            "version": "0.1",
+            "kind": "dynamic-node-completion",
+            "status": "success",
+            "summary": "split into two branches",
+            "next": {
+                "type": "fanout",
+                "groupId": "group-core",
+                "nodes": [
+                    {
+                        "id": "branch-a",
+                        "kind": "worker",
+                        "title": "Branch A",
+                        "task": "Finish branch A",
+                        "profile": "pf-builtin-dev",
+                        "dependsOn": ["bootstrap"]
+                    },
+                    {
+                        "id": "branch-b",
+                        "kind": "worker",
+                        "title": "Branch B",
+                        "task": "Finish branch B",
+                        "profile": "pf-builtin-dev",
+                        "dependsOn": ["bootstrap"]
+                    }
+                ],
+                "merge": {
+                    "title": "Merge core",
+                    "task": "Merge branch outputs"
+                },
+                "acceptance": {
+                    "title": "Accept core",
+                    "task": "Accept merged branch outputs"
+                }
+            }
+        }"#
+    .to_string()
+}
+
+fn worktree_fanout_completion(_profile: &str) -> String {
+    r#"{
+            "version": "0.1",
+            "kind": "dynamic-node-completion",
+            "status": "success",
+            "summary": "split into two writable branches",
+            "next": {
+                "type": "fanout",
+                "groupId": "group-core",
+                "nodes": [
+                    {
+                        "id": "branch-a",
+                        "kind": "worker",
+                        "title": "Branch A",
+                        "task": "Write branch A",
+                        "profile": "pf-builtin-dev",
+                        "dependsOn": ["bootstrap"]
+                    },
+                    {
+                        "id": "branch-b",
+                        "kind": "worker",
+                        "title": "Branch B",
+                        "task": "Write branch B",
+                        "profile": "pf-builtin-dev",
+                        "dependsOn": ["bootstrap"]
+                    }
+                ],
+                "merge": {
+                    "title": "Merge writable branches",
+                    "task": "Merge branch worktrees"
+                },
+                "acceptance": {
+                    "title": "Accept writable branches",
+                    "task": "Accept merged branch worktrees"
+                }
+            }
+        }"#
+    .to_string()
+}
+
+fn nested_fanout_completion(_profile: &str) -> String {
+    r#"{
+            "version": "0.1",
+            "kind": "dynamic-node-completion",
+            "status": "success",
+            "summary": "split branch A into deeper work",
+            "next": {
+                "type": "fanout",
+                "groupId": "group-branch-a",
+                "nodes": [
+                    {
+                        "id": "branch-a-1",
+                        "kind": "worker",
+                        "title": "Branch A 1",
+                        "task": "Finish branch A part 1",
+                        "profile": "pf-builtin-dev",
+                        "dependsOn": ["branch-a"]
+                    },
+                    {
+                        "id": "branch-a-2",
+                        "kind": "worker",
+                        "title": "Branch A 2",
+                        "task": "Finish branch A part 2",
+                        "profile": "pf-builtin-dev",
+                        "dependsOn": ["branch-a"]
+                    }
+                ],
+                "merge": {
+                    "title": "Merge branch A",
+                    "task": "Merge branch A outputs"
+                },
+                "acceptance": {
+                    "title": "Accept branch A",
+                    "task": "Accept branch A outputs"
+                }
+            }
+        }"#
+    .to_string()
+}
+
+fn end_completion(summary: &str) -> String {
+    format!(
+        r#"{{
+            "version": "0.1",
+            "kind": "dynamic-node-completion",
+            "status": "success",
+            "summary": "{summary}",
+            "next": {{ "type": "end" }}
+        }}"#
+    )
+}
+
+fn new_round_revision_completion() -> String {
+    r#"{
+            "version": "0.1",
+            "kind": "dynamic-node-completion",
+            "status": "success",
+            "summary": "delegate the requested revision",
+            "next": {
+                "type": "single",
+                "node": {
+                    "id": "revision",
+                    "kind": "worker",
+                    "title": "Apply revision",
+                    "task": "Apply the previous Round acceptance feedback",
+                    "profile": "pf-builtin-dev",
+                    "dependsOn": ["bootstrap"]
+                }
+            }
+        }"#
+    .to_string()
+}
+
+fn invalid_workflow_invocation_completion(_profile: &str) -> String {
+    r#"{
+            "version": "0.1",
+            "kind": "dynamic-node-completion",
+            "status": "success",
+            "summary": "try unallowed workflow",
+            "next": {
+                "type": "single",
+                "node": {
+                    "id": "invoke-missing",
+                    "kind": "workflow-invocation",
+                    "title": "Invoke missing workflow",
+                    "task": "Run a workflow that is not allowed",
+                    "dependsOn": ["bootstrap"],
+                    "workflowId": "missing-workflow"
+                }
+            }
+        }"#
+    .to_string()
+}
+
+fn too_many_fanout_branches_completion(_profile: &str) -> String {
+    r#"{
+            "version": "0.1",
+            "kind": "dynamic-node-completion",
+            "status": "success",
+            "summary": "split into too many branches",
+            "next": {
+                "type": "fanout",
+                "groupId": "group-overflow",
+                "nodes": [
+                    {
+                        "id": "branch-a",
+                        "kind": "worker",
+                        "title": "Branch A",
+                        "task": "Finish branch A",
+                        "profile": "pf-builtin-dev",
+                        "dependsOn": ["bootstrap"]
+                    },
+                    {
+                        "id": "branch-b",
+                        "kind": "worker",
+                        "title": "Branch B",
+                        "task": "Finish branch B",
+                        "profile": "pf-builtin-dev",
+                        "dependsOn": ["bootstrap"]
+                    },
+                    {
+                        "id": "branch-c",
+                        "kind": "worker",
+                        "title": "Branch C",
+                        "task": "Finish branch C",
+                        "profile": "pf-builtin-dev",
+                        "dependsOn": ["bootstrap"]
+                    }
+                ],
+                "merge": {
+                    "title": "Merge overflow",
+                    "task": "Merge branch outputs"
+                },
+                "acceptance": {
+                    "title": "Accept overflow",
+                    "task": "Accept merged branch outputs"
+                }
+            }
+        }"#
+    .to_string()
+}
+
+fn invalid_profile_and_overflow_completion() -> String {
+    r#"{
+            "version": "0.1",
+            "kind": "dynamic-node-completion",
+            "status": "success",
+            "summary": "invalid split",
+            "next": {
+                "type": "fanout",
+                "groupId": "group-overflow",
+                "nodes": [
+                    {
+                        "id": "branch-a",
+                        "kind": "worker",
+                        "title": "Branch A",
+                        "task": "Finish branch A",
+                        "profile": "missing-profile",
+                        "dependsOn": ["bootstrap"]
+                    },
+                    {
+                        "id": "branch-b",
+                        "kind": "worker",
+                        "title": "Branch B",
+                        "task": "Finish branch B",
+                        "profile": "missing-profile",
+                        "dependsOn": ["bootstrap"]
+                    },
+                    {
+                        "id": "branch-c",
+                        "kind": "worker",
+                        "title": "Branch C",
+                        "task": "Finish branch C",
+                        "profile": "missing-profile",
+                        "dependsOn": ["bootstrap"]
+                    }
+                ],
+                "merge": {
+                    "title": "Merge overflow",
+                    "task": "Merge branch outputs"
+                },
+                "acceptance": {
+                    "title": "Accept overflow",
+                    "task": "Accept merged branch outputs"
+                }
+            }
+        }"#
+    .to_string()
+}
+
+fn merge_acceptance_profile_completion() -> String {
+    r#"{
+            "version": "0.1",
+            "kind": "dynamic-node-completion",
+            "status": "success",
+            "summary": "split into two branches with unsupported group profiles",
+            "next": {
+                "type": "fanout",
+                "groupId": "group-core",
+                "nodes": [
+                    {
+                        "id": "branch-a",
+                        "kind": "worker",
+                        "title": "Branch A",
+                        "task": "Finish branch A",
+                        "profile": "pf-builtin-dev",
+                        "dependsOn": ["bootstrap"]
+                    },
+                    {
+                        "id": "branch-b",
+                        "kind": "worker",
+                        "title": "Branch B",
+                        "task": "Finish branch B",
+                        "profile": "pf-builtin-dev",
+                        "dependsOn": ["bootstrap"]
+                    }
+                ],
+                "merge": {
+                    "title": "Merge core",
+                    "profile": "pf-builtin-review",
+                    "task": "Merge branch outputs"
+                },
+                "acceptance": {
+                    "title": "Accept core",
+                    "profile": "pf-builtin-accept",
+                    "task": "Accept merged branch outputs"
+                }
+            }
+        }"#
+    .to_string()
+}
+
+fn missing_merge_task_completion() -> String {
+    r#"{
+            "version": "0.1",
+            "kind": "dynamic-node-completion",
+            "status": "success",
+            "summary": "split into two branches with malformed merge spec",
+            "next": {
+                "type": "fanout",
+                "groupId": "group-core",
+                "nodes": [
+                    {
+                        "id": "branch-a",
+                        "kind": "worker",
+                        "title": "Branch A",
+                        "task": "Finish branch A",
+                        "profile": "pf-builtin-dev",
+                        "dependsOn": ["bootstrap"]
+                    },
+                    {
+                        "id": "branch-b",
+                        "kind": "worker",
+                        "title": "Branch B",
+                        "task": "Finish branch B",
+                        "profile": "pf-builtin-dev",
+                        "dependsOn": ["bootstrap"]
+                    }
+                ],
+                "merge": {
+                    "title": "Merge core"
+                },
+                "acceptance": {
+                    "title": "Accept core",
+                    "task": "Accept merged branch outputs"
+                }
+            }
+        }"#
+    .to_string()
+}
+
+fn session_continue_fanout_completion() -> String {
+    r#"{
+            "version": "0.1",
+            "kind": "dynamic-node-completion",
+            "status": "success",
+            "summary": "split into branches and leave one follow-up",
+            "next": {
+                "type": "fanout",
+                "groupId": "group-core",
+                "nodes": [
+                    {
+                        "id": "branch-a",
+                        "kind": "worker",
+                        "title": "Branch A",
+                        "task": "Finish branch A",
+                        "profile": "pf-builtin-dev",
+                        "dependsOn": ["bootstrap"]
+                    },
+                    {
+                        "id": "branch-b",
+                        "kind": "worker",
+                        "title": "Branch B",
+                        "task": "Finish branch B then continue same chat for final wrap-up",
+                        "profile": "pf-builtin-dev",
+                        "dependsOn": ["bootstrap"]
+                    }
+                ],
+                "merge": {
+                    "title": "Merge core",
+                    "task": "Merge branch outputs"
+                },
+                "acceptance": {
+                    "title": "Accept core",
+                    "task": "Accept merged branch outputs"
+                }
+            }
+        }"#
+    .to_string()
+}
+
+fn session_continue_single_completion() -> String {
+    r#"{
+            "version": "0.1",
+            "kind": "dynamic-node-completion",
+            "status": "success",
+            "summary": "continue branch B conversation into final wrap-up node",
+            "next": {
+                "type": "single",
+                "node": {
+                    "id": "branch-c",
+                    "kind": "worker",
+                    "title": "Branch C",
+                    "task": "Continue branch B conversation and wrap up remaining branch work",
+                    "profile": "pf-builtin-dev",
+                    "sessionMode": "continue",
+                    "continueFromNodeId": "branch-b",
+                    "dependsOn": ["branch-b"]
+                }
+            }
+        }"#
+    .to_string()
+}
+
+fn single_worktree_completion() -> String {
+    r#"{
+            "version": "0.1",
+            "kind": "dynamic-node-completion",
+            "status": "success",
+            "summary": "create one writable node",
+            "next": {
+                "type": "single",
+                "node": {
+                    "id": "single-write",
+                    "kind": "worker",
+                    "title": "Single Write",
+                    "task": "Write one change in an isolated worktree",
+                    "profile": "pf-builtin-dev",
+                    "workspace": { "mode": "worktree" },
+                    "dependsOn": ["bootstrap"]
+                }
+            }
+        }"#
+    .to_string()
+}
+
+fn invalid_session_continue_completion() -> String {
+    r#"{
+            "version": "0.1",
+            "kind": "dynamic-node-completion",
+            "status": "success",
+            "summary": "try invalid continue target",
+            "next": {
+                "type": "single",
+                "node": {
+                    "id": "child-flow-node",
+                    "kind": "workflow-invocation",
+                    "title": "Run child flow with invalid continue",
+                    "task": "Try to continue a workflow invocation session",
+                    "sessionMode": "continue",
+                    "continueFromNodeId": "bootstrap",
+                    "dependsOn": ["bootstrap"],
+                    "workflowId": "missing-workflow"
+                }
+            }
+        }"#
+    .to_string()
+}
+
+fn workflow_invocation_completion(workflow_id: &str) -> String {
+    format!(
+        r#"{{
+            "version": "0.1",
+            "kind": "dynamic-node-completion",
+            "status": "success",
+            "summary": "invoke allowed workflow",
+            "next": {{
+                "type": "single",
+                "node": {{
+                    "id": "child-flow-node",
+                    "kind": "workflow-invocation",
+                    "title": "Run child flow",
+                    "task": "Run child workflow from frozen snapshot",
+                    "dependsOn": ["bootstrap"],
+                    "workflowId": "{workflow_id}"
+                }}
+            }}
+        }}"#
+    )
+}
+
+fn first_profile_id(app: &App) -> String {
+    app.profiles().unwrap().profiles[0].id.clone()
+}
+
+fn write_task_file(app: &App, task_id: &str) {
+    if !app.paths.repo_root.join(".git").exists() {
+        init_git_repo(&app.paths.repo_root);
+    }
+    write_task_file_without_git(app, task_id);
+}
+
+fn write_task_file_without_git(app: &App, task_id: &str) {
+    std::fs::create_dir_all(app.paths.task_dir(task_id).join("authoring").as_std_path()).unwrap();
+    std::fs::write(
+        app.paths.requirement_file(task_id).as_std_path(),
+        "Exercise AI-DYNAMIC",
+    )
+    .unwrap();
+    std::fs::write(
+        app.paths.task_file(task_id).as_std_path(),
+        format!(r#"{{"version":"0.1","id":"{task_id}"}}"#),
+    )
+    .unwrap();
+}
+
+fn write_task_input_image(app: &App, task_id: &str, name: &str) -> Utf8PathBuf {
+    let inputs_dir = app.paths.task_dir(task_id).join("authoring").join("inputs");
+    std::fs::create_dir_all(inputs_dir.as_std_path()).unwrap();
+    let path = inputs_dir.join(name);
+    image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]))
+        .save(path.as_std_path())
+        .unwrap();
+    path
+}
+
+fn write_dynamic_workflow(app: &App, task_id: &str, _profile: &str, allowed_workflows: &str) {
+    write_dynamic_workflow_with_agent_strategy(
+        app,
+        task_id,
+        r#"{
+                            "mode": "fixed",
+                            "provider": "claude-acp",
+                            "model": "test-model"
+                        }"#,
+        allowed_workflows,
+    );
+}
+
+fn write_dynamic_workflow_with_successor(app: &App, task_id: &str) {
+    std::fs::write(
+        app.paths.workflow_file(task_id).as_std_path(),
+        r#"{
+            "version": "0.1",
+            "id": "dynamic-flow-with-successor",
+            "entry": "router",
+            "control": { "max_attempts": 1, "max_rounds": 1 },
+            "nodes": [
+                {
+                    "id": "router",
+                    "type": "ai-dynamic",
+                    "agentStrategy": {
+                        "mode": "fixed",
+                        "provider": "claude-acp",
+                        "model": "test-model"
+                    },
+                    "control": {
+                        "maxDynamicNodes": 10,
+                        "maxFanout": 2,
+                        "maxDepth": 4,
+                        "maxParallel": 2,
+                        "maxGroupDepth": 2,
+                        "maxWorkflowInvocations": 2,
+                        "allowNestedDynamic": false
+                    },
+                    "allowedWorkflows": []
+                },
+                {
+                    "id": "after",
+                    "type": "worker",
+                    "provider": "claude-acp",
+                    "profile": "pf-builtin-dev",
+                    "goal": "Consume the AI-DYNAMIC handoff"
+                }
+            ],
+            "edges": [
+                { "from": "router", "to": "after", "on": "success" },
+                { "from": "after", "to": "$end", "on": "success" }
+            ]
+        }"#,
+    )
+    .unwrap();
+}
+
+fn write_dynamic_workflow_with_new_round_feedback(app: &App, task_id: &str) {
+    std::fs::write(
+        app.paths.workflow_file(task_id).as_std_path(),
+        r#"{
+            "version": "0.1",
+            "id": "dynamic-flow-with-new-round-feedback",
+            "entry": "router",
+            "control": { "max_attempts": 1, "max_rounds": 1 },
+            "nodes": [
+                {
+                    "id": "router",
+                    "type": "ai-dynamic",
+                    "agentStrategy": {
+                        "mode": "fixed",
+                        "provider": "claude-acp",
+                        "model": "test-model"
+                    },
+                    "control": {
+                        "maxDynamicNodes": 10,
+                        "maxFanout": 2,
+                        "maxDepth": 4,
+                        "maxParallel": 2,
+                        "maxGroupDepth": 2,
+                        "maxWorkflowInvocations": 2,
+                        "allowNestedDynamic": false
+                    },
+                    "allowedWorkflows": []
+                },
+                {
+                    "id": "accept",
+                    "type": "worker",
+                    "provider": "claude-acp",
+                    "profile": "pf-builtin-accept",
+                    "goal": "Accept the AI-DYNAMIC result",
+                    "output": {
+                        "kind": "json",
+                        "artifact": "accept-result",
+                        "schema": { "result": "boolean", "reason": "String" }
+                    },
+                    "success_condition": { "expression": "$.result == true" }
+                }
+            ],
+            "edges": [
+                { "from": "router", "to": "accept", "on": "success" },
+                {
+                    "from": "accept",
+                    "to": "$new-round",
+                    "on": "failure",
+                    "new_round_entry": "router"
+                },
+                { "from": "accept", "to": "$end", "on": "success" }
+            ]
+        }"#,
+    )
+    .unwrap();
+}
+
+fn write_dynamic_workflow_with_agent_strategy(
+    app: &App,
+    task_id: &str,
+    agent_strategy: &str,
+    allowed_workflows: &str,
+) {
+    std::fs::write(
+        app.paths.workflow_file(task_id).as_std_path(),
+        format!(
+            r#"{{
+                "version": "0.1",
+                "id": "dynamic-flow",
+                "entry": "router",
+                "control": {{ "max_attempts": 1, "max_rounds": 1 }},
+                "nodes": [
+                    {{
+                        "id": "router",
+                        "type": "ai-dynamic",
+                        "agentStrategy": {agent_strategy},
+                        "control": {{
+                            "maxDynamicNodes": 10,
+                            "maxFanout": 2,
+                            "maxDepth": 4,
+                            "maxParallel": 2,
+                            "maxGroupDepth": 2,
+                            "maxWorkflowInvocations": 2,
+                            "allowNestedDynamic": false
+                        }},
+                        "allowedWorkflows": {allowed_workflows}
+                    }}
+                ],
+                "edges": [
+                    {{ "from": "router", "to": "$end", "on": "success" }}
+                ]
+            }}"#,
+            agent_strategy = agent_strategy,
+        ),
+    )
+    .unwrap();
+}
+
+fn dynamic_graph(app: &App, task_id: &str) -> DynamicGraphState {
+    sasuke::dynamic_store::load_dynamic_graph(
+        &app.paths
+            .dynamic_graph_file(task_id, "run-001", "round-001", "router", "attempt-001"),
+        &app.paths.repo_root,
+    )
+    .unwrap()
+}
+
+fn coordination_snapshot(app: &App, task_id: &str) -> serde_json::Value {
+    sasuke::storage::read_json(
+        &app.paths
+            .dynamic_dir(task_id, "run-001", "round-001", "router", "attempt-001")
+            .join("coordination-snapshot.json"),
+    )
+    .unwrap()
+}
+
+fn coordination_workstream<'a>(
+    snapshot: &'a serde_json::Value,
+    workstream_id: &str,
+) -> &'a serde_json::Value {
+    snapshot["workstreams"]
+        .as_array()
+        .expect("coordination snapshot must expose workstream-first TODOs")
+        .iter()
+        .find(|workstream| workstream["id"] == workstream_id)
+        .unwrap_or_else(|| panic!("missing coordination workstream `{workstream_id}`"))
+}
+
+fn coordination_group<'a>(
+    snapshot: &'a serde_json::Value,
+    group_id: &str,
+) -> &'a serde_json::Value {
+    snapshot["groups"]
+        .as_array()
+        .expect("coordination snapshot must expose groups")
+        .iter()
+        .find(|group| group["id"] == group_id)
+        .unwrap_or_else(|| panic!("missing coordination group `{group_id}`"))
+}
+
+fn json_string_array(value: &serde_json::Value) -> Vec<&str> {
+    value
+        .as_array()
+        .expect("expected a JSON string array")
+        .iter()
+        .map(|item| item.as_str().expect("expected a JSON string"))
+        .collect()
+}
+
+fn wait_for_invocation(
+    provider: &DynamicProvider,
+    node_id: &str,
+    render_mode: UserPromptRenderMode,
+) {
+    for _ in 0..1000 {
+        if provider
+            .invocations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|invocation| {
+                invocation.runtime_context.node_id == node_id
+                    && invocation.user_prompt_render_mode == render_mode
+            })
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("expected invocation for node `{node_id}` with render mode {render_mode:?}");
+}
+
+fn is_business_invocation(invocation: &WorkerInvocation) -> bool {
+    !matches!(
+        invocation.user_prompt_render_mode,
+        UserPromptRenderMode::RuntimeFinalize | UserPromptRenderMode::RuntimeRepair
+    )
+}
+
+fn init_git_repo(repo_root: &camino::Utf8Path) {
+    let init = sasuke::process::background_command("git")
+        .arg("-C")
+        .arg(repo_root.as_str())
+        .arg("init")
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+    std::fs::write(
+        repo_root.join(".git/info/exclude"),
+        "sasuke-home/\n.sasuke/\n",
+    )
+    .unwrap();
+    std::fs::write(repo_root.join("README.md"), "fixture").unwrap();
+    let add = sasuke::process::background_command("git")
+        .arg("-C")
+        .arg(repo_root.as_str())
+        .args(["add", "README.md"])
+        .output()
+        .unwrap();
+    assert!(add.status.success());
+    let commit = sasuke::process::background_command("git")
+        .arg("-C")
+        .arg(repo_root.as_str())
+        .args([
+            "-c",
+            "user.name=sasuke Test",
+            "-c",
+            "user.email=sasuke@example.test",
+            "commit",
+            "-m",
+            "initial",
+        ])
+        .output()
+        .unwrap();
+    assert!(commit.status.success());
+}
+
+fn fixture_git(repo: &camino::Utf8Path, args: &[&str]) -> String {
+    let output = sasuke::process::background_command("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+#[test]
+fn ai_dynamic_dirty_workspace_reminder_commits_only_delivery_and_forks_one_baseline() {
+    let temp = tempdir().unwrap();
+    let repo = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let provider = DynamicProvider::new(DynamicScenario::DirtyWorkspaceRepair);
+    let app = App::with_provider(repo.clone(), Box::new(provider.clone()));
+    let task = "task-dirty";
+    let profile = first_profile_id(&app);
+    write_task_file(&app, task);
+    write_dynamic_workflow(&app, task, &profile, "[]");
+    let run = app.run_start(task, None).unwrap();
+    assert_eq!(run.outcome, Some(RunOutcome::Success));
+    let graph = dynamic_graph(&app, task);
+    let rejected = graph
+        .proposals
+        .iter()
+        .find(|proposal| proposal.validation_status == DynamicProposalValidationStatus::Rejected)
+        .unwrap();
+    for code in [
+        "dynamic.fanout.workspace-dirty",
+        "dynamic.fanout.max-fanout-exceeded",
+        "dynamic.profile.unknown",
+    ] {
+        assert!(
+            rejected
+                .validation_errors
+                .iter()
+                .any(|error| error.code == code),
+            "missing {code}"
+        );
+    }
+    let invocations = provider.invocations.lock().unwrap();
+    let repairs = invocations
+        .iter()
+        .filter(|req| req.user_prompt_render_mode == UserPromptRenderMode::RuntimeRepair)
+        .collect::<Vec<_>>();
+    assert_eq!(repairs.len(), 1);
+    let prompt = repairs[0].resume_prompt.as_ref().unwrap();
+    for text in [
+        "dynamic.fanout.workspace-dirty",
+        "maxFanout",
+        "missing-profile",
+        "Conventional Commits",
+        "不要求工作区干净",
+    ] {
+        assert!(prompt.contains(text), "missing {text}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(repo.join("local-reference.txt")).unwrap(),
+        "user reference\n"
+    );
+    assert!(fixture_git(&repo, &["stash", "list"]).is_empty());
+    let heads = graph
+        .workspaces
+        .iter()
+        .filter(|workspace| workspace.parent_workspace_id.as_deref() == Some("workspace-main"))
+        .map(|workspace| workspace.fork_commit.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(heads.len(), 1);
+    assert_eq!(
+        fixture_git(
+            &repo,
+            &[
+                "show",
+                &format!("{}:foundation.txt", heads.iter().next().unwrap())
+            ]
+        ),
+        "shared foundation"
+    );
+}
+
+#[test]
+fn ai_dynamic_dirty_workspace_no_commit_is_allowed_but_protocol_still_repairs() {
+    let temp = tempdir().unwrap();
+    let repo = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let provider = DynamicProvider::new(DynamicScenario::DirtyWorkspaceNoCommit);
+    let app = App::with_provider(repo.clone(), Box::new(provider.clone()));
+    let task = "task-no-commit";
+    write_task_file(&app, task);
+    write_dynamic_workflow(&app, task, &first_profile_id(&app), "[]");
+    let baseline = fixture_git(&repo, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        app.run_start(task, None).unwrap().outcome,
+        Some(RunOutcome::Success)
+    );
+    let graph = dynamic_graph(&app, task);
+    assert_eq!(
+        graph
+            .proposals
+            .iter()
+            .filter(|proposal| proposal
+                .validation_errors
+                .iter()
+                .any(|error| error.code == "dynamic.fanout.workspace-dirty"))
+            .count(),
+        1
+    );
+    assert!(graph.proposals.iter().any(|proposal| {
+        proposal
+            .validation_errors
+            .iter()
+            .any(|error| error.code == "dynamic.profile.unknown")
+    }));
+    for workspace in graph
+        .workspaces
+        .iter()
+        .filter(|workspace| workspace.parent_workspace_id.is_some())
+    {
+        assert_eq!(workspace.fork_commit, baseline);
+    }
+    let invocations = provider.invocations.lock().unwrap();
+    let repairs = invocations
+        .iter()
+        .filter(|req| req.user_prompt_render_mode == UserPromptRenderMode::RuntimeRepair)
+        .collect::<Vec<_>>();
+    assert_eq!(repairs.len(), 2);
+    assert!(
+        repairs[0]
+            .resume_prompt
+            .as_ref()
+            .unwrap()
+            .contains("从HEAD开始创建worktree")
+    );
+    assert!(
+        !repairs[1]
+            .resume_prompt
+            .as_ref()
+            .unwrap()
+            .contains("dynamic.fanout.workspace-dirty")
+    );
+    assert_eq!(fixture_git(&repo, &["rev-parse", "HEAD"]), baseline);
+    assert!(repo.join("local-reference.txt").exists());
+    assert!(fixture_git(&repo, &["stash", "list"]).is_empty());
+}
+
+#[test]
+fn ai_dynamic_invalid_repair_cannot_accept_previous_fanout_artifact() {
+    let temp = tempdir().unwrap();
+    let repo = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let provider = DynamicProvider::new(DynamicScenario::StaleFanoutRepair);
+    let app = App::with_provider(repo, Box::new(provider.clone()));
+    let task = "task-fresh-artifact";
+    write_task_file(&app, task);
+    write_dynamic_workflow(&app, task, &first_profile_id(&app), "[]");
+    assert_eq!(
+        app.run_start(task, None).unwrap().outcome,
+        Some(RunOutcome::Success)
+    );
+    let graph = dynamic_graph(&app, task);
+    assert!(graph.groups.is_empty());
+    let accepted = graph
+        .proposals
+        .iter()
+        .find(|proposal| proposal.validation_status == DynamicProposalValidationStatus::Accepted)
+        .unwrap();
+    assert_eq!(
+        accepted.parsed["summary"],
+        "fresh completion after invalid repair"
+    );
+    let invocations = provider.invocations.lock().unwrap();
+    assert_eq!(invocations.len(), 3);
+    assert_eq!(
+        invocations[2].user_prompt_render_mode,
+        UserPromptRenderMode::RuntimeRepair
+    );
+}
+
+#[test]
+fn ai_dynamic_fanout_runs_merge_acceptance_and_persists_graph() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-fanout";
+    let provider = DynamicProvider::fanout();
+    let app = App::with_provider(repo_root, Box::new(provider.clone()));
+    let profile = first_profile_id(&app);
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(&app, task_id, &profile, "[]");
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(run.outcome, Some(RunOutcome::Success));
+
+    let graph = dynamic_graph(&app, task_id);
+    assert_eq!(
+        graph.run.status,
+        sasuke::dynamic::DynamicRunStatus::Completed
+    );
+    assert_eq!(graph.run.outcome, Some(RunOutcome::Success));
+    assert_eq!(graph.nodes.len(), 5);
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .all(|node| { node.status == DynamicNodeStatus::Completed && node.outcome.is_some() })
+    );
+    assert_eq!(graph.groups.len(), 1);
+    assert_eq!(graph.groups[0].status, DynamicGroupStatus::Closed);
+    assert_eq!(graph.groups[0].terminal_node_ids.len(), 2);
+    assert_eq!(graph.proposals.len(), 4);
+    assert!(graph.proposals.iter().all(|proposal| {
+        proposal.validation_status == DynamicProposalValidationStatus::Accepted
+    }));
+
+    let result_path = app.paths.artifact_file(
+        task_id,
+        "run-001",
+        "round-001",
+        "router",
+        "attempt-001",
+        "ai-dynamic-result",
+    );
+    let result: serde_json::Value = sasuke::storage::read_json(&result_path).unwrap();
+    assert_eq!(result["kind"], "ai-dynamic-result");
+    assert_eq!(result["summary"], "accepted");
+    assert_eq!(result["sourceNodeId"], "group-core-accept");
+    assert_eq!(result["sourceGroupId"], "group-core");
+    assert!(result.get("nodes").is_none());
+
+    let manifest_path = app.paths.artifact_file(
+        task_id,
+        "run-001",
+        "round-001",
+        "router",
+        "attempt-001",
+        "ai-dynamic-report-manifest",
+    );
+    assert_eq!(result["reportManifest"]["path"], manifest_path.as_str());
+    let manifest: serde_json::Value = sasuke::storage::read_json(&manifest_path).unwrap();
+    assert_eq!(manifest["kind"], "ai-dynamic-report-manifest");
+    assert_eq!(manifest["rootNodeId"], "bootstrap");
+    let manifest_nodes = manifest["nodes"].as_array().unwrap();
+    let bootstrap_report = manifest_nodes
+        .iter()
+        .find(|node| node["id"] == "bootstrap")
+        .unwrap();
+    assert_eq!(bootstrap_report["next"]["type"], "fanout");
+    assert_eq!(bootstrap_report["next"]["groupId"], "group-core");
+    let branch_report = manifest_nodes
+        .iter()
+        .find(|node| node["id"] == "branch-a")
+        .unwrap();
+    assert_eq!(branch_report["spawnedByNodeId"], "bootstrap");
+    assert_eq!(branch_report["next"]["type"], "end");
+    let merge_report = manifest_nodes
+        .iter()
+        .find(|node| node["id"] == "group-core-merge")
+        .unwrap();
+    assert_eq!(merge_report["spawnedByNodeId"], "bootstrap");
+    assert!(
+        merge_report["dependsOn"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node_id| node_id == "branch-a")
+    );
+    assert!(manifest["groups"].as_array().unwrap().iter().any(|group| {
+        group["id"] == "group-core"
+            && group["mergeNodeId"] == "group-core-merge"
+            && group["acceptanceNodeId"] == "group-core-accept"
+    }));
+
+    let dynamic_root =
+        app.paths
+            .dynamic_dir(task_id, "run-001", "round-001", "router", "attempt-001");
+    let coordination_path = dynamic_root.join("coordination-snapshot.json");
+    let coordination = coordination_snapshot(&app, task_id);
+    assert_eq!(coordination["kind"], "ai-dynamic-coordination-snapshot");
+    assert!(
+        coordination.get("nodes").is_none(),
+        "the runtime TODO projection must not duplicate the complete node history"
+    );
+    let workstreams = coordination["workstreams"]
+        .as_array()
+        .expect("coordination snapshot must expose workstream-first TODOs");
+    assert_eq!(workstreams.len(), 2);
+    assert!(
+        workstreams
+            .iter()
+            .all(|workstream| workstream["id"] != "bootstrap"),
+        "bootstrap is a control dispatcher, not a business workstream"
+    );
+    let branch_a_workstream = coordination_workstream(&coordination, "branch-a");
+    assert!(branch_a_workstream.get("parentWorkstreamId").is_none());
+    assert_eq!(branch_a_workstream["ownerGroupId"], "group-core");
+    assert_eq!(branch_a_workstream["title"], "Branch A");
+    assert_eq!(branch_a_workstream["goal"], "Finish branch A");
+    assert_eq!(branch_a_workstream["status"], "completed");
+    assert!(branch_a_workstream["workspace"]["path"].as_str().is_some());
+    let branch_a_steps = branch_a_workstream["steps"].as_array().unwrap();
+    assert_eq!(branch_a_steps.len(), 1);
+    assert_eq!(branch_a_steps[0]["nodeId"], "branch-a");
+    assert_eq!(branch_a_steps[0]["task"], "Finish branch A");
+    assert_eq!(branch_a_steps[0]["status"], "completed");
+    assert_eq!(branch_a_steps[0]["summary"], "branch done");
+
+    let group = coordination_group(&coordination, "group-core");
+    assert!(group.get("createdByWorkstreamId").is_none());
+    assert_eq!(
+        json_string_array(&group["branchWorkstreamIds"]),
+        vec!["branch-a", "branch-b"]
+    );
+    assert_eq!(group["phase"], "closed");
+    assert_eq!(group["merge"]["nodeId"], "group-core-merge");
+    assert_eq!(group["merge"]["status"], "completed");
+    assert_eq!(group["acceptance"]["nodeId"], "group-core-accept");
+    assert_eq!(group["acceptance"]["status"], "completed");
+    assert!(
+        workstreams.iter().all(|workstream| {
+            workstream["id"] != "group-core-merge" && workstream["id"] != "group-core-accept"
+        }),
+        "merge and acceptance are group phases, not business workstreams"
+    );
+
+    let invocations = provider.invocations.lock().unwrap();
+    let business_invocations = invocations
+        .iter()
+        .filter(|invocation| is_business_invocation(invocation))
+        .collect::<Vec<_>>();
+    let node_ids = business_invocations
+        .iter()
+        .map(|invocation| invocation.runtime_context.node_id.as_str())
+        .collect::<Vec<_>>();
+    let prompt_ids = business_invocations
+        .iter()
+        .map(|invocation| {
+            invocation
+                .resume_prompt_id
+                .as_deref()
+                .filter(|prompt_id| !prompt_id.trim().is_empty())
+                .expect("every AI-DYNAMIC business turn must have a stable prompt identity")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        prompt_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        prompt_ids.len(),
+        "distinct AI-DYNAMIC business turns must not share a prompt identity"
+    );
+    assert_eq!(node_ids[0], "bootstrap");
+    assert_eq!(node_ids[3], "group-core-merge");
+    assert_eq!(node_ids[4], "group-core-accept");
+    assert!(prompt_ids[3].starts_with("runtime-turn-"));
+    assert!(prompt_ids[4].starts_with("runtime-turn-"));
+    let branch_nodes = node_ids[1..3].to_vec();
+    assert!(branch_nodes.contains(&"branch-a"));
+    assert!(branch_nodes.contains(&"branch-b"));
+    let bootstrap = render_prompt_bundle(business_invocations[0]).unwrap();
+    assert!(!bootstrap.system_prompt.contains("dynamic-run-001"));
+    assert!(bootstrap.user_prompt.contains("dynamic-run-001"));
+    assert!(bootstrap.user_prompt.contains("bootstrap"));
+    assert!(bootstrap.user_prompt.contains("claude-acp"));
+    assert!(bootstrap.system_prompt.contains("dynamic-node-completion"));
+    assert!(
+        bootstrap
+            .user_prompt
+            .contains("# 需求\nExercise AI-DYNAMIC")
+    );
+    assert!(
+        bootstrap
+            .user_prompt
+            .contains("Design the first internal dynamic step")
+    );
+    let merge = render_prompt_bundle(business_invocations[3]).unwrap();
+    assert!(merge.user_prompt.contains("group-core"));
+    assert!(merge.user_prompt.contains("branch-a"));
+    assert!(merge.user_prompt.contains("branch-b"));
+
+    let coordination_path_text = coordination_path.as_str();
+    let bootstrap_hidden = business_invocations[0]
+        .extra_hidden_sections
+        .iter()
+        .map(|section| section.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!bootstrap_hidden.contains(coordination_path_text));
+    for branch_id in ["branch-a", "branch-b"] {
+        let branch = business_invocations
+            .iter()
+            .find(|invocation| invocation.runtime_context.node_id == branch_id)
+            .unwrap();
+        let branch_hidden = branch
+            .extra_hidden_sections
+            .iter()
+            .map(|section| section.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(branch_hidden.contains(&format!("- Dynamic 根目录：{dynamic_root}")));
+        assert!(
+            branch_hidden.contains("- 只读快照（相对 Dynamic 根目录）：coordination-snapshot.json")
+        );
+        assert_eq!(branch_hidden.matches(dynamic_root.as_str()).count(), 1);
+        assert!(!branch_hidden.contains(coordination_path_text));
+        let finalize_context = branch
+            .output_contract
+            .as_ref()
+            .and_then(|contract| contract.finalize_context.as_deref())
+            .expect("dynamic branch finalizer needs the coordination snapshot");
+        assert!(finalize_context.contains(&format!("- Dynamic 根目录：{dynamic_root}")));
+        assert!(
+            finalize_context
+                .contains("- 只读快照（相对 Dynamic 根目录）：coordination-snapshot.json")
+        );
+        assert_eq!(finalize_context.matches(dynamic_root.as_str()).count(), 1);
+        assert!(!finalize_context.contains(coordination_path_text));
+    }
+    let merge_invocation = business_invocations
+        .iter()
+        .find(|invocation| invocation.runtime_context.node_id == "group-core-merge")
+        .unwrap();
+    assert!(
+        !merge_invocation
+            .extra_hidden_sections
+            .iter()
+            .any(|section| section.content.contains("## Runtime 协调快照"))
+    );
+    let acceptance_invocation = business_invocations
+        .iter()
+        .find(|invocation| invocation.runtime_context.node_id == "group-core-accept")
+        .unwrap();
+    assert!(
+        !acceptance_invocation
+            .profile_content
+            .as_deref()
+            .unwrap()
+            .contains("如果当前 group 是顶层 group")
+    );
+    assert!(
+        acceptance_invocation
+            .output_contract
+            .as_ref()
+            .and_then(|contract| contract.schema_text.as_deref())
+            .is_some_and(|protocol| protocol.contains("完整业务交接摘要"))
+    );
+    assert!(
+        !acceptance_invocation
+            .extra_hidden_sections
+            .iter()
+            .any(|section| section.content.contains("## Runtime 协调快照"))
+    );
+    let acceptance_finalize_context = acceptance_invocation
+        .output_contract
+        .as_ref()
+        .and_then(|contract| contract.finalize_context.as_deref())
+        .expect("dynamic acceptance finalizer needs the coordination snapshot");
+    assert!(acceptance_finalize_context.contains(&format!("- Dynamic 根目录：{dynamic_root}")));
+    assert!(
+        acceptance_finalize_context
+            .contains("- 只读快照（相对 Dynamic 根目录）：coordination-snapshot.json")
+    );
+    assert_eq!(
+        acceptance_finalize_context
+            .matches(dynamic_root.as_str())
+            .count(),
+        1
+    );
+    assert!(!acceptance_finalize_context.contains(coordination_path_text));
+}
+
+#[test]
+fn ai_dynamic_without_groups_publishes_final_end_summary() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-direct-end";
+    let provider = DynamicProvider::direct_end();
+    let app = App::with_provider(repo_root, Box::new(provider));
+    let profile = first_profile_id(&app);
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(&app, task_id, &profile, "[]");
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    let result: serde_json::Value = sasuke::storage::read_json(&app.paths.artifact_file(
+        task_id,
+        "run-001",
+        "round-001",
+        "router",
+        "attempt-001",
+        "ai-dynamic-result",
+    ))
+    .unwrap();
+    assert_eq!(result["summary"], "outer handoff");
+    assert_eq!(result["sourceNodeId"], "bootstrap");
+    assert!(result.get("sourceGroupId").is_none());
+}
+
+#[test]
+fn ai_dynamic_inner_resume_does_not_leak_into_new_round() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-resume-scope";
+    let provider = DynamicProvider::new(DynamicScenario::NewRoundAfterResume);
+    let app = with_available_claude_diagnostics(App::with_provider(
+        repo_root,
+        Box::new(provider.clone()),
+    ));
+    write_task_file(&app, task_id);
+    write_dynamic_workflow_with_new_round_feedback(&app, task_id);
+    let paused = app.run_start(task_id, None).unwrap();
+    assert_eq!(paused.pause_reason, Some(PauseReason::ProcessInterrupted));
+    let run = {
+        app.run_continue_dynamic_inner_background(
+            task_id,
+            "run-001",
+            "round-001",
+            "router",
+            "attempt-001",
+            "bootstrap",
+            "attempt-001",
+            Some("original-resume-prompt".into()),
+            Some("ORIGINAL_RESUME_ONLY".to_string().into()),
+            Vec::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let run = app.run_status(task_id, "run-001").unwrap();
+            if run.status != RunStatus::Running {
+                break run;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resume driver did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
+    let events = std::fs::read_to_string(app.paths.run_events_file(task_id, "run-001")).unwrap();
+    assert_eq!(
+        run.status,
+        RunStatus::Completed,
+        "unexpected pause: {:?}; events: {events}",
+        run.pause_reason
+    );
+    assert_eq!(run.outcome, Some(RunOutcome::Success));
+    assert_eq!(run.new_rounds_opened, 1);
+    let invocations = provider.invocations.lock().unwrap();
+    let resumed = invocations
+        .iter()
+        .find(|req| {
+            req.runtime_context.round_id == "round-001"
+                && req.runtime_context.node_id == "bootstrap"
+                && req.user_prompt_render_mode == UserPromptRenderMode::UserMessage
+        })
+        .unwrap();
+    assert!(
+        resumed
+            .resume_prompt
+            .as_deref()
+            .unwrap_or_default()
+            .contains("ORIGINAL_RESUME_ONLY")
+    );
+    let fresh = invocations
+        .iter()
+        .find(|req| {
+            req.runtime_context.round_id == "round-002"
+                && req.runtime_context.node_id == "bootstrap"
+                && is_business_invocation(req)
+        })
+        .unwrap();
+    assert_eq!(fresh.session_mode, SessionMode::New);
+    for req in invocations.iter().filter(|req| {
+        req.runtime_context.round_id == "round-002" || req.runtime_context.node_id == "accept"
+    }) {
+        assert_ne!(
+            req.resume_prompt_id.as_deref(),
+            Some("original-resume-prompt")
+        );
+        assert!(
+            !req.resume_prompt
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ORIGINAL_RESUME_ONLY")
+        );
+        assert!(
+            !req.prompt_display
+                .as_ref()
+                .is_some_and(|input| input.display_text.contains("ORIGINAL_RESUME_ONLY"))
+        );
+    }
+}
+
+#[test]
+fn ai_dynamic_new_round_bootstrap_receives_acceptance_trigger_context() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-new-round-feedback";
+    let provider = DynamicProvider::new_round_feedback();
+    let app = with_available_claude_diagnostics(App::with_provider(
+        repo_root,
+        Box::new(provider.clone()),
+    ));
+    write_task_file(&app, task_id);
+    write_dynamic_workflow_with_new_round_feedback(&app, task_id);
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(run.outcome, Some(RunOutcome::Success));
+    assert_eq!(run.new_rounds_opened, 1);
+
+    let invocations = provider.invocations.lock().unwrap();
+    let round_two_bootstrap = invocations
+        .iter()
+        .find(|invocation| {
+            invocation.runtime_context.round_id == "round-002"
+                && invocation.runtime_context.node_id == "bootstrap"
+                && is_business_invocation(invocation)
+        })
+        .expect("the second round should execute the AI-DYNAMIC bootstrap");
+    let trigger = round_two_bootstrap
+        .new_round_trigger
+        .as_ref()
+        .expect("the second-round bootstrap must receive the first-round acceptance trigger");
+    assert_eq!(trigger.round_id, "round-001");
+    assert_eq!(trigger.node_id, "accept");
+    assert_eq!(trigger.attempt_id, "attempt-001");
+    assert_eq!(trigger.outcome.as_deref(), Some("failure"));
+    assert_eq!(trigger.branch_direction.as_deref(), Some("$new-round"));
+
+    let artifact = trigger
+        .output_artifact
+        .as_ref()
+        .expect("the acceptance trigger must expose its output artifact");
+    let expected_artifact_path = app.paths.artifact_file(
+        task_id,
+        "run-001",
+        "round-001",
+        "accept",
+        "attempt-001",
+        "accept-result",
+    );
+    assert_eq!(artifact.name, "accept-result");
+    assert_eq!(artifact.path, expected_artifact_path);
+    assert!(
+        artifact
+            .preview
+            .as_deref()
+            .is_some_and(|preview| preview.contains("ROUND_ONE_REVISION_REQUIRED")),
+        "the trigger must include the prior acceptance artifact preview"
+    );
+    let round_two_revision = invocations
+        .iter()
+        .find(|invocation| {
+            invocation.runtime_context.round_id == "round-002"
+                && invocation.runtime_context.node_id == "revision"
+                && is_business_invocation(invocation)
+        })
+        .expect("the second-round bootstrap should dispatch an internal revision worker");
+    assert!(round_two_revision.new_round_trigger.is_none());
+    let revision_prompt = render_prompt_bundle(round_two_revision).unwrap();
+    assert!(!revision_prompt.user_prompt.contains("$new-round"));
+    assert!(
+        !revision_prompt
+            .user_prompt
+            .contains("ROUND_ONE_REVISION_REQUIRED")
+    );
+    assert!(
+        invocations
+            .iter()
+            .filter(|invocation| {
+                invocation.runtime_context.round_id == "round-002"
+                    && invocation.runtime_context.node_id != "bootstrap"
+            })
+            .all(|invocation| invocation.new_round_trigger.is_none()),
+        "the outer trigger must not be broadcast beyond the AI-DYNAMIC bootstrap"
+    );
+
+    let rendered = render_prompt_bundle(round_two_bootstrap).unwrap();
+    assert!(rendered.user_prompt.contains("$new-round"));
+    assert!(
+        rendered
+            .user_prompt
+            .contains("round-001/accept/attempt-001")
+    );
+    assert!(
+        rendered
+            .user_prompt
+            .contains(expected_artifact_path.as_str())
+    );
+    assert!(rendered.user_prompt.contains("ROUND_ONE_REVISION_REQUIRED"));
+}
+
+#[test]
+fn ai_dynamic_successor_receives_public_handoff_artifact() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-successor";
+    let provider = DynamicProvider::fanout();
+    let app = with_available_claude_diagnostics(App::with_provider(
+        repo_root,
+        Box::new(provider.clone()),
+    ));
+    write_task_file(&app, task_id);
+    write_dynamic_workflow_with_successor(&app, task_id);
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+
+    let invocations = provider.invocations.lock().unwrap();
+    let successor = invocations
+        .iter()
+        .find(|invocation| invocation.runtime_context.node_id == "after")
+        .unwrap();
+    let handoff = successor.predecessors[0]
+        .output_artifact
+        .as_ref()
+        .expect("AI-DYNAMIC successor should receive the public handoff artifact");
+    assert_eq!(handoff.name, "ai-dynamic-result");
+    let preview = handoff.preview.as_deref().unwrap();
+    assert!(preview.contains("\"summary\": \"accepted\""));
+    assert!(preview.contains("ai-dynamic-report-manifest.json"));
+
+    let rendered = render_prompt_bundle(successor).unwrap();
+    assert!(
+        rendered
+            .user_prompt
+            .contains("## AI-DYNAMIC 完整报告清单（按需读取）")
+    );
+    assert!(rendered.user_prompt.contains("`reportManifest.path`"));
+    assert!(rendered.user_prompt.contains("节点/group 拓扑"));
+    assert!(rendered.user_prompt.contains("默认使用业务交接 `summary`"));
+}
+
+#[test]
+fn ai_dynamic_provider_runtime_error_does_not_enter_proposal_repair() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-provider-runtime-error";
+    let provider = DynamicProvider::provider_runtime_error();
+    let app = App::with_provider(repo_root, Box::new(provider.clone()));
+    let profile = first_profile_id(&app);
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(&app, task_id, &profile, "[]");
+
+    let run = app.run_start(task_id, None).unwrap();
+
+    assert_eq!(run.status, RunStatus::Paused);
+    assert_eq!(run.pause_reason, Some(PauseReason::RuntimeAbnormal));
+    let graph = dynamic_graph(&app, task_id);
+    assert_eq!(graph.run.status, DynamicRunStatus::Paused);
+    assert_eq!(graph.run.pause_reason, Some(PauseReason::RuntimeAbnormal));
+    let bootstrap = graph
+        .nodes
+        .iter()
+        .find(|node| node.id == "bootstrap")
+        .expect("bootstrap node");
+    assert_eq!(bootstrap.status, DynamicNodeStatus::Paused);
+    assert_eq!(bootstrap.pause_reason, Some(PauseReason::RuntimeAbnormal));
+    assert_eq!(
+        bootstrap
+            .runtime_error
+            .as_ref()
+            .map(|error| error.code.code.as_str()),
+        Some("provider.server-unavailable")
+    );
+
+    let invocations = provider.invocations.lock().unwrap();
+    assert_eq!(
+        invocations.len(),
+        (DEFAULT_AUTO_RETRY_MAX_ATTEMPTS + 1) as usize
+    );
+    assert!(
+        invocations
+            .iter()
+            .all(|invocation| invocation.session_mode == SessionMode::New)
+    );
+    assert!(
+        invocations
+            .iter()
+            .all(|invocation| invocation.resume_prompt.is_none())
+    );
+}
+
+#[test]
+fn ai_dynamic_merge_inner_continue_uses_user_message_render_mode() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-merge-pause-continue";
+    let provider = DynamicProvider::merge_pause_then_continue();
+    let app = App::with_provider(repo_root, Box::new(provider.clone()));
+    let profile = first_profile_id(&app);
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(&app, task_id, &profile, "[]");
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Paused);
+    assert_eq!(run.pause_reason, Some(PauseReason::ProcessInterrupted));
+
+    let graph = dynamic_graph(&app, task_id);
+    let merge = graph
+        .nodes
+        .iter()
+        .find(|node| node.id == "group-core-merge")
+        .unwrap();
+    assert_eq!(merge.status, DynamicNodeStatus::Paused);
+
+    app.run_continue_dynamic_inner_background(
+        task_id,
+        "run-001",
+        "round-001",
+        "router",
+        "attempt-001",
+        "group-core-merge",
+        "attempt-001",
+        Some("merge-resume-001".to_string()),
+        Some("继续".to_string().into()),
+        Vec::new(),
+        None,
+        None,
+    )
+    .unwrap();
+    wait_for_invocation(
+        &provider,
+        "group-core-merge",
+        UserPromptRenderMode::UserMessage,
+    );
+
+    let invocations = provider.invocations.lock().unwrap();
+    let merge_continue = invocations
+        .iter()
+        .find(|invocation| {
+            invocation.runtime_context.node_id == "group-core-merge"
+                && invocation.user_prompt_render_mode == UserPromptRenderMode::UserMessage
+        })
+        .unwrap();
+    assert_eq!(
+        merge_continue.user_prompt_render_mode,
+        UserPromptRenderMode::UserMessage
+    );
+    let resume_prompt = merge_continue.resume_prompt.as_deref().unwrap_or_default();
+    assert_eq!(resume_prompt.lines().next(), Some("继续"));
+    assert!(resume_prompt.contains("show=\"false\""));
+    assert!(resume_prompt.contains("请先完整执行本消息中的用户指令，然后继续完成你之前的任务"));
+    assert!(!resume_prompt.contains("artifact 输出约束"));
+    assert!(!resume_prompt.contains("后续独立 turn"));
+    assert!(!resume_prompt.contains("按当前输出契约输出 artifact"));
+    assert_eq!(
+        merge_continue.resume_prompt_id.as_deref(),
+        Some("merge-resume-001")
+    );
+
+    let prompt = render_prompt_bundle(merge_continue).unwrap();
+    assert_eq!(prompt.user_prompt.lines().next(), Some("继续"));
+    assert!(prompt.user_prompt.contains("data-sasuke-hidden"));
+    assert_eq!(prompt.display_text.as_deref(), Some("继续"));
+    assert!(!prompt.user_prompt.contains("# 目标"));
+    assert!(!prompt.user_prompt.contains("# Goal"));
+    assert!(!prompt.user_prompt.contains("# 用户提示"));
+    assert!(!prompt.user_prompt.contains("# User Tips"));
+    assert!(!prompt.user_prompt.contains("# 任务"));
+    assert!(!prompt.user_prompt.contains("# Task"));
+}
+
+#[test]
+fn ai_dynamic_run_rejects_non_git_workspace_before_provider() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-non-git-prompt";
+    let provider = DynamicProvider::fanout();
+    let app = App::with_provider(repo_root, Box::new(provider.clone()));
+    let profile = first_profile_id(&app);
+    write_task_file_without_git(&app, task_id);
+    write_dynamic_workflow(&app, task_id, &profile, "[]");
+
+    let error = app.run_start(task_id, None).unwrap_err();
+    assert_eq!(error.to_string(), "run.git-repository-required");
+    assert!(provider.invocations.lock().unwrap().is_empty());
+}
+
+#[test]
+fn ai_dynamic_worktree_fanout_is_rejected_before_provider_in_non_git_workspace() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-non-git-worktree-fanout";
+    let provider = DynamicProvider::worktree_fanout();
+    let app = App::with_provider(repo_root.clone(), Box::new(provider.clone()));
+    let profile = first_profile_id(&app);
+    write_task_file_without_git(&app, task_id);
+    write_dynamic_workflow(&app, task_id, &profile, "[]");
+
+    let error = app.run_start(task_id, None).unwrap_err();
+    assert_eq!(error.to_string(), "run.git-repository-required");
+    assert!(provider.invocations.lock().unwrap().is_empty());
+}
+
+#[test]
+fn ai_dynamic_rejects_single_worktree_even_when_git_supports_worktree() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().join("repo")).unwrap();
+    std::fs::create_dir_all(&repo_root).unwrap();
+    init_git_repo(&repo_root);
+    let task_id = "task-ai-dynamic-single-worktree";
+    let provider = DynamicProvider::single_worktree_repair();
+    let app = App::with_provider(repo_root, Box::new(provider.clone()));
+    let profile = first_profile_id(&app);
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(&app, task_id, &profile, "[]");
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(run.outcome, Some(RunOutcome::Success));
+
+    let graph = dynamic_graph(&app, task_id);
+    assert_eq!(
+        graph.proposals[0].validation_status,
+        DynamicProposalValidationStatus::Rejected
+    );
+    let error = graph.proposals[0]
+        .validation_errors
+        .iter()
+        .find(|error| error.code == "dynamic.schema.additional-property")
+        .expect("runtime-owned workspace field should be rejected by the schema");
+    assert_eq!(error.path.as_deref(), Some("next.node.workspace"));
+    assert_eq!(error.expected.as_deref(), Some("omit this field"));
+    assert!(graph.proposals.iter().any(|proposal| {
+        proposal.validation_status == DynamicProposalValidationStatus::Accepted
+    }));
+
+    let invocations = provider.invocations.lock().unwrap();
+    let repair_invocation = invocations
+        .iter()
+        .find(|invocation| {
+            invocation.user_prompt_render_mode == UserPromptRenderMode::RuntimeRepair
+        })
+        .unwrap();
+    let resume_prompt = repair_invocation.resume_prompt.as_deref().unwrap();
+    assert!(resume_prompt.contains("[dynamic.schema.additional-property]"));
+    assert!(resume_prompt.contains("path: next.node.workspace"));
+}
+
+#[test]
+fn ai_dynamic_worktree_fanout_injects_merge_workspace_metadata() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().join("repo")).unwrap();
+    std::fs::create_dir_all(&repo_root).unwrap();
+    init_git_repo(&repo_root);
+    let task_id = "task-ai-dynamic-worktree-fanout";
+    let provider = DynamicProvider::worktree_fanout();
+    let app = App::with_provider(repo_root.clone(), Box::new(provider.clone()));
+    let profile = first_profile_id(&app);
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(&app, task_id, &profile, "[]");
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(run.outcome, Some(RunOutcome::Success));
+
+    let graph = dynamic_graph(&app, task_id);
+    let branch_a = graph
+        .nodes
+        .iter()
+        .find(|node| node.id == "branch-a")
+        .unwrap();
+    let branch_b = graph
+        .nodes
+        .iter()
+        .find(|node| node.id == "branch-b")
+        .unwrap();
+    assert_ne!(branch_a.workspace_id, branch_b.workspace_id);
+    for branch in [branch_a, branch_b] {
+        let workspace = graph
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == branch.workspace_id)
+            .expect("fanout branch workspace should remain in the catalog");
+        assert!(workspace.checkpoint_commit.is_some());
+        assert_eq!(workspace.status, WorkspaceStatus::Released);
+        assert!(!workspace.path.exists());
+    }
+
+    let invocations = provider.invocations.lock().unwrap();
+    let merge_invocation = invocations
+        .iter()
+        .find(|invocation| invocation.runtime_context.node_id == "group-core-merge")
+        .unwrap();
+    let merge = render_prompt_bundle(merge_invocation).unwrap();
+    assert_eq!(merge_invocation.session_mode, SessionMode::New);
+    assert_eq!(
+        merge_invocation.user_prompt_render_mode,
+        UserPromptRenderMode::RequirementTask
+    );
+    assert!(merge.user_prompt.contains("# 需求"));
+    assert!(merge.user_prompt.contains("# 任务"));
+    assert!(!merge.user_prompt.contains("# 目标"));
+    assert!(merge.user_prompt.contains("branch workspaces"));
+    let branch_lines = merge
+        .user_prompt
+        .lines()
+        .filter(|line| line.contains("branch=gb-dyn-task-ai-dynamic-worktree-fanout-run-001-dyn-"))
+        .collect::<Vec<_>>();
+    assert_eq!(branch_lines.len(), 2);
+    assert_ne!(branch_lines[0], branch_lines[1]);
+    assert!(merge.user_prompt.contains("head="));
+    assert!(merge.user_prompt.contains("forkCommit="));
+    assert!(merge.user_prompt.contains("checkpointCommit="));
+    assert_eq!(merge.user_prompt.matches("status=clean").count(), 2);
+    assert!(merge.user_prompt.contains(repo_root.as_str()));
+}
+
+#[test]
+fn ai_dynamic_invocations_receive_task_input_attachments() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-input-attachments";
+    let provider = DynamicProvider::fanout();
+    let app = App::with_provider(repo_root, Box::new(provider.clone()));
+    let profile = first_profile_id(&app);
+    write_task_file(&app, task_id);
+    let image_path = write_task_input_image(&app, task_id, "image.png");
+    write_dynamic_workflow(&app, task_id, &profile, "[]");
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(run.outcome, Some(RunOutcome::Success));
+
+    let image_path_string = image_path.to_string();
+    let invocations = provider.invocations.lock().unwrap();
+    assert!(!invocations.is_empty());
+    assert!(
+        invocations
+            .iter()
+            .filter(|invocation| is_business_invocation(invocation))
+            .all(|invocation| {
+                invocation.task_input_attachment_paths == vec![image_path_string.clone()]
+                    && invocation.user_input_attachment_paths.is_empty()
+            })
+    );
+    assert!(
+        invocations
+            .iter()
+            .filter(|invocation| {
+                invocation.user_prompt_render_mode == UserPromptRenderMode::RuntimeFinalize
+            })
+            .all(|invocation| {
+                invocation.task_input_attachment_paths.is_empty()
+                    && invocation.user_input_attachment_paths.is_empty()
+            })
+    );
+    assert!(invocations.iter().all(|invocation| {
+        invocation
+            .runtime_context
+            .task_inputs_dir
+            .as_ref()
+            .map(|dir| dir == &app.paths.task_dir(task_id).join("authoring").join("inputs"))
+            .unwrap_or(false)
+    }));
+
+    let business_invocation = invocations
+        .iter()
+        .find(|invocation| is_business_invocation(invocation))
+        .expect("expected a business invocation");
+    let prompt = render_prompt_bundle(business_invocation).unwrap();
+    assert_eq!(prompt.attachment_metas.len(), 1);
+    assert_eq!(prompt.attachment_metas[0].name, "image.png");
+    assert_eq!(prompt.attachment_metas[0].path, "task-inputs/image.png");
+    match prompt.content_blocks.first() {
+        Some(AcpContentBlock::Image(block)) => {
+            let expected_uri = format!("file://{}", image_path_string.replace('\\', "/"));
+            assert_eq!(block.mime_type, "image/png");
+            assert_eq!(block.link.uri, expected_uri);
+        }
+        _ => panic!("expected image content block"),
+    }
+}
+
+#[test]
+fn ai_dynamic_nested_fanout_waits_for_child_group_before_parent_merge() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-nested-fanout";
+    let provider = DynamicProvider::nested_fanout();
+    let app = App::with_provider(repo_root, Box::new(provider.clone()));
+    let profile = first_profile_id(&app);
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(&app, task_id, &profile, "[]");
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(run.outcome, Some(RunOutcome::Success));
+
+    let result: serde_json::Value = sasuke::storage::read_json(&app.paths.artifact_file(
+        task_id,
+        "run-001",
+        "round-001",
+        "router",
+        "attempt-001",
+        "ai-dynamic-result",
+    ))
+    .unwrap();
+    assert_eq!(result["summary"], "parent group accepted");
+    assert_eq!(result["sourceNodeId"], "group-core-accept");
+
+    let graph = dynamic_graph(&app, task_id);
+    assert_eq!(graph.groups.len(), 2);
+    let parent = graph
+        .groups
+        .iter()
+        .find(|group| group.id == "group-core")
+        .unwrap();
+    let child = graph
+        .groups
+        .iter()
+        .find(|group| group.id == "group-branch-a")
+        .unwrap();
+    assert_eq!(parent.status, DynamicGroupStatus::Closed);
+    assert_eq!(parent.parent_group_id, None);
+    assert_eq!(child.status, DynamicGroupStatus::Closed);
+    assert_eq!(child.parent_group_id.as_deref(), Some("group-core"));
+    assert_eq!(child.depth, 2);
+    assert!(
+        parent
+            .terminal_node_ids
+            .iter()
+            .any(|node_id| node_id == "group-branch-a-accept")
+    );
+    assert!(
+        parent
+            .terminal_node_ids
+            .iter()
+            .any(|node_id| node_id == "branch-b")
+    );
+    let parent_merge = graph
+        .nodes
+        .iter()
+        .find(|node| node.id == "group-core-merge")
+        .unwrap();
+    assert!(
+        parent_merge
+            .depends_on
+            .iter()
+            .any(|node_id| node_id == "group-branch-a-accept")
+    );
+    assert!(
+        parent_merge
+            .depends_on
+            .iter()
+            .any(|node_id| node_id == "branch-b")
+    );
+
+    let invocations = provider.invocations.lock().unwrap();
+    let child_acceptance = invocations
+        .iter()
+        .find(|invocation| {
+            invocation.runtime_context.node_id == "group-branch-a-accept"
+                && is_business_invocation(invocation)
+        })
+        .unwrap();
+    assert!(
+        child_acceptance
+            .output_contract
+            .as_ref()
+            .and_then(|contract| contract.schema_text.as_deref())
+            .is_some_and(|protocol| protocol.contains("内部进度/分支报告"))
+    );
+    let parent_acceptance = invocations
+        .iter()
+        .find(|invocation| {
+            invocation.runtime_context.node_id == "group-core-accept"
+                && is_business_invocation(invocation)
+        })
+        .unwrap();
+    assert!(
+        parent_acceptance
+            .output_contract
+            .as_ref()
+            .and_then(|contract| contract.schema_text.as_deref())
+            .is_some_and(|protocol| protocol.contains("完整业务交接摘要"))
+    );
+    let node_ids = invocations
+        .iter()
+        .map(|invocation| invocation.runtime_context.node_id.as_str())
+        .collect::<Vec<_>>();
+    let child_accept_position = node_ids
+        .iter()
+        .position(|node_id| *node_id == "group-branch-a-accept")
+        .unwrap();
+    let parent_merge_position = node_ids
+        .iter()
+        .position(|node_id| *node_id == "group-core-merge")
+        .unwrap();
+    assert!(child_accept_position < parent_merge_position);
+
+    let coordination = coordination_snapshot(&app, task_id);
+    let workstreams = coordination["workstreams"].as_array().unwrap();
+    assert_eq!(workstreams.len(), 4);
+    let branch_a = coordination_workstream(&coordination, "branch-a");
+    assert!(branch_a.get("parentWorkstreamId").is_none());
+    assert_eq!(branch_a["ownerGroupId"], "group-core");
+    for child_id in ["branch-a-1", "branch-a-2"] {
+        let child_workstream = coordination_workstream(&coordination, child_id);
+        assert_eq!(child_workstream["parentWorkstreamId"], "branch-a");
+        assert_eq!(child_workstream["ownerGroupId"], "group-branch-a");
+        assert_eq!(child_workstream["status"], "completed");
+    }
+    let child_group = coordination_group(&coordination, "group-branch-a");
+    assert_eq!(child_group["parentGroupId"], "group-core");
+    assert_eq!(child_group["createdByWorkstreamId"], "branch-a");
+    assert_eq!(
+        json_string_array(&child_group["branchWorkstreamIds"]),
+        vec!["branch-a-1", "branch-a-2"]
+    );
+    assert_eq!(child_group["phase"], "closed");
+    assert!(workstreams.iter().all(|workstream| {
+        !matches!(
+            workstream["id"].as_str(),
+            Some(
+                "group-branch-a-merge"
+                    | "group-branch-a-accept"
+                    | "group-core-merge"
+                    | "group-core-accept"
+            )
+        )
+    }));
+}
+
+#[test]
+fn ai_dynamic_acceptance_continues_single_at_top_level() {
+    assert_acceptance_continuation(false, false, false);
+}
+
+#[test]
+fn ai_dynamic_acceptance_continues_fanout_at_top_level() {
+    assert_acceptance_continuation(false, true, false);
+}
+
+#[test]
+fn ai_dynamic_acceptance_continues_single_in_parent_branch() {
+    assert_acceptance_continuation(true, false, false);
+}
+
+#[test]
+fn ai_dynamic_acceptance_continues_fanout_in_parent_branch() {
+    assert_acceptance_continuation(true, true, false);
+}
+
+#[test]
+fn ai_dynamic_acceptance_fanout_end_terminates_top_level_chain() {
+    assert_acceptance_continuation(false, true, true);
+}
+
+#[test]
+fn ai_dynamic_acceptance_fanout_end_terminates_parent_branch() {
+    assert_acceptance_continuation(true, true, true);
+}
+
+fn assert_acceptance_continuation(nested: bool, fanout: bool, end_after_fanout: bool) {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-group-continuation";
+    let provider = DynamicProvider::new(DynamicScenario::AcceptanceContinuation {
+        nested,
+        fanout,
+        end_after_fanout,
+    });
+    let app = App::with_provider(repo_root, Box::new(provider.clone()));
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(&app, task_id, &first_profile_id(&app), "[]");
+    let workflow_path = app.paths.workflow_file(task_id);
+    let mut workflow: serde_json::Value = sasuke::storage::read_json(&workflow_path).unwrap();
+    workflow["nodes"][0]["control"]["maxDynamicNodes"] = json!(24);
+    workflow["nodes"][0]["control"]["maxDepth"] = json!(20);
+    workflow["nodes"][0]["control"]["maxGroupDepth"] = json!(if nested { 2 } else { 1 });
+    sasuke::storage::write_json(&workflow_path, &workflow).unwrap();
+
+    let run = app.run_start(task_id, None).unwrap();
+    let graph = dynamic_graph(&app, task_id);
+    let exited_id = if nested {
+        "group-branch-a"
+    } else {
+        "group-core"
+    };
+    let exited = graph
+        .groups
+        .iter()
+        .find(|group| group.id == exited_id)
+        .unwrap();
+    assert_eq!(
+        exited.status,
+        DynamicGroupStatus::Closed,
+        "acceptance must close the old group before continuing"
+    );
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(run.outcome, Some(RunOutcome::Success));
+    if !end_after_fanout {
+        let successor = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == "after-group")
+            .unwrap();
+        assert_eq!(
+            successor.group_id.as_deref(),
+            nested.then_some("group-core")
+        );
+        assert_eq!(
+            successor.chain_id,
+            if nested { "branch-a" } else { "bootstrap" }
+        );
+        assert_eq!(successor.workspace_id, exited.target_workspace_id);
+    }
+    assert!(!graph.nodes.iter().any(|node| node.id.ends_with("-merge-2")));
+    if fanout {
+        let next = graph
+            .groups
+            .iter()
+            .find(|group| group.id == "group-next")
+            .unwrap();
+        assert_eq!(
+            next.parent_group_id.as_deref(),
+            nested.then_some("group-core")
+        );
+        assert_eq!(next.depth, if nested { 2 } else { 1 });
+        assert_eq!(next.created_by_node_id, format!("{exited_id}-accept"));
+    }
+    if nested {
+        let terminal_id = if end_after_fanout {
+            "group-next-accept"
+        } else {
+            "after-group"
+        };
+        let parent = graph
+            .groups
+            .iter()
+            .find(|group| group.id == "group-core")
+            .unwrap();
+        assert!(parent.terminal_node_ids.iter().any(|id| id == terminal_id));
+        assert!(
+            !parent
+                .terminal_node_ids
+                .iter()
+                .any(|id| id == "group-branch-a-accept"
+                    || (!end_after_fanout && id == "group-next-accept"))
+        );
+        let invocations = provider.invocations.lock().unwrap();
+        let after = invocations
+            .iter()
+            .rposition(|req| req.runtime_context.node_id == terminal_id)
+            .unwrap();
+        let merge = invocations
+            .iter()
+            .position(|req| req.runtime_context.node_id == "group-core-merge")
+            .unwrap();
+        assert!(after < merge, "parent merge must wait for the continuation");
+    }
+    let _: serde_json::Value = coordination_snapshot(&app, task_id);
+    let result: serde_json::Value = sasuke::storage::read_json(&app.paths.artifact_file(
+        task_id,
+        "run-001",
+        "round-001",
+        "router",
+        "attempt-001",
+        "ai-dynamic-result",
+    ))
+    .unwrap();
+    assert_eq!(
+        result["summary"],
+        if nested {
+            "parent group accepted"
+        } else {
+            "continuation finished"
+        }
+    );
+}
+
+#[test]
+fn ai_dynamic_rejects_unallowed_workflow_invocation() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-invalid";
+    let provider = DynamicProvider::invalid_workflow_invocation();
+    let app = App::with_provider(repo_root, Box::new(provider));
+    let profile = first_profile_id(&app);
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(&app, task_id, &profile, "[]");
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Paused);
+    assert_eq!(run.outcome, None);
+    assert_eq!(run.pause_reason, Some(PauseReason::ErrorBlocked));
+
+    let graph = dynamic_graph(&app, task_id);
+    assert_eq!(graph.proposals.len(), 4);
+    assert_eq!(
+        graph.proposals.last().unwrap().validation_status,
+        DynamicProposalValidationStatus::Rejected
+    );
+    assert_eq!(
+        graph.proposals.last().unwrap().validation_errors[0].code,
+        "dynamic.workflow-invocation.workflow-unallowed"
+    );
+    assert!(
+        graph.proposals.last().unwrap().validation_errors[0]
+            .message
+            .contains("references unallowed workflow")
+    );
+}
+
+#[test]
+fn ai_dynamic_rejects_allowed_workflow_with_duplicate_workflow_id() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let app = App::new(repo_root);
+    let workflows_path = app.paths.workflow_templates_file();
+    std::fs::create_dir_all(workflows_path.parent().unwrap().as_std_path()).unwrap();
+    std::fs::write(
+        workflows_path.as_std_path(),
+        format!(
+            r#"{{
+                "version": "0.1",
+                "lastUsedTemplateId": "template-b",
+                "lastCreatedWorkflow": null,
+                "templates": [
+                    {{
+                        "id": "default",
+                        "name": "默认工作流",
+                        "workflow": {{
+                            "version": "0.1",
+                            "id": "task-workflow",
+                            "entry": "plan",
+                            "control": {{}},
+                            "nodes": [
+                                {{ "id": "plan", "type": "worker", "provider": "claude-acp", "profile": "pf-builtin-plan", "goal": "Plan" }}
+                            ],
+                            "edges": [{{ "from": "plan", "to": "$end", "on": "success" }}]
+                        }},
+                        "createdAt": "2026-05-31T00:00:00Z",
+                        "updatedAt": "2026-05-31T00:00:00Z"
+                    }},
+                    {{
+                        "id": "template-a",
+                        "name": "Template A",
+                        "workflow": {{
+                            "version": "0.1",
+                            "id": "shared-workflow",
+                            "entry": "child",
+                            "control": {{}},
+                            "nodes": [
+                                {{ "id": "child", "type": "worker", "provider": "claude-acp", "profile": "pf-builtin-dev", "goal": "Run child work" }}
+                            ],
+                            "edges": [{{ "from": "child", "to": "$end", "on": "success" }}]
+                        }},
+                        "createdAt": "2026-05-31T00:00:00Z",
+                        "updatedAt": "2026-05-31T00:00:00Z"
+                    }},
+                    {{
+                        "id": "template-b",
+                        "name": "Template B",
+                        "workflow": {{
+                            "version": "0.1",
+                            "id": "shared-workflow",
+                            "entry": "child",
+                            "control": {{}},
+                            "nodes": [
+                                {{ "id": "child", "type": "worker", "provider": "claude-acp", "profile": "pf-builtin-dev", "goal": "Run child work again" }}
+                            ],
+                            "edges": [{{ "from": "child", "to": "$end", "on": "success" }}]
+                        }},
+                        "createdAt": "2026-05-31T00:00:00Z",
+                        "updatedAt": "2026-05-31T00:00:00Z"
+                    }}
+                ]
+            }}"#
+        ),
+    )
+    .unwrap();
+
+    let invalid_parent = serde_json::from_str(&format!(
+        r#"{{
+            "version": "0.1",
+            "id": "parent-flow",
+            "entry": "router",
+            "nodes": [
+                {{
+                    "id": "router",
+                    "type": "ai-dynamic",
+                    "provider": "claude-acp",
+                    "control": {{
+                        "maxDynamicNodes": 10,
+                        "maxFanout": 2,
+                        "maxDepth": 4,
+                        "maxParallel": 2,
+                        "maxGroupDepth": 1,
+                        "maxWorkflowInvocations": 2,
+                        "allowNestedDynamic": false
+                    }},
+                    "allowedWorkflows": [{{ "workflowId": "shared-workflow" }}]
+                }}
+            ],
+            "edges": [
+                {{ "from": "router", "to": "$end", "on": "success" }}
+            ]
+        }}"#,
+    ))
+    .unwrap();
+
+    let err = app
+        .save_workflow_template("Parent".to_string(), invalid_parent)
+        .unwrap_err();
+    let typed = err.downcast_ref::<WorkflowValidationError>().unwrap();
+    match typed {
+        WorkflowValidationError::AiDynamicInvalidWorkflow {
+            node_id,
+            workflow_name,
+            reason,
+        } => {
+            assert_eq!(node_id, "router");
+            assert_eq!(workflow_name, "Template A");
+            assert!(reason.contains("shared-workflow"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn ai_dynamic_repairs_over_limit_fanout_before_pausing() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-fanout-repair";
+    let provider = DynamicProvider::fanout_repair();
+    let app = App::with_provider(repo_root, Box::new(provider.clone()));
+    let profile = first_profile_id(&app);
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(&app, task_id, &profile, "[]");
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(run.outcome, Some(RunOutcome::Success));
+
+    let graph = dynamic_graph(&app, task_id);
+    assert!(graph.proposals.len() >= 2);
+    assert_eq!(
+        graph.proposals[0].validation_status,
+        DynamicProposalValidationStatus::Rejected
+    );
+    assert_eq!(
+        graph.proposals[0].validation_errors[0].code,
+        "dynamic.fanout.max-fanout-exceeded"
+    );
+    assert!(
+        graph.proposals[0].validation_errors[0]
+            .message
+            .contains("maxFanout")
+    );
+    assert!(graph.proposals.iter().any(|proposal| {
+        proposal.validation_status == DynamicProposalValidationStatus::Accepted
+    }));
+
+    let invocations = provider.invocations.lock().unwrap();
+    assert!(
+        invocations
+            .iter()
+            .any(|invocation| invocation.session_mode == SessionMode::Continue)
+    );
+    let repair_invocation = invocations
+        .iter()
+        .find(|invocation| invocation.session_mode == SessionMode::Continue)
+        .unwrap();
+    assert!(
+        repair_invocation
+            .resume_prompt
+            .as_deref()
+            .unwrap()
+            .contains("maxFanout")
+    );
+    assert!(
+        repair_invocation
+            .resume_prompt
+            .as_deref()
+            .unwrap()
+            .contains("remaining dynamic nodes")
+    );
+}
+
+#[test]
+fn ai_dynamic_repairs_multiple_validation_errors_in_one_retry() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-multi-repair";
+    let provider = DynamicProvider::multi_validation_repair();
+    let app = App::with_provider(repo_root, Box::new(provider.clone()));
+    let profile = first_profile_id(&app);
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(&app, task_id, &profile, "[]");
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(run.outcome, Some(RunOutcome::Success));
+
+    let graph = dynamic_graph(&app, task_id);
+    assert!(graph.proposals.len() >= 2);
+    assert_eq!(
+        graph.proposals[0].validation_status,
+        DynamicProposalValidationStatus::Rejected
+    );
+    assert!(
+        graph.proposals[0]
+            .validation_errors
+            .iter()
+            .any(|error| error.code == "dynamic.fanout.max-fanout-exceeded")
+    );
+    assert!(
+        graph.proposals[0]
+            .validation_errors
+            .iter()
+            .any(|error| error.code == "dynamic.profile.unknown"
+                && error.message.contains("unknown profile `missing-profile`"))
+    );
+    assert!(graph.proposals.iter().any(|proposal| {
+        proposal.validation_status == DynamicProposalValidationStatus::Accepted
+    }));
+
+    let invocations = provider.invocations.lock().unwrap();
+    let repair_invocation = invocations
+        .iter()
+        .find(|invocation| invocation.session_mode == SessionMode::Continue)
+        .unwrap();
+    let resume_prompt = repair_invocation.resume_prompt.as_deref().unwrap();
+    assert!(resume_prompt.contains("maxFanout"));
+    assert!(resume_prompt.contains("unknown profile `missing-profile`"));
+    assert!(resume_prompt.contains("allowed values:"));
+    assert!(resume_prompt.contains("Available worker profile IDs:"));
+}
+
+#[test]
+fn ai_dynamic_rejects_merge_acceptance_profile_fields() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-group-profile-repair";
+    let provider = DynamicProvider::merge_acceptance_profile_repair();
+    let app = App::with_provider(repo_root, Box::new(provider.clone()));
+    let profile = first_profile_id(&app);
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(&app, task_id, &profile, "[]");
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(run.outcome, Some(RunOutcome::Success));
+
+    let graph = dynamic_graph(&app, task_id);
+    assert_eq!(
+        graph.proposals[0].validation_status,
+        DynamicProposalValidationStatus::Rejected
+    );
+    assert!(graph.proposals[0].validation_errors.iter().any(|error| {
+        error.code == "dynamic.merge.profile.unsupported"
+            && error.path.as_deref() == Some("next.merge.profile")
+            && error.expected.as_deref() == Some("omit this field")
+    }));
+    assert!(graph.proposals[0].validation_errors.iter().any(|error| {
+        error.code == "dynamic.acceptance.profile.unsupported"
+            && error.path.as_deref() == Some("next.acceptance.profile")
+            && error.expected.as_deref() == Some("omit this field")
+    }));
+
+    let invocations = provider.invocations.lock().unwrap();
+    let repair_invocation = invocations
+        .iter()
+        .find(|invocation| invocation.session_mode == SessionMode::Continue)
+        .unwrap();
+    let resume_prompt = repair_invocation.resume_prompt.as_deref().unwrap();
+    assert!(resume_prompt.contains("path: next.merge.profile"));
+    assert!(resume_prompt.contains("expected: omit this field"));
+}
+
+#[test]
+fn ai_dynamic_parse_repair_prompt_includes_json_path() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-parse-repair";
+    let provider = DynamicProvider::parse_repair();
+    let app = App::with_provider(repo_root, Box::new(provider.clone()));
+    let profile = first_profile_id(&app);
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(&app, task_id, &profile, "[]");
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(run.outcome, Some(RunOutcome::Success));
+
+    let invocations = provider.invocations.lock().unwrap();
+    let repair_invocation = invocations
+        .iter()
+        .find(|invocation| invocation.session_mode == SessionMode::Continue)
+        .unwrap();
+    let resume_prompt = repair_invocation.resume_prompt.as_deref().unwrap();
+    assert!(resume_prompt.contains("[dynamic.schema.required]"));
+    assert!(resume_prompt.contains("path: next.merge.task"));
+}
+
+#[test]
+fn ai_dynamic_repairs_missing_completion_without_empty_artifact() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-missing-artifact-repair";
+    let provider = DynamicProvider::missing_artifact_repair();
+    let app = App::with_provider(repo_root, Box::new(provider.clone()));
+    let profile = first_profile_id(&app);
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(&app, task_id, &profile, "[]");
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(run.outcome, Some(RunOutcome::Success));
+
+    let invocations = provider.invocations.lock().unwrap();
+    let repair_invocation = invocations
+        .iter()
+        .find(|invocation| invocation.session_mode == SessionMode::Continue)
+        .unwrap();
+    let resume_prompt = repair_invocation.resume_prompt.as_deref().unwrap();
+    assert!(resume_prompt.contains("did not produce dynamic-node-completion"));
+
+    let artifact_path = app.paths.dynamic_node_artifact_file(
+        task_id,
+        "run-001",
+        "round-001",
+        "router",
+        "attempt-001",
+        "bootstrap",
+        "attempt-001",
+        "dynamic-node-completion",
+    );
+    let metadata = std::fs::metadata(artifact_path.as_std_path()).unwrap();
+    assert!(metadata.len() > 0);
+}
+
+#[test]
+fn ai_dynamic_effective_schema_reflects_runtime_policy() {
+    let schema = dynamic_completion_effective_schema(&DynamicCompletionSchemaPolicy {
+        provider_required: false,
+        node_model_required: false,
+        agent_task_model_required: false,
+        agent_task_model_visible: true,
+        provider_ids: vec!["claude-acp".to_string()],
+        model_names: Vec::new(),
+        profile_ids: vec!["pf-builtin-dev".to_string()],
+        workflow_ids: vec!["child-flow".to_string()],
+        max_fanout: 2,
+    });
+
+    assert!(schema.pointer("/properties/source").is_none());
+    assert_eq!(
+        schema.pointer("/definitions/DynamicNext/properties/nodes/maxItems"),
+        Some(&json!(2))
+    );
+    assert_eq!(
+        schema.pointer("/definitions/DynamicNext/properties/nodes/minItems"),
+        Some(&json!(2))
+    );
+    assert_eq!(
+        schema.pointer("/definitions/DynamicNodeSpec/allOf/0/if/properties/kind/enum/0"),
+        Some(&json!("worker"))
+    );
+    assert_eq!(
+        schema.pointer("/definitions/DynamicNodeSpec/allOf/0/then/properties/provider"),
+        Some(&json!(false))
+    );
+    assert_eq!(
+        schema.pointer("/definitions/DynamicAgentTaskSpec/allOf/0/properties/provider"),
+        Some(&json!(false))
+    );
+    assert_eq!(
+        schema.pointer("/definitions/DynamicNodeSpec/properties/profile/enum/0"),
+        Some(&json!("pf-builtin-dev"))
+    );
+    assert_eq!(
+        schema.pointer("/definitions/DynamicNodeSpec/properties/workflowId/enum/0"),
+        Some(&json!("child-flow"))
+    );
+}
+
+#[test]
+fn ai_dynamic_effective_schema_hides_agent_task_model_when_acceptance_model_is_configured() {
+    let schema = dynamic_completion_effective_schema(&DynamicCompletionSchemaPolicy {
+        provider_required: true,
+        node_model_required: true,
+        agent_task_model_required: false,
+        agent_task_model_visible: false,
+        provider_ids: vec!["claude-acp".to_string()],
+        model_names: vec!["worker-model-a".to_string()],
+        profile_ids: vec!["pf-builtin-dev".to_string()],
+        workflow_ids: vec![],
+        max_fanout: 2,
+    });
+
+    assert_eq!(
+        schema.pointer("/definitions/DynamicNodeSpec/properties/model/type"),
+        Some(&json!("string"))
+    );
+    assert_eq!(
+        schema.pointer("/definitions/DynamicAgentTaskSpec/properties/model"),
+        None
+    );
+}
+
+#[test]
+fn ai_dynamic_lists_resumable_session_nodes_and_uses_continue_session() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-session-continue";
+    let provider = DynamicProvider::session_continue_prompt();
+    let app = App::with_provider(repo_root, Box::new(provider.clone()));
+    let profile = first_profile_id(&app);
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(&app, task_id, &profile, "[]");
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(run.outcome, Some(RunOutcome::Success));
+
+    let graph = dynamic_graph(&app, task_id);
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|node| node.id == "branch-c" && node.session_mode == SessionMode::Continue)
+    );
+    assert!(
+        graph.nodes.iter().any(|node| node.id == "branch-c"
+            && node.continue_from_node_id.as_deref() == Some("branch-b"))
+    );
+
+    let invocations = provider.invocations.lock().unwrap();
+    let branch_b = render_prompt_bundle(
+        invocations
+            .iter()
+            .find(|invocation| invocation.runtime_context.node_id == "branch-b")
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(branch_b.user_prompt.contains("branch-a"));
+    assert!(branch_b.user_prompt.contains("branch-b"));
+    assert!(!branch_b.system_prompt.contains("bootstrap title="));
+    let branch_c = invocations
+        .iter()
+        .find(|invocation| invocation.runtime_context.node_id == "branch-c")
+        .unwrap();
+    assert_eq!(branch_c.session_mode, SessionMode::Continue);
+    assert!(branch_c.continue_ref.is_some());
+
+    let coordination = coordination_snapshot(&app, task_id);
+    let workstreams = coordination["workstreams"].as_array().unwrap();
+    assert_eq!(workstreams.len(), 2);
+    assert!(
+        workstreams
+            .iter()
+            .all(|workstream| workstream["id"] != "branch-c"),
+        "a single successor must remain a step in its source workstream"
+    );
+    let branch_b_workstream = coordination_workstream(&coordination, "branch-b");
+    assert!(branch_b_workstream.get("parentWorkstreamId").is_none());
+    assert_eq!(branch_b_workstream["ownerGroupId"], "group-core");
+    assert_eq!(branch_b_workstream["status"], "completed");
+    assert!(branch_b_workstream["workspace"]["path"].as_str().is_some());
+    let steps = branch_b_workstream["steps"].as_array().unwrap();
+    assert_eq!(
+        steps
+            .iter()
+            .map(|step| step["nodeId"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["branch-b", "branch-c"]
+    );
+    assert_eq!(steps[0]["status"], "completed");
+    assert_eq!(
+        steps[0]["summary"],
+        "continue branch B conversation into final wrap-up node"
+    );
+    assert_eq!(steps[1]["status"], "completed");
+    assert_eq!(steps[1]["summary"], "branch C done");
+}
+
+#[test]
+fn ai_dynamic_continue_prompt_bundle_preserves_prompt_id() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-prompt-id";
+    let provider = DynamicProvider::session_continue_prompt();
+    let app = App::with_provider(repo_root, Box::new(provider));
+    let profile = first_profile_id(&app);
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(&app, task_id, &profile, "[]");
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+
+    let graph = dynamic_graph(&app, task_id);
+    let branch_b = graph
+        .nodes
+        .iter()
+        .find(|node| node.id == "branch-b")
+        .unwrap();
+    let branch_b_workspace = graph
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == branch_b.workspace_id)
+        .unwrap();
+    let continue_ref = serde_json::json!({ "sessionId": "branch-b-attempt-001" });
+    let prepared_prompt = app
+        .prepare_dynamic_acp_prompt_for_attempt(
+            task_id,
+            "run-001",
+            "round-001",
+            "router",
+            "attempt-001",
+            "branch-b",
+            "attempt-001",
+            "继续".to_string(),
+            Some("acp-prompt-test".to_string()),
+            Some(continue_ref),
+        )
+        .unwrap();
+    assert_eq!(prepared_prompt.adapter_workspace_dir, app.paths.repo_root);
+    assert_eq!(
+        prepared_prompt.session_workspace_dir,
+        branch_b_workspace.path
+    );
+    let prompt = prepared_prompt.prompt;
+
+    assert_eq!(prompt.user_prompt, "继续");
+    assert!(prompt.system_prompt.contains("用户主动打断当前工作"));
+    assert!(prompt.system_prompt.contains("角色预设的执行流程"));
+    assert!(!prompt.user_prompt.contains("sasuke runtime context"));
+    assert_eq!(prompt.prompt_id.as_deref(), Some("acp-prompt-test"));
+}
+
+#[test]
+fn ai_dynamic_rejects_continue_target_outside_resumable_range() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-invalid-session-continue";
+    let provider = DynamicProvider::invalid_session_continue();
+    let app = App::with_provider(repo_root, Box::new(provider));
+    let profile = first_profile_id(&app);
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(&app, task_id, &profile, "[]");
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Paused);
+    assert_eq!(run.pause_reason, Some(PauseReason::ErrorBlocked));
+
+    let graph = dynamic_graph(&app, task_id);
+    assert!(graph.proposals.iter().any(|proposal| {
+        proposal
+            .validation_errors
+            .iter()
+            .any(|error| error.code == "dynamic.node.session.workflow-invocation-disallowed")
+    }));
+}
+
+#[test]
+fn ai_dynamic_workflow_invocation_pause_and_continue_resume_child_run() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-child-pause";
+    let workflow_id = Arc::new(Mutex::new(String::new()));
+    let provider = DynamicProvider::workflow_invocation_pause_then_continue(workflow_id.clone());
+    let app = with_available_claude_diagnostics(App::with_provider(
+        repo_root,
+        Box::new(provider.clone()),
+    ));
+    let profile = first_profile_id(&app);
+
+    let store = app
+        .save_workflow_template(
+            "Child Flow".to_string(),
+            serde_json::from_str(&format!(
+                r#"{{
+                    "version": "0.1",
+                    "id": "child-flow",
+                    "entry": "child",
+                    "nodes": [
+                        {{
+                            "id": "child",
+                            "type": "worker",
+                            "provider": "claude-acp",
+                            "profile": "pf-builtin-dev",
+                            "goal": "Run child work"
+                        }}
+                    ],
+                    "edges": [
+                        {{ "from": "child", "to": "$end", "on": "success" }}
+                    ]
+                }}"#
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    let child_template = store
+        .templates
+        .iter()
+        .find(|template| template.name == "Child Flow")
+        .unwrap();
+    *workflow_id.lock().unwrap() = child_template.workflow.id.clone();
+
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(
+        &app,
+        task_id,
+        &profile,
+        &format!(r#"[{{ "workflowId": "{}" }}]"#, child_template.workflow.id),
+    );
+
+    let paused = app.run_start(task_id, None).unwrap();
+    assert_eq!(paused.status, RunStatus::Paused);
+    assert_eq!(paused.pause_reason, Some(PauseReason::ProcessInterrupted));
+
+    let graph = dynamic_graph(&app, task_id);
+    assert_eq!(graph.run.status, DynamicRunStatus::Paused);
+    assert_eq!(
+        graph.run.pause_reason,
+        Some(PauseReason::ProcessInterrupted)
+    );
+    let invocation_node = graph
+        .nodes
+        .iter()
+        .find(|node| node.id == "child-flow-node")
+        .unwrap();
+    assert_eq!(invocation_node.status, DynamicNodeStatus::Paused);
+    assert_eq!(invocation_node.outcome, None);
+    assert_eq!(invocation_node.child_run_id.as_deref(), Some("run-002"));
+
+    let child_run: sasuke::runtime::RunState =
+        sasuke::storage::read_json(&app.paths.run_file(task_id, "run-002")).unwrap();
+    assert_eq!(child_run.status, RunStatus::Paused);
+    assert_eq!(
+        child_run.pause_reason,
+        Some(PauseReason::ProcessInterrupted)
+    );
+
+    let durable_parent = app.run_status(task_id, "run-001").unwrap();
+    let parent_round: sasuke::runtime::RoundState =
+        sasuke::storage::read_json(&app.paths.round_file(task_id, "run-001", "round-001"))
+            .unwrap();
+    let parent_node: sasuke::runtime::NodeState = sasuke::storage::read_json(
+        &app.paths
+            .node_file(task_id, "run-001", "round-001", "router", "attempt-001"),
+    )
+    .unwrap();
+    assert_eq!(durable_parent.status, RunStatus::Paused);
+    assert_eq!(parent_round.status, RunStatus::Paused);
+    assert_eq!(parent_node.status, RunStatus::Paused);
+    assert_eq!(parent_node.runtime_execution_id, None);
+    assert_eq!(
+        durable_parent.execution.phase,
+        sasuke::runtime::RuntimeExecutionPhase::Paused
+    );
+    let locator = durable_parent.execution.locator.as_ref().unwrap();
+    assert_eq!(locator.node_id, "router");
+    assert_eq!(locator.attempt_id, "attempt-001");
+    assert_eq!(locator.outer_node_id, None);
+    assert_eq!(locator.outer_attempt_id, None);
+
+    let resumed = app.run_continue(task_id, "run-001", None, None).unwrap();
+    assert_eq!(resumed.status, RunStatus::Completed);
+    assert_eq!(resumed.outcome, Some(RunOutcome::Success));
+
+    let child_run: sasuke::runtime::RunState =
+        sasuke::storage::read_json(&app.paths.run_file(task_id, "run-002")).unwrap();
+    assert_eq!(child_run.status, RunStatus::Completed);
+    assert_eq!(child_run.outcome, Some(RunOutcome::Success));
+
+    let invocations = provider.invocations.lock().unwrap();
+    assert!(invocations.iter().any(|invocation| {
+        invocation.runtime_context.run_id == "run-002"
+            && invocation.runtime_context.node_id == "child"
+            && invocation.session_mode == SessionMode::Continue
+    }));
+}
+
+#[test]
+fn ai_dynamic_workflow_invocation_pause_and_continue_uses_user_message_render_mode() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-child-pause-user-message";
+    let workflow_id = Arc::new(Mutex::new(String::new()));
+    let provider = DynamicProvider::workflow_invocation_pause_then_continue(workflow_id.clone());
+    let app = with_available_claude_diagnostics(App::with_provider(
+        repo_root,
+        Box::new(provider.clone()),
+    ));
+    let profile = first_profile_id(&app);
+
+    let store = app
+        .save_workflow_template(
+            "Child Flow".to_string(),
+            serde_json::from_str(&format!(
+                r#"{{
+                    "version": "0.1",
+                    "id": "child-flow",
+                    "entry": "child",
+                    "nodes": [
+                        {{
+                            "id": "child",
+                            "type": "worker",
+                            "provider": "claude-acp",
+                            "profile": "pf-builtin-dev",
+                            "goal": "Run child work"
+                        }}
+                    ],
+                    "edges": [
+                        {{ "from": "child", "to": "$end", "on": "success" }}
+                    ]
+                }}"#
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    let child_template = store
+        .templates
+        .iter()
+        .find(|template| template.name == "Child Flow")
+        .unwrap();
+    *workflow_id.lock().unwrap() = child_template.workflow.id.clone();
+
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(
+        &app,
+        task_id,
+        &profile,
+        &format!(r#"[{{ "workflowId": "{}" }}]"#, child_template.workflow.id),
+    );
+
+    let paused = app.run_start(task_id, None).unwrap();
+    assert_eq!(paused.status, RunStatus::Paused);
+    assert_eq!(paused.pause_reason, Some(PauseReason::ProcessInterrupted));
+
+    let resumed = app
+        .run_continue(
+            task_id,
+            "run-001",
+            Some("prompt-continue-001".to_string()),
+            Some("请继续检查这个会话".to_string()),
+        )
+        .unwrap();
+
+    assert_eq!(resumed.status, RunStatus::Completed);
+    assert_eq!(resumed.outcome, Some(RunOutcome::Success));
+
+    let invocations = provider.invocations.lock().unwrap();
+    let child_continue = invocations
+        .iter()
+        .find(|invocation| {
+            invocation.runtime_context.run_id == "run-002"
+                && invocation.runtime_context.node_id == "child"
+                && invocation.session_mode == SessionMode::Continue
+        })
+        .unwrap();
+    assert_eq!(
+        child_continue.user_prompt_render_mode,
+        UserPromptRenderMode::UserMessage
+    );
+    let resume_prompt = child_continue.resume_prompt.as_deref().unwrap_or_default();
+    assert_eq!(resume_prompt.lines().next(), Some("请继续检查这个会话"));
+    assert!(resume_prompt.contains("show=\"false\""));
+    assert!(resume_prompt.contains("请先完整执行本消息中的用户指令，然后继续完成你之前的任务"));
+    assert_eq!(
+        child_continue.resume_prompt_id.as_deref(),
+        Some("prompt-continue-001")
+    );
+}
+
+#[test]
+fn ai_dynamic_pause_all_running_sessions_recursively_pauses_child_run() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-global-pause";
+    let workflow_id = Arc::new(Mutex::new(String::new()));
+    let provider = DynamicProvider::workflow_invocation_pause_then_continue(workflow_id.clone());
+    let app = with_available_claude_diagnostics(App::with_provider(repo_root, Box::new(provider)));
+    let profile = first_profile_id(&app);
+
+    let store = app
+        .save_workflow_template(
+            "Child Flow".to_string(),
+            serde_json::from_str(&format!(
+                r#"{{
+                    "version": "0.1",
+                    "id": "child-flow",
+                    "entry": "child",
+                    "nodes": [
+                        {{
+                            "id": "child",
+                            "type": "worker",
+                            "provider": "claude-acp",
+                            "profile": "pf-builtin-dev",
+                            "goal": "Run child work"
+                        }}
+                    ],
+                    "edges": [
+                        {{ "from": "child", "to": "$end", "on": "success" }}
+                    ]
+                }}"#
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    let child_template = store
+        .templates
+        .iter()
+        .find(|template| template.name == "Child Flow")
+        .unwrap();
+    *workflow_id.lock().unwrap() = child_template.workflow.id.clone();
+
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(
+        &app,
+        task_id,
+        &profile,
+        &format!(r#"[{{ "workflowId": "{}" }}]"#, child_template.workflow.id),
+    );
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Paused);
+
+    let paused_runs = app.pause_all_running_sessions().unwrap();
+    assert!(paused_runs.is_empty());
+
+    let paused = app
+        .run_pause(task_id, "run-001", PauseReason::ProcessInterrupted)
+        .unwrap();
+    assert_eq!(paused.status, RunStatus::Paused);
+    assert_eq!(paused.pause_reason, Some(PauseReason::ProcessInterrupted));
+
+    let graph = dynamic_graph(&app, task_id);
+    assert_eq!(
+        graph.run.status,
+        sasuke::dynamic::DynamicRunStatus::Paused
+    );
+    assert_eq!(
+        graph.run.pause_reason,
+        Some(PauseReason::ProcessInterrupted)
+    );
+    let child_run: sasuke::runtime::RunState =
+        sasuke::storage::read_json(&app.paths.run_file(task_id, "run-002")).unwrap();
+    assert_eq!(child_run.status, RunStatus::Paused);
+    assert_eq!(
+        child_run.pause_reason,
+        Some(PauseReason::ProcessInterrupted)
+    );
+}
+
+#[test]
+fn ai_dynamic_workflow_invocation_uses_frozen_allowed_snapshot() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let task_id = "task-ai-dynamic-child";
+    let workflow_id = Arc::new(Mutex::new(String::new()));
+    let provider = DynamicProvider::workflow_invocation(workflow_id.clone());
+    let app = with_available_claude_diagnostics(App::with_provider(
+        repo_root,
+        Box::new(provider.clone()),
+    ));
+    let profile = first_profile_id(&app);
+
+    let store = app
+        .save_workflow_template(
+            "Child Flow".to_string(),
+            serde_json::from_str(&format!(
+                r#"{{
+                    "version": "0.1",
+                    "id": "child-flow",
+                    "entry": "child",
+                    "nodes": [
+                        {{
+                            "id": "child",
+                            "type": "worker",
+                            "provider": "claude-acp",
+                            "profile": "pf-builtin-dev",
+                            "goal": "Run child work"
+                        }}
+                    ],
+                    "edges": [
+                        {{ "from": "child", "to": "$end", "on": "success" }}
+                    ]
+                }}"#
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    let child_template = store
+        .templates
+        .iter()
+        .find(|template| template.name == "Child Flow")
+        .unwrap();
+    *workflow_id.lock().unwrap() = child_template.workflow.id.clone();
+
+    write_task_file(&app, task_id);
+    write_dynamic_workflow(
+        &app,
+        task_id,
+        &profile,
+        &format!(r#"[{{ "workflowId": "{}" }}]"#, child_template.workflow.id),
+    );
+
+    let run = app.run_start(task_id, None).unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(run.outcome, Some(RunOutcome::Success));
+
+    let graph = dynamic_graph(&app, task_id);
+    assert_eq!(graph.run.allowed_workflow_snapshots.len(), 1);
+    assert_eq!(
+        graph.run.allowed_workflow_snapshots[0].workflow_id,
+        child_template.workflow.id
+    );
+    assert_eq!(
+        graph.run.allowed_workflow_snapshots[0].workflow.id,
+        child_template.workflow.id
+    );
+    let invocation_node = graph
+        .nodes
+        .iter()
+        .find(|node| node.id == "child-flow-node")
+        .unwrap();
+    assert_eq!(invocation_node.kind, DynamicNodeKind::WorkflowInvocation);
+    assert_eq!(
+        invocation_node.workflow_snapshot_id.as_deref(),
+        Some("wf-snapshot-001")
+    );
+    assert_eq!(invocation_node.child_run_id.as_deref(), Some("run-002"));
+
+    let child_run: sasuke::runtime::RunState =
+        sasuke::storage::read_json(&app.paths.run_file(task_id, "run-002")).unwrap();
+    assert_eq!(child_run.status, RunStatus::Completed);
+    assert_eq!(child_run.outcome, Some(RunOutcome::Success));
+
+    let invocations = provider.invocations.lock().unwrap();
+    let child_invocation = render_prompt_bundle(
+        invocations
+            .iter()
+            .find(|invocation| invocation.runtime_context.run_id == "run-002")
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        child_invocation
+            .user_prompt
+            .contains("Run child workflow from frozen snapshot")
+    );
+    assert!(child_invocation.user_prompt.contains("Run child work"));
+    assert!(
+        child_invocation
+            .user_prompt
+            .contains("# 需求\nExercise AI-DYNAMIC")
+    );
+}
