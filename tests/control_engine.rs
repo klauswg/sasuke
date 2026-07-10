@@ -1,0 +1,364 @@
+use sasuke::control::{ControlDecision, decide_next_step};
+use sasuke::domain::{NodeOutcome, NodeType, RunStatus, SessionMode, VERSION};
+use sasuke::dsl::WorkflowDsl;
+use sasuke::runtime::{NodeState, RoundState, RunState};
+
+fn parse_workflow(json: &str) -> WorkflowDsl {
+    serde_json::from_str(json).unwrap()
+}
+
+fn sample_run() -> RunState {
+    RunState {
+        version: VERSION.to_string(),
+        id: "run-001".to_string(),
+        task_id: "task-001".to_string(),
+        status: RunStatus::Running,
+        outcome: None,
+        started_at: "0Z".to_string(),
+        updated_at: "0Z".to_string(),
+        workflow_snapshot: "workflow.snapshot.json".to_string(),
+        current_round: Some("round-001".to_string()),
+        current_node: Some("accept".to_string()),
+        current_attempt: Some("attempt-001".to_string()),
+        new_rounds_opened: 0,
+        pause_reason: None,
+        task_uuid: None,
+        uuid: None,
+        last_executed_node: None,
+        worktree: None,
+        execution: Default::default(),
+    }
+}
+
+fn sample_round() -> RoundState {
+    RoundState {
+        version: VERSION.to_string(),
+        id: "round-001".to_string(),
+        run_id: "run-001".to_string(),
+        index: 1,
+        status: RunStatus::Running,
+        outcome: None,
+        trigger: sasuke::domain::RoundTrigger::Initial,
+        started_at: "0Z".to_string(),
+        trace: Vec::new(),
+        uuid: None,
+    }
+}
+
+fn sample_node(node_id: &str, outcome: NodeOutcome) -> NodeState {
+    NodeState {
+        version: VERSION.to_string(),
+        acp_storage_schema_version: sasuke::runtime::CURRENT_ACP_STORAGE_SCHEMA_VERSION,
+        node_id: node_id.to_string(),
+        node_type: NodeType::Worker,
+        run_id: "run-001".to_string(),
+        round_id: "round-001".to_string(),
+        attempt_id: "attempt-001".to_string(),
+        status: RunStatus::Completed,
+        outcome: Some(outcome),
+        started_at: "0Z".to_string(),
+        finished_at: Some("1Z".to_string()),
+        manual_check_pending: false,
+        runtime_execution_id: None,
+        resolved_config: Default::default(),
+        uuid: None,
+    }
+}
+
+#[test]
+fn worker_success_to_end_completes_run() {
+    let workflow = parse_workflow(
+        r#"{
+            "version": "0.1",
+            "id": "worker-accept",
+            "entry": "accept",
+            "control": { "max_attempts": 1 },
+            "nodes": [
+                { "id": "accept", "type": "worker", "provider": "claude-acp" }
+            ],
+            "edges": [
+                { "from": "accept", "to": "$end", "on": "success" }
+            ]
+        }"#,
+    );
+
+    let validated = sasuke::dsl::validate_workflow(workflow).unwrap();
+    let decision = decide_next_step(
+        &validated,
+        &sample_run(),
+        &sample_round(),
+        &sample_node("accept", NodeOutcome::Success),
+    );
+    assert!(matches!(
+        decision,
+        ControlDecision::CompleteRun(sasuke::domain::RunOutcome::Success)
+    ));
+}
+
+#[test]
+fn worker_invalid_completes_run_as_failure() {
+    let workflow = parse_workflow(
+        r#"{
+            "version": "0.1",
+            "id": "worker-invalid-no-edge",
+            "entry": "test",
+            "control": { "max_attempts": 2 },
+            "nodes": [
+                { "id": "test", "type": "worker", "provider": "claude-acp" },
+                { "id": "accept", "type": "worker", "provider": "claude-acp" }
+            ],
+            "edges": [
+                { "from": "test", "to": "accept", "on": "success" },
+                { "from": "accept", "to": "$end", "on": "success" }
+            ]
+        }"#,
+    );
+
+    let validated = sasuke::dsl::validate_workflow(workflow).unwrap();
+    let decision = decide_next_step(
+        &validated,
+        &sample_run(),
+        &sample_round(),
+        &sample_node("test", NodeOutcome::Invalid),
+    );
+    assert!(matches!(
+        decision,
+        ControlDecision::CompleteRun(sasuke::domain::RunOutcome::Failure)
+    ));
+}
+
+#[test]
+fn worker_success_without_matching_edge_completes_run_as_success() {
+    let workflow = parse_workflow(
+        r#"{
+            "version": "0.1",
+            "id": "worker-success-no-edge",
+            "entry": "review",
+            "control": { "max_attempts": 1 },
+            "nodes": [
+                { "id": "review", "type": "worker", "provider": "claude-acp" }
+            ],
+            "edges": [
+                { "from": "review", "to": "$end", "on": "failure" }
+            ]
+        }"#,
+    );
+
+    let validated = sasuke::dsl::validate_workflow(workflow).unwrap();
+    let decision = decide_next_step(
+        &validated,
+        &sample_run(),
+        &sample_round(),
+        &sample_node("review", NodeOutcome::Success),
+    );
+    assert!(matches!(
+        decision,
+        ControlDecision::CompleteRun(sasuke::domain::RunOutcome::Success)
+    ));
+}
+
+#[test]
+fn manual_check_failure_without_matching_edge_completes_run_as_failure() {
+    let workflow = parse_workflow(
+        r#"{
+            "version": "0.1",
+            "id": "worker-failure-no-edge",
+            "entry": "review",
+            "control": { "max_attempts": 1 },
+            "nodes": [
+                { "id": "review", "type": "worker", "provider": "claude-acp", "manual_check": true }
+            ],
+            "edges": [
+                { "from": "review", "to": "$end", "on": "success" }
+            ]
+        }"#,
+    );
+
+    let validated = sasuke::dsl::validate_workflow(workflow).unwrap();
+    let decision = decide_next_step(
+        &validated,
+        &sample_run(),
+        &sample_round(),
+        &sample_node("review", NodeOutcome::Failure),
+    );
+    assert!(matches!(
+        decision,
+        ControlDecision::CompleteRun(sasuke::domain::RunOutcome::Failure)
+    ));
+}
+
+#[test]
+fn worker_manual_check_rejects_output_validation() {
+    let workflow = parse_workflow(
+        r#"{
+            "version": "0.1",
+            "id": "manual-check-exclusive",
+            "entry": "review",
+            "control": { "max_attempts": 1 },
+            "nodes": [
+                { "id": "review", "type": "worker", "provider": "claude-acp", "manual_check": true, "output": { "kind": "json", "artifact": "review-result" }, "success_condition": { "path": "passed", "equals": true } }
+            ],
+            "edges": []
+        }"#,
+    );
+
+    let err = sasuke::dsl::validate_workflow(workflow).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cannot enable manual_check together with output validation")
+    );
+}
+
+#[test]
+fn worker_failure_uses_explicit_edge() {
+    let workflow = parse_workflow(
+        r#"{
+            "version": "0.1",
+            "id": "worker-failure-edge",
+            "entry": "review",
+            "control": { "max_attempts": 1 },
+            "nodes": [
+                { "id": "review", "type": "worker", "provider": "claude-acp", "output": { "kind": "json", "artifact": "review-result" }, "success_condition": { "path": "passed", "equals": true } },
+                { "id": "dev", "type": "worker", "provider": "claude-acp" }
+            ],
+            "edges": [
+                { "from": "review", "to": "dev", "on": "failure", "session": "continue" },
+                { "from": "dev", "to": "$end", "on": "success" }
+            ]
+        }"#,
+    );
+
+    let validated = sasuke::dsl::validate_workflow(workflow).unwrap();
+    let decision = decide_next_step(
+        &validated,
+        &sample_run(),
+        &sample_round(),
+        &sample_node("review", NodeOutcome::Failure),
+    );
+    assert!(
+        matches!(decision, ControlDecision::TransitionToNode { node_id, session: SessionMode::Continue } if node_id == "dev")
+    );
+}
+
+#[test]
+fn manual_check_failure_uses_explicit_edge() {
+    let workflow = parse_workflow(
+        r#"{
+            "version": "0.1",
+            "id": "manual-check-failure-edge",
+            "entry": "interview",
+            "control": { "max_attempts": 1 },
+            "nodes": [
+                { "id": "interview", "type": "worker", "provider": "claude-acp", "manual_check": true },
+                { "id": "plan", "type": "worker", "provider": "claude-acp" }
+            ],
+            "edges": [
+                { "from": "interview", "to": "plan", "on": "failure" },
+                { "from": "plan", "to": "$end", "on": "success" }
+            ]
+        }"#,
+    );
+
+    let validated = sasuke::dsl::validate_workflow(workflow).unwrap();
+    let decision = decide_next_step(
+        &validated,
+        &sample_run(),
+        &sample_round(),
+        &sample_node("interview", NodeOutcome::Failure),
+    );
+    assert!(
+        matches!(decision, ControlDecision::TransitionToNode { node_id, session: SessionMode::New } if node_id == "plan")
+    );
+}
+
+#[test]
+fn edge_to_new_round_opens_round() {
+    let workflow = parse_workflow(
+        r#"{
+            "version": "0.1",
+            "id": "new-round-edge",
+            "entry": "accept",
+            "control": { "max_attempts": 1 },
+            "nodes": [
+                { "id": "accept", "type": "worker", "provider": "claude-acp", "output": { "kind": "json", "artifact": "accept-result" }, "success_condition": { "path": "passed", "equals": true } }
+            ],
+            "edges": [
+                { "from": "accept", "to": "$new-round", "on": "failure", "new_round_entry": "$entry" },
+                { "from": "accept", "to": "$end", "on": "success" }
+            ]
+        }"#,
+    );
+
+    let validated = sasuke::dsl::validate_workflow(workflow).unwrap();
+    let decision = decide_next_step(
+        &validated,
+        &sample_run(),
+        &sample_round(),
+        &sample_node("accept", NodeOutcome::Failure),
+    );
+    assert!(
+        matches!(decision, ControlDecision::OpenNewRound { entry_node_id } if entry_node_id == "accept")
+    );
+}
+
+#[test]
+fn legacy_snapshot_new_round_edge_defaults_to_workflow_entry() {
+    let workflow = parse_workflow(
+        r#"{
+            "version": "0.1",
+            "id": "legacy-new-round-edge",
+            "entry": "accept",
+            "control": { "max_attempts": 1 },
+            "nodes": [
+                { "id": "accept", "type": "worker", "provider": "claude-acp", "output": { "kind": "json", "artifact": "accept-result" }, "success_condition": { "path": "passed", "equals": true } }
+            ],
+            "edges": [
+                { "from": "accept", "to": "$new-round", "on": "failure" },
+                { "from": "accept", "to": "$end", "on": "success" }
+            ]
+        }"#,
+    );
+
+    let validated = sasuke::dsl::validate_workflow_snapshot(workflow).unwrap();
+    let decision = decide_next_step(
+        &validated,
+        &sample_run(),
+        &sample_round(),
+        &sample_node("accept", NodeOutcome::Failure),
+    );
+    assert!(
+        matches!(decision, ControlDecision::OpenNewRound { entry_node_id } if entry_node_id == "accept")
+    );
+}
+
+#[test]
+fn edge_to_new_round_uses_configured_entry_node() {
+    let workflow = parse_workflow(
+        r#"{
+            "version": "0.1",
+            "id": "new-round-custom-entry",
+            "entry": "accept",
+            "control": { "max_attempts": 1 },
+            "nodes": [
+                { "id": "accept", "type": "worker", "provider": "claude-acp", "output": { "kind": "json", "artifact": "accept-result" }, "success_condition": { "path": "passed", "equals": true } },
+                { "id": "dev", "type": "worker", "provider": "claude-acp" }
+            ],
+            "edges": [
+                { "from": "accept", "to": "$new-round", "on": "failure", "new_round_entry": "dev" },
+                { "from": "accept", "to": "$end", "on": "success" },
+                { "from": "dev", "to": "$end", "on": "success" }
+            ]
+        }"#,
+    );
+
+    let validated = sasuke::dsl::validate_workflow(workflow).unwrap();
+    let decision = decide_next_step(
+        &validated,
+        &sample_run(),
+        &sample_round(),
+        &sample_node("accept", NodeOutcome::Failure),
+    );
+    assert!(
+        matches!(decision, ControlDecision::OpenNewRound { entry_node_id } if entry_node_id == "dev")
+    );
+}
