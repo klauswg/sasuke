@@ -1,0 +1,156 @@
+mod support;
+
+use camino::Utf8PathBuf;
+use sasuke::domain::SessionMode;
+use sasuke::provider::{
+    DoctorResult, ProviderAdapter, ProviderCapabilities, ProviderInfo, ProviderResultPayload,
+    ProviderRunResult, ProviderRunStatus, SessionRef, WorkerInvocation,
+};
+use sasuke::runtime::RunState;
+use tempfile::tempdir;
+
+use support::app_with_available_claude_provider;
+
+#[derive(Clone, Default)]
+struct UnicodeTimelineProvider;
+
+impl ProviderAdapter for UnicodeTimelineProvider {
+    fn describe_provider(&self) -> ProviderInfo {
+        ProviderInfo {
+            provider_id: "fake".to_string(),
+            display_name: "Fake".to_string(),
+            capabilities: ProviderCapabilities {
+                supports_open_session: true,
+                supports_continue_session: true,
+                supports_system_prompt: true,
+                supports_raw_stream: false,
+            },
+            is_default: false,
+        }
+    }
+
+    fn doctor(&self) -> DoctorResult {
+        DoctorResult {
+            available: true,
+            reason: None,
+            capabilities: None,
+        }
+    }
+
+    fn run_worker(&self, req: WorkerInvocation) -> anyhow::Result<ProviderRunResult> {
+        let timeline_path = req.attempt_dir.join("acp.timeline.jsonl");
+        let prefix = r#"{"item":{"kind":"message","text":""#;
+        let unicode_payload = "你".repeat(120);
+        let suffix = r#""}}"#;
+        let mut line = format!("{prefix}{unicode_payload}{suffix}");
+        let mut ascii_pad = String::new();
+        while line.is_char_boundary(200) {
+            ascii_pad.push('a');
+            line = format!("{prefix}{ascii_pad}{unicode_payload}{suffix}");
+        }
+        std::fs::write(timeline_path.as_std_path(), format!("{line}\n"))?;
+        std::fs::write(
+            req.attempt_dir.join("acp.snapshot.json").as_std_path(),
+            r#"{"inputTokens":1,"outputTokens":2,"cachedReadTokens":0,"totalTokens":3}"#,
+        )?;
+
+        Ok(ProviderRunResult {
+            status: ProviderRunStatus::Success,
+            exit_code: Some(0),
+            result_payload: Some(ProviderResultPayload {
+                output_artifact: None,
+            }),
+            worker_ref_seed: Some(SessionRef {
+                provider: "claude-acp".to_string(),
+                mode: SessionMode::New,
+                supports_open_session: true,
+                supports_continue_session: true,
+                continue_ref: Some(serde_json::json!({ "sessionId": "session-123" })),
+                open_command: Some("claude -c session-123".to_string()),
+            }),
+            stream_path: None,
+            runtime_error: None,
+            runtime_control_output: None,
+        })
+    }
+
+    fn open_session(&self, _worker_ref: &sasuke::domain::SessionRef) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn build_continue_command(
+        &self,
+        _worker_ref: &sasuke::domain::SessionRef,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(Some("claude -c session-123".to_string()))
+    }
+}
+
+#[test]
+fn run_start_transitions_past_completed_worker_with_unicode_timeline() {
+    let temp = tempdir().unwrap();
+    let repo_root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let sasuke_home = repo_root.join("sasuke-home");
+    unsafe { std::env::set_var("SASUKE_HOME", sasuke_home.as_str()) };
+
+    let app = app_with_available_claude_provider(repo_root, Box::new(UnicodeTimelineProvider));
+    let task_id = "task-001";
+
+    std::fs::create_dir_all(app.paths.task_dir(task_id).join("authoring").as_std_path()).unwrap();
+    let profiles = app.profiles().unwrap();
+    let dev_profile = profiles
+        .profiles
+        .iter()
+        .find(|profile| profile.name == "开发")
+        .unwrap()
+        .id
+        .clone();
+    let review_profile = profiles
+        .profiles
+        .iter()
+        .find(|profile| profile.name == "审查")
+        .unwrap()
+        .id
+        .clone();
+    std::fs::write(
+        app.paths.requirement_file(task_id).as_std_path(),
+        "Implement feature",
+    )
+    .unwrap();
+    std::fs::write(
+        app.paths.workflow_file(task_id).as_std_path(),
+        format!(
+            r#"{{
+          "version": "0.1",
+          "id": "unicode-transition",
+          "entry": "dev",
+          "nodes": [
+            {{"id":"dev","type":"worker","provider":"claude-acp","profile":"{}","goal":"Implement the requirement"}},
+            {{"id":"review","type":"worker","provider":"claude-acp","profile":"{}","goal":"Review the implementation"}}
+          ],
+          "edges": [
+            {{"from":"dev","to":"review","on":"success"}},
+            {{"from":"review","to":"$end","on":"success"}}
+          ]
+        }}"#,
+            dev_profile, review_profile
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        app.paths.task_file(task_id).as_std_path(),
+        r#"{"version":"0.1","id":"task-001"}"#,
+    )
+    .unwrap();
+
+    let run = app.run_start(task_id, None).unwrap();
+    let run_state: RunState =
+        sasuke::storage::read_json(&app.paths.run_file(task_id, &run.id)).unwrap();
+
+    assert_eq!(run_state.status, sasuke::domain::RunStatus::Completed);
+    assert_eq!(
+        run_state.outcome,
+        Some(sasuke::domain::RunOutcome::Success)
+    );
+    assert_eq!(run_state.current_node.as_deref(), Some("review"));
+}
