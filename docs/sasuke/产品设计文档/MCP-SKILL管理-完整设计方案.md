@@ -1,0 +1,676 @@
+# sasuke MCP & SKILL 管理 — 完整设计方案（最终版）
+
+> 基于 5 轮深度访谈 + 完整开发实现（对标 Zed）
+> 更新：2026-06-11
+> 涵盖：MCP 服务管理、MCP 健康检查、SKILL 管理、SKILL 传递、运行时集成
+## 2026-07-01 实施补充
+- SKILL 管理改为按实例目录（`directoryPath`）识别，同名原生 skill 允许并列展示。
+- 查询与同步以全局已配置 agent 为准；保存时按目标集合对账，允许“只保存不同步”以及取消既有软链同步。
+- 软链副本不单独展示；同步遇到目标目录已有同名原生 skill，或同目录发生同名创建/重命名时，均直接阻止并提示冲突。
+- 管理页卡片左下角展示来源 agent 图标；同步目标仅展示全局已配置 agent。
+- 编辑已有 skill 时，抽屉中的保存位置提示必须按真实 `directoryPath` 展示；项目内原生 agent skill 显示为 `<project>/<agent-dir>/skills/...`，不再一律回退成 `<project>/.sasuke/...`。
+- 原生 agent skill 的文件系统身份以真实目录名为准，而不是 frontmatter `name:`；同步、冲突检测、同步状态识别都基于 `directoryPath` 的最后一级目录处理。
+- 管理页支持按“当前 agent 可用 skill”筛选；过滤选项仅来自全局已配置 agent。
+- SKILL 卡片左下角图标改为“来源 agent + 已同步目标 agent”的并集展示；`.sasuke` 自建 skill 固定展示 sasuke 图标。
+- 编辑原生 agent skill 时，同步目标列表排除其自身 agent，不再允许出现“`.claude` skill 再同步到 `.claude`”这类自相矛盾操作。
+
+## 2026-07-09 实施补充
+- sasuke 自管 SKILL 的权威存储目录为 `~/.sasuke/skills/<dir>/SKILL.md` 与 `<workspace>/.sasuke/skills/<dir>/SKILL.md`；原生 agent skill 继续按各 agent 实例目录扫描，但列表、编辑、删除、同步状态均以 `directoryPath` 标识单个实例。
+- 多 Agent 同步模型以“已配置 agent 实例 + skill 目录名”为同步键。同步链接只在已配置 agent 的 `skills/<dir>` 下创建、移除和回放；未配置目录中的手工链接不属于 sasuke 对账范围。
+- 保存流程收敛为后端单一事务入口：先计算目标目录并完成同目录与同步目标冲突预检，再执行目录移动/写入，最后按目标集合 reconcile 软链。若写入或同步失败，后端恢复旧内容、旧目录和已记录的旧同步目标，避免 UI 报错但磁盘已半成功。
+- Rename 是真实目录 rename：编辑已有 skill 且 `name` 变化时，后端将旧 `directoryPath` 移动到同父目录的新目录名，删除旧目录名下的已配置 agent 同步链接，再按新目录名建立新链接；frontmatter `name:` 只作为展示/运行时名称，不再代替目录身份。
+- SKILL 与角色管理统一使用共享 YAML frontmatter 解析模块：`name:`、`summary:` 与 `description:` 可为单行值，也可使用 `>` folded block 或 `|` literal block；frontmatter 分隔符同时支持 LF 与 Windows CRLF 换行，`description: >` 不会再被误读成字面量 `>` 或因为 CRLF 被视为无描述。编辑已有 SKILL/角色时采用字段级 frontmatter 更新，只覆盖 `name`、`description`/`summary` 与正文，保留 `compatibility` 等未知字段和原 block scalar 风格。
+- 前端冲突检查必须同时传入 `oldName`、`directoryPath` 与 `syncTargets`，由后端按最终目标目录名判断新目录冲突和多 Agent 同步冲突，避免编辑原生 skill 时仅按 frontmatter 名误判。
+- SKILL 卡片底部将“来源实例”和“同步目标”分区展示：来源 icon 不可点击；同步目标 icon 列表与创建/编辑抽屉的 `syncTargets` 枚举一致，并复用工作流节点的 agent icon 视觉规格化逻辑，保证圆形、方形和留白不同的图标视觉重量一致。已同步目标用原色 icon + 左上角绿色状态点，未同步目标用灰色 icon；点击目标 icon 通过 `update_skill_sync_targets` 只更新软链对账，不重写 `SKILL.md` 正文，仅当前 icon 显示加载态，失败复用页面错误横幅并自动消失。
+- SKILL 卡片采用紧凑稳定尺寸结构：卡片使用固定高度，顶部信息区与底部 agent/action 区均固定高度；描述最多两行省略，不能因为描述行数不同导致底部 agent 列表和操作按钮上下跳动，也不能被 grid 行高拉伸出大面积空白。
+- SKILL 管理页的项目级 workspace 选择会记忆上一次有效选择。切回“项目 SKILL”或重新进入上下文管理页时，如果该 workspace 仍存在于当前 workspace 列表中，自动恢复并加载项目 SKILL；如果 workspace 已不存在，清除本地记忆并保持未选择状态。
+- SKILL 创建/编辑抽屉拥有独立表单状态，正文 Markdown 输入、名称/描述编辑和同步目标勾选只重渲染抽屉自身；`ContextManagementPage` 列表页只负责打开目标、接收保存后的列表刷新，避免每个字符触发背后的 SKILL 卡片网格、筛选栏和 tooltip 树重新 render。
+- SKILL 创建/编辑抽屉的同步目标区提供“全选 / 全不选”批量操作；批量选择只以当前可用同步 Agent 集合为边界，继续写入同一份抽屉局部 `syncTargets` 草稿，不建立旁路状态。
+- SKILL 创建/编辑抽屉的范围选择复用项目 shadcn/ui Select，项目 workspace 与 Global 继续写入同一份 `form.source` 草稿；编辑态保持禁用，不使用浏览器原生 `<select>` 形成独立视觉和弹层行为。
+- 前端选择控件统一遵守 `docs/sasuke/rules/ui-interaction.md` 的共享组件约束；全局 AST 契约测试同时阻止产品源码新增原生 `<select>` 或浏览器 `title` Tooltip，避免同类实现回退。
+- 上下文管理按领域延迟加载：首次进入“角色管理”只读取 Profile，不读取 Agent registry、SKILL 或会话任务树；只有进入“SKILL 管理”或打开 SKILL 创建抽屉时才并行读取 Agent registry 与 workspace 元数据。workspace 选择器必须调用轻量 `get_conversation_workspaces`，禁止为了取得项目名称复用包含 task/run 历史的 `get_conversation_sidebar`。
+
+## 2026-08-29 项目协作 SKILL 补充
+
+- 项目级 GitHub 协作 SKILL 以 `<workspace>/.claude/skills` 为唯一内容真源；`<workspace>/.agents/skills` 只允许作为指向 `../.claude/skills` 的相对目录符号链接，为读取 `.agents` 约定的 Agent 提供兼容发现。链接投影不得复制正文、形成第二份可编辑实例或被管理页重复展示。
+- 目录链接会投影 `.claude/skills` 下的全部项目 SKILL，而不是只投影 GitHub 协作 SKILL。新增 `git-issue` 与 `git-pr` 必须通过两个发现入口读取到同一 `SKILL.md` 内容；规范路径比较需要解析相对段和符号链接后再判断身份。
+- `git-issue` 与 `git-pr` 只负责编排仓库取证、模板选择、用户审阅、GitHub 写入和回读验证。Issue/PR 正文结构的权威来源分别为 `.github/ISSUE_TEMPLATE/*` 与 `.github/PULL_REQUEST_TEMPLATE.md`，SKILL 不复制模板字段。
+- GitHub 发布采用强制审阅门禁：Agent 必须先展示仓库、完整标题、完整正文及全部元数据，并等待用户在后续消息中明确批准；初始“提交”请求不能批准尚未展示的内容。批准绑定到已展示 revision，正文、元数据、diff 或提交集合变化后必须重新审阅。
+- GitHub 模板和默认发布内容统一使用英文；Agent 可使用中文与用户沟通，并把中文需求整理为自然英文。用户明确要求中文发布时才改变单次产出的语言，不维护两套模板真源。
+- `git-pr` 复用 `git-commit` 的本地 staging/commit 边界；批准前禁止 push 和 PR 写操作，批准后才允许发布经审阅的提交集合。两个协作 SKILL 都使用官方 `gh` CLI 和仓库实时规则，不硬编码 owner、repository、default branch、label 或 required check。
+- 接口级契约测试固定 canonical SKILL 的 frontmatter、审阅门禁、四类英文 Issue Forms 和 PR 模板关键章节；PR checks 必须运行该契约测试。`.agents/skills` 的环境级链接由 workspace 管理者单独设置和验证，不属于协作 SKILL 内容提交的 CI 前置条件。
+
+## 2026-08-30 Issue Forms schema 校验补充
+
+- GitHub Issue Forms 与 config 的可选 `title`、`labels`、`contact_links` 等字段只有存在有效值时才允许写入；不得使用 `title: ""`、`labels: []` 或 `contact_links: []` 表示“不设置”，因为 GitHub 会把表单配置判为无效并静默回退到空白 Issue 编辑器。
+- 协作模板契约测试必须使用 SchemaStore 的 GitHub Issue Forms 与 issue template config schema 校验解析后的 YAML 数据，不能只验证 YAML 语法、固定标题文本或文件存在性。测试直接依赖的 YAML parser 必须声明为项目 devDependency，不依赖间接依赖偶然提升到根目录。
+
+## 2026-08-30 Issue Forms 提交者边界补充
+
+- 公开 Issue Form 只收集目标提交者能够可靠提供的事实，不把维护者的设计回溯、根因分类、方案研究、性能目标、回归策略或验收定义设为普通用户的提交前置条件。GitHub Issue 标题已经承担摘要职责，四类表单均不得重复设置必填 `Summary` 字段。
+- Bug 必填实际行为、预期行为、复现步骤和环境；Feature 必填用户问题、期望结果和主要用例；Performance 必填可观察的性能问题、复现 workload 和环境，测量与 Profiler 证据可选；Technical Proposal 面向贡献者，必填当前问题、提议方向和已考虑替代方案，其余设计、迁移、风险与验收信息均按已有证据选填。
+- 设计意图、根因、瓶颈、正确性约束与验收标准由维护者在调查、Issue refinement 或 PR 阶段补充。`git-issue` 可以基于仓库证据主动调查，但不得因为报告者无法提供这些内部分析而阻止生成待审阅 Issue。
+- 契约测试除 SchemaStore 语法校验外，还固定各模板的最小必填字段、禁止普通反馈模板重新引入维护者字段，并把提交检查项收敛为查重与敏感信息清理两项。
+
+
+---
+
+## 一、架构总览
+
+### 模块结构
+
+```
+src/
+├── mcp/mod.rs              ← MCP 管理器（对标 Zed ContextServerStore + ContextServer）
+├── skill/mod.rs            ← SKILL 管理器（对标 Zed agent_skills + SkillIndex）
+├── config/mod.rs           ← 共享数据模型（McpServerState, ToolInfo, SkillMeta 等）
+├── storage/mod.rs          ← 路径管理（SasukePaths: global/project skills dirs）
+├── app/mod.rs              ← 委托层（App → McpManager / SkillManager）
+├── app/node_executor.rs    ← 运行时集成（WorkerInvocation 构建）
+├── acp/client.rs           ← ACP mcpServers 传递（session/new + session/load）
+├── provider/mod.rs         ← System/User Prompt 渲染
+├── prompts/
+│   ├── {en,zh-CN}/runtime/system.md              ← 稳定 runtime 规则
+│   └── {en,zh-CN}/runtime/hidden_context.md      ← 每次 invocation 的 hidden runtime context
+└── prompts.rs              ← include_str! 常量
+```
+
+### 对标关系
+
+| sasuke | Zed | 对齐程度 |
+|-----------|-----|----------|
+| `McpManager` | `ContextServerStore` + `ContextServer` | ✅ 完整对标 |
+| `McpServerState` | `ContextServerState` | ✅ 状态机对齐 |
+| `SkillManager` | `agent_skills` + `SkillIndex` | ✅ 完整对标 |
+| `apply_skill_overrides()` | `apply_skill_overrides()` | ✅ 同名函数 |
+| `select_catalog_skills()` | `select_catalog_skills()` | ✅ 同名函数 |
+| `mcpServers` ACP 字段 | `into_new_session_request().mcp_servers()` | ✅ |
+| `skill_catalog_block.md` | `system_prompt.hbs` `<available_skills>` | ✅ 模板对齐 |
+| ContextManagementPage | Agent Panel Settings | ✅ |
+| SkillTool (工具调用) | `SkillTool` (AgentTool trait) | ❌ 架构约束（路径 A 嵌入替代） |
+| 斜杠命令 SKILL | Slash Commands | ✅ 仅索引元数据并发送普通文本，不注入正文 |
+| Worktree Trust | `TrustedWorktrees` | 🔜 后续 PR |
+
+---
+
+## 二、MCP 管理
+
+### 2.1 核心决策
+
+| # | 决策 | 结论 | 对标 Zed |
+|---|------|------|----------|
+| 1 | 传递方式 | ACP `mcpServers` 字段 + System Prompt `{{mcp_tools}}` 占位符 | ✅ `into_new_session_request()` |
+| 2 | 编辑方式 | Local/Remote Tab + JSON 编辑器 | ✅ `ConfigureContextServerModal` |
+| 3 | JSON 解析 | 后端 strip `///` 注释 + lenient JSON parse | ✅ `parse_input()` |
+| 4 | Server ID | JSON 顶层 key 即 id | ✅ |
+| 5 | 传输类型 | stdio + HTTP（含 OAuth 支持） | ✅ |
+| 6 | 健康检查 | MCP initialize 握手（Stdio + HTTP 统一协议） | ✅ `server.start()` |
+| 7 | 健康门控 | 仅传递 enabled + healthy 的服务器给 ACP | ✅ `maintain_servers` |
+| 8 | 状态机 | `McpServerState: Starting → Running{tools} → Stopped/Error/AuthRequired` | ✅ `ContextServerState` |
+| 9 | 状态缓存 | `RefCell<HashMap<String, McpServerState>>` 内存缓存 | ✅ |
+| 10 | 保存策略 | 先保存 → 再验证（"先存后验"） | ✅ |
+| 11 | enabled 开关 | 独立于健康状态，始终可手动切换 | ✅ |
+| 12 | 工具发现 | `initialize` 成功后立即调用 `tools/list`，将工具清单写入健康结果与状态缓存 | ✅ |
+| 13 | 工具订阅 | 订阅 `notifications/tools/list_changed` | 🔜 后续 PR |
+
+### 2.2 数据模型
+
+```rust
+// ── MCP 服务器配置 ──
+pub struct McpServerConfig {
+    pub id: String,           // JSON 顶层 key
+    pub name: String,         // = id
+    pub enabled: bool,
+    pub transport: McpTransportConfig,
+}
+
+pub enum McpTransportConfig {
+    Stdio { command, args, env },
+    Http { url, headers, oauth: Option<OAuthClientConfig> },
+}
+
+pub struct OAuthClientConfig {
+    pub client_id: String,
+    pub client_secret: Option<String>,
+}
+
+// ── 状态机（对标 Zed ContextServerState） ──
+pub enum McpServerState {
+    Starting,                                    // 正在启动
+    Running { tools: Vec<ToolInfo> },             // 运行中 + 已发现工具
+    Stopped,                                      // 已停止
+    Error { message: String },                    // 启动失败
+    AuthRequired { auth_url: Option<String> },    // 需要 OAuth
+}
+
+// ── 工具信息 ──
+pub struct ToolInfo {
+    pub name: String,
+    pub description: Option<String>,
+    pub input_schema: Option<serde_json::Value>,
+}
+
+// ── 健康检查结果 ──
+pub struct McpServerHealthResult {
+    pub status: String,        // "healthy" | "unhealthy" | "auth_required"
+    pub message: Option<String>,
+    pub auth_url: Option<String>,
+    pub needs_client_secret: Option<bool>,
+    pub tools: Vec<ToolInfo>,   // tools/list 结果（仅 healthy 时填充）
+}
+```
+
+### 2.3 健康检查协议
+
+**统一 MCP initialize 握手（Stdio + HTTP 共享）：**
+
+```rust
+fn build_initialize_request() -> Value    // 构建标准 MCP initialize JSON-RPC
+fn parse_initialize_response(&str) -> Result<McpServerHealthResult>  // 解析响应
+```
+
+**Stdio 流程：**
+```
+spawn command → stdin.write(initialize) → 读取匹配 id=1 的 initialize 响应 → stdin.write(tools/list) → 读取匹配 id=2 的工具响应 → kill
+```
+
+**HTTP 流程：**
+```
+POST initialize
+  → application/json: 校验 JSON-RPC response id
+  → text/event-stream: 增量解析 SSE event，忽略 notification/request/其他 id，等待 initialize response
+  → 记录 Mcp-Session-Id 与服务端协商的 protocolVersion
+  → notifications/initialized
+  → tools/list（同样按 response id 关联）
+  → DELETE + Mcp-Session-Id 释放短生命周期 session
+```
+
+Streamable HTTP 的状态由 `StreamableHttpClient` 统一管理：静态 headers 属于配置域，`session_id` 与协商后的 `protocol_version` 属于同一连接生命周期，不能由健康检查和工具发现分别拼接。服务端返回 session 级 `404` 时，客户端清除旧 session，重新执行完整 initialize → initialized → request 流程；不允许只重放失败的业务请求。
+
+SSE 响应按标准 event framing 处理：多个 `data:` 字段使用换行拼接，comment/keepalive 不产生消息；服务端可以在目标 response 前发送 JSON-RPC request、notification 或其他 response，客户端只接受同时满足“无 method、包含 result/error、id 与当前 request 匹配”的消息。读取到目标 response 后立即结束本次 POST stream，不等待 HTTP body EOF。
+
+HTTP endpoint 必须配置最终 URL。客户端不自动跟随 301/302，避免 `POST` 被 HTTP 客户端降级为 `GET`；重定向响应作为配置错误返回，并提示使用最终 MCP endpoint。
+
+### 2.4 健康门控与缓存
+
+```rust
+// to_acp_mcp_servers() — 缓存优先
+pub fn to_acp_mcp_servers(&self) -> Result<Vec<Value>> {
+    // 1. 检查 state_cache: Running → 直接通过
+    // 2. 缓存未命中 → verify_server() → 更新缓存
+    // 3. 仅返回 status=="healthy" 的服务器
+    // 4. 将内部 McpServerConfig 转换为 ACP mcpServers wire format
+}
+
+// check_health() — 手动刷新并更新缓存
+pub fn check_health(&self, id: &str) -> Result<McpServerHealthResult>;
+
+// refresh_health() — 对标 Zed wait_for_context_server
+pub fn refresh_health(&self, id: &str) -> Result<McpServerHealthResult>;
+
+// invalidate_health() — 清除缓存
+pub fn invalidate_health(&self, id: &str);
+```
+
+### 2.5 运行时链路
+
+```
+1. UI 配置 MCP → settings.json
+2. node_executor 创建 McpManager → render_mcp_tools_catalog() → {{mcp_tools}}
+3. node_executor 调用 to_acp_mcp_servers() → 健康门控 → ACP schema mcp_servers
+4. provider 传递 &req.mcp_servers → ACP session/new { mcpServers: [...] }
+5. ACP Agent 直连 MCP 服务器（路径 B — 不经过 sasuke 中转）
+```
+
+`settings.json` / UI VM 允许使用 sasuke 内部结构保存 `id`、`transport`、`env` map 和 `headers` map；ACP 出站层必须按协议转换：
+
+- stdio：`{ name, command, args, env: [{ name, value }] }`，不带 `type`。
+- HTTP：`{ type: "http", name, url, headers: [{ name, value }] }`。
+- SSE：`{ type: "sse", name, url, headers: [{ name, value }] }`。
+- 不向 ACP `mcpServers` 透传内部 `id`、`transport`、OAuth 配置或对象 map。
+
+### 2.6 Tauri Commands
+
+| Command | 输入 | 输出 |
+|---------|------|------|
+| `list_mcp_servers` | — | `Vec<McpServerVm>` |
+| `add_mcp_server` | `jsonContent: String` | `Vec<McpServerVm>` |
+| `update_mcp_server` | `id, jsonContent` | `Vec<McpServerVm>` |
+| `delete_mcp_server` | `id` | `Vec<McpServerVm>` |
+| `toggle_mcp_server` | `id, enabled` | `Vec<McpServerVm>` |
+| `check_mcp_server_health` | `id` | `McpServerHealthResult` |
+| `refresh_mcp_health` | `id` | `McpServerHealthResult` |
+| `invalidate_mcp_health` | `id` | — |
+
+### 2.7 UI 特性
+
+- 搜索：按名称/command/url 过滤
+- 状态指示灯：🟢 healthy / 🟡 auth_required / 🔴 unhealthy / ⚪ unchecked
+- 状态统计条：healthy/auth/error 数量
+- enabled 开关：❌→✅ 自动触发健康检查，✅→❌ 清除状态
+- 保存 Sheet：保持打开 → "正在连接…" → 成功关闭 / 失败显示具体错误（6 秒自动消失 + ✕ 手动关闭）
+- 诊断按钮：每个服务器卡片的"MCP 服务诊断"按钮
+- 进入 Tab 时自动刷新 + 检查所有 enabled 服务器
+- MCP 卡片的 per-Agent transport 兼容性统一读取 App 级 `AgentRegistryVm`；该 Registry 在应用启动时从持久化的 `agent-diagnostics.json` 恢复，MCP 页面不得维护第二份局部 Registry，也不得因页面重新挂载把已有兼容性退回 loading。
+- Agent doctor 采用 stale-while-refresh 展示语义：检查期间继续展示上一次已知的 `mcpCapabilities`，doctor 完成并发布 `agent-registry-updated` 后一次性替换为新状态；只有从未获得过能力快照的 Agent 才显示诊断 loading。
+- Agent 健康状态优先于 MCP transport capability。不健康 Agent 展示不可用状态与 doctor 失败原因，不触发 MCP 兼容性检查，也不能把“当前不可用”误判为“不支持某 transport”。健康但未声明 `mcpCapabilities` 的 Agent 才展示未知态并允许手动重新诊断。
+
+### 2.8 Zed 对标达成度
+
+| 能力 | 状态 |
+|------|------|
+| 统一 MCP initialize 握手（Stdio + HTTP） | ✅ |
+| 状态机 `McpServerState` | ✅ |
+| 后端健康状态缓存（RefCell + HashMap） | ✅ |
+| `list()` 返回实际健康状态 | ✅ |
+| `to_acp_mcp_servers()` 缓存优先 + 健康门控 | ✅ |
+| 手动刷新/失效 | ✅ |
+| System prompt 渲染工具列表（缓存优先） | ✅ |
+| SSE event 增量解析 + JSON-RPC id 关联 + 10s 超时保护 | ✅ |
+| Streamable HTTP session 失效重建与 DELETE 释放 | ✅ |
+| 长期进程管理 | 🔜 |
+| `tools/list` 自动发现 | ✅ |
+| `tools/list_changed` 订阅 | 🔜 |
+
+---
+
+## 三、SKILL 管理
+
+### 3.1 核心决策
+
+| # | 决策 | 结论 | 对标 Zed |
+|---|------|------|----------|
+| 1 | 存储模型 | `.sasuke/skills/` 文件系统（全局 + 项目级） | ✅ |
+| 2 | Scope 选择 | 创建时 Dropdown 显式选择 Global / Project | ✅ |
+| 3 | 默认 Scope | 有 workspace 时默认 Project，无时默认 Global | ✅ |
+| 4 | 编辑限制 | 编辑时 Scope 锁定 | ✅ |
+| 5 | 重名检测 | 实时，冲突时禁用保存 + 红色错误提示 | ✅ |
+| 6 | 改名处理 | 编辑改名由后端移动真实目录并重建同步链接（`oldName + directoryPath`） | ✅ |
+| 7 | 渲染 | View 模式 Markdown 渲染 | ✅ |
+| 8 | 传递方式 | System Prompt `{{skill_catalog}}` → ACP `_meta.systemPrompt.append` | ✅ |
+| 9 | Body 嵌入 | SKILL.md 正文直接注入 system prompt（路径 A） | ✅ 替代 SkillTool |
+| 10 | 跨源优先级 | `apply_skill_overrides()`: Project(2) > Global(1) > BuiltIn(0) | ✅ |
+| 11 | Token 预算 | `select_catalog_skills()`: 50KB catalog budget | ✅ |
+| 12 | 项目隔离 | 仅加载当前 workspace 的项目 SKILL | ✅ |
+| 13 | 信任门控 | 本地自动信任 + 外部来源弹窗 + settings.json | 🔜 |
+
+### 3.2 数据模型
+
+```rust
+// ── SKILL 元数据 ──
+pub struct SkillMeta {
+    pub name: String,
+    pub description: String,
+    pub source: SkillSource,
+    pub directory_path: String,
+    pub disable_model_invocation: bool,
+    pub load_warnings: Vec<String>,
+}
+
+pub enum SkillSource {
+    BuiltIn,  // 内置（暂未实现）
+    Global,   // ~/.sasuke/skills/
+    Project,  // <workspace>/.sasuke/skills/
+}
+
+// ── 优先级（对标 Zed SkillSource::precedence） ──
+fn precedence(source: SkillSource) -> u8 {
+    match source {
+        BuiltIn => 0,
+        Global => 1,
+        Project => 2,  // 最高优先级
+    }
+}
+```
+
+### 3.3 文件系统布局
+
+```
+~/.sasuke/skills/                 ← 全局 SKILL（所有项目可用）
+  └── <name>/SKILL.md
+
+<workspace>/.sasuke/skills/        ← 项目级 SKILL（仅当前 project）
+  └── <name>/SKILL.md
+
+<agent-root>/skills/                  ← 原生 agent SKILL 实例（按已配置 agent 扫描）
+  └── <dir>/SKILL.md
+```
+
+目录名 `<name>/<dir>` 是文件系统身份与同步链接名；frontmatter `name:` 可以与目录名不同，运行时展示和 catalog 使用 frontmatter，冲突检测与同步使用目录名。
+
+### 3.4 SKILL.md 格式
+
+```markdown
+---
+name: my-skill
+description: A helpful skill for doing X
+---
+
+具体技能指引内容...
+```
+
+- 前置元数据（`---` 分隔）: `name`, `description`, `disable-model-invocation`
+- 正文: 自由 Markdown
+- 文件大小限制: 100KB
+- 描述长度限制: 1024 字节
+
+### 3.5 运行时集成
+
+```
+1. SkillManager::catalog_skills_for_agent_workspace(path)
+   → 全局 SKILL + 当前 workspace 项目 SKILL
+   → apply_skill_overrides() 优先级去重
+   → select_catalog_skills() 50KB 预算截断
+
+2. SkillManager::render_skill_catalog_for_workspace(lang, path)
+   → 读取每个 SKILL 的 body
+   → MiniJinja 渲染 skill_catalog_block.md 模板
+   → 注入 system prompt {{skill_catalog}}
+
+3. System Prompt 中 SKILL 内容格式:
+   <available_skills> — 目录摘要（name + description + location）
+   <skill_instructions> — 完整 body（Agent 可直接使用）
+```
+
+### 3.6 System Prompt 模板
+
+**对标 Zed `system_prompt.hbs:221-248`：**
+
+```xml
+{{#if has_skills}}
+## Agent Skills
+
+You have access to the following Skills — modular capabilities...
+
+<available_skills>
+{{#each skills}}
+  <skill>
+    <name>{{name}}</name>
+    <description>{{description}}</description>
+    <location>{{directory_path}}</location>
+  </skill>
+{{/each}}
+</available_skills>
+
+<skill_instructions>
+{{#each skills}}
+### {{name}}
+{{body}}
+{{/each}}
+</skill_instructions>
+{{/if}}
+```
+
+### 3.7 Tauri Commands
+
+| Command | 输入 | 输出 |
+|---------|------|------|
+| `list_skills` | — | `SkillListVm { global, project }` |
+| `list_project_skills` | `workspacePath` | `Vec<SkillMetaVm>` |
+| `read_skill` | `name, source, workspacePath?` | `SkillContentVm` |
+| `write_skill` | `name, source, content, workspacePath?, oldName?, directoryPath?, syncTargets?` | `SkillListVm` |
+| `delete_skill` | `name, source, workspacePath?, directoryPath?` | `SkillListVm` |
+| `update_skill_sync_targets` | `name, source, workspacePath?, directoryPath, syncTargets` | `SkillListVm` |
+| `get_skill_sync_status` | `name, directoryPath, workspacePath?` | `Vec<SyncStatusEntryVm>` |
+| `check_skill_name_conflict` | `name, source, workspacePath?, oldName?, directoryPath?, syncTargets?` | `Vec<String>` |
+
+`write_skill` 不直接分散执行创建、覆盖、rename 和同步。Tauri command 只解析入参并委托 `SkillManager::write_instance`，由后端统一执行“预检 → 文件系统变更 → 同步链接 reconcile → 失败回滚”。
+`update_skill_sync_targets` 只处理已有 SKILL 实例的同步链接 reconcile，用于卡片上的快速同步/取消同步，不应修改 `SKILL.md` 内容或触发 rename。
+
+SKILL 写入、删除或同步链接 reconcile 成功后，Tauri command 需要异步触发当前 workspace 的命令目录刷新。每个 `ManagedAgentConfig` 直接保存主 Agent 目录与兼容 Agent 目录，并由此生成 `AgentSkillDirectoryPolicy`：写列表只包含主 Agent 目录，是 SKILL 管理同步目标；读列表包含主目录和去重后的兼容目录，是 Agent 实际发现来源。所有路径解析统一在 Agent 目录后追加 `skills`，不允许调用方分散硬编码。Claude preset 默认主目录 `.claude`、无兼容目录；Codex/Cursor/Gemini/OpenCode 分别使用自己的主目录，并配置 `.agents` 为只读兼容目录。
+
+刷新先通过 Doctor 捕获 Agent 的 ACP `available_commands_update`，再扫描读列表下用户级与 workspace 级 `skills/*/SKILL.md` 的 `name / description` frontmatter，最终按“ACP 原生命令优先、SKILL 补充、命令名不区分大小写去重”生成目录。扫描不读取或注入 `SKILL.md` 正文；用户选择条目后只向 Agent 发送普通 `/${name} ` 文本。刷新失败保留上一次成功目录，且不能阻塞 SKILL 管理操作返回。
+
+### 3.8 UI 特性
+
+- 全局 Tab：直接展示所有全局 SKILL + 搜索
+- 项目 Tab：必须选择 workspace 才展示 + workspace 选择器下拉
+- 创建/编辑：Sheet 表单，Scope 编辑时锁定
+- 重名检测：实时计算，Save disabled + 红色错误
+- View 模式：Markdown 渲染
+- 卡片：View / Edit / Delete 操作按钮 + Tooltip
+
+### 3.9 Zed 对标达成度
+
+| 能力 | 状态 | 替代方案 |
+|------|------|----------|
+| 跨源优先级去重 | ✅ | `apply_skill_overrides()` |
+| SKILL body 嵌入 | ✅ | 路径 A: system prompt 全量注入 |
+| Zed 模板格式 | ✅ | `has_skills` + `<available_skills>` |
+| disable_model_invocation | ✅ | |
+| 50KB Token 预算 | ✅ | `select_catalog_skills()` |
+| 项目隔离 | ✅ | `catalog_skills_for_agent_workspace()` |
+| SkillTool (Agent 工具) | ❌ | 路径 A 内嵌替代 |
+| 斜杠命令 | ✅ | ACP 原生命令 + Agent 读目录 SKILL 元数据；普通文本发送 |
+| SKILL Mention | ❌ | ACP 架构不支持 |
+| File Watch 自动刷新 | 🔜 | 手动刷新 |
+| 信任门控 | 🔜 | C+1 方案 |
+
+---
+
+## 四、前端架构
+
+### 4.1 ContextManagementPage
+
+```
+Page
+├── PageHeader（标题）
+├── Tab 条（角色管理 / MCP 管理 / SKILL 管理）
+├── Profiles Tab → activeTab === 'profiles'
+├── MCP Tab    → activeTab === 'mcp'
+│   ├── 搜索栏 + 状态统计（healthy/auth/error 数量）
+│   ├── MCP 卡片网格（ScrollArea）
+│   │   └── 每卡片: 状态灯 + 名称 + transport + 操作按钮
+│   └── 诊断按钮（Stethoscope → "MCP 服务诊断"）
+├── SKILL Tab  → activeTab === 'skills'
+│   ├── 全局/项目 Tabs + workspace 选择器
+│   ├── 搜索栏
+│   └── SKILL 卡片网格（ScrollArea）
+├── McpSheet / SkillSheet
+│   ├── 错误 banner（6 秒自动消失 + ✕ 手动关闭）
+│   └── 保存（Close 时自动清 error）
+└── 删除确认 Dialogs
+```
+
+加载生命周期固定为：Profiles Tab 挂载只执行 `get_profiles`；MCP Tab 首次激活执行 MCP 列表；SKILL Tab 首次激活执行 SKILL 列表，并按需取得 `get_agent_registry + get_conversation_workspaces`。不同 Tab 的数据结构分属不同领域，不允许页面挂载时统一预取。完整会话侧栏属于会话运行领域，即使 App 壳已经缓存，也不能成为上下文管理的 workspace 下拉数据接口。
+
+角色批量导入统一使用可调整宽度的右侧 Sheet：设置与结果共享尺寸记忆，标题、状态提示与底部操作区固定，中间结果列表作为唯一可收缩滚动区。结果行使用 `minmax(0, 1fr)` 分配文本列，窄宽度下操作按钮自然换行；名称、Windows 路径与错误信息允许安全断行，任何单条记录都不能扩大抽屉或产生横向溢出。结果内编辑进入同一抽屉工作流的角色编辑层，保存、返回或关闭后恢复原批次结果；保存成功后使用接口返回实体，按 `importedId` 同步结果行名称，源路径与兜底诊断继续保留；任意时刻只挂载一个活动 Sheet。
+
+上述入口都会访问文件系统或目录树，后端必须声明为 async Tauri command，并通过统一的 `spawn_blocking_command` 在 blocking pool 中完成读取和 VM 构建。该约束覆盖 `get_profiles`、`get_agent_registry`、`list_mcp_servers`、`list_skills`、`list_project_skills` 与 `get_conversation_workspaces`，确保任一 Tab 加载期间都不占用桌面 IPC 事件处理线程。
+
+SKILL 卡片底部的 Agent 区域采用“最多两行、超量聚合”的自适应布局。容器先按实际可用宽度展示一行，数量增加时自然使用第二行；只有两行仍无法容纳时，才在末尾保留 `+N` 入口。`+N` 使用无页面遮罩的 Popover 展示被隐藏 Agent，并按“直接读取 / 同步设置”分组；同步 Agent 行复用卡片上的同步/取消同步接口，操作后 Popover 保持打开，支持连续调整。详情、编辑、删除操作区固定在右侧，不参与 Agent 换行。容量由 `ResizeObserver` 驱动，不绑定内置 Agent 数量或窗口断点。
+
+SKILL 管理中的“当前已配置 Agent”必须以 `AgentRegistryVm.agents` 为配置真源，读取用户实际保存的显示名、图标、全局/项目主目录和兼容目录；`catalog` 只用于保持内置 Agent 的产品排序。Catalog 之外的自定义 Agent 追加到列表中，参与来源识别、Agent 筛选、创建时默认同步目标、编辑同步目标和卡片聚合展示。不得以 `catalog.configured` 代替实际运行配置，否则自定义 Agent 和用户修改后的内置 Agent 配置都会丢失。
+
+MCP 卡片的 Agent 兼容性区域复用相同的两行容量策略：先换行、两行放不下再显示 `+N`，右侧 MCP 诊断、工具、编辑、删除入口固定。Popover 展示隐藏 Agent 的名称和兼容状态；未知状态仍可点击执行单 Agent 诊断，操作后浮层保持打开。MCP 与 SKILL 分别维护领域展示组件，但共享同一容量计算与 `ResizeObserver` Hook，避免两套溢出规则漂移。
+
+Agent 来源识别必须服从 SKILL 作用域：全局 SKILL 使用 `primaryAgentDir` 匹配原生来源，项目 SKILL 使用 `projectPrimaryAgentDir ?? primaryAgentDir` 匹配原生来源，两种作用域都继续识别 `compatibleAgentDirs`。因此目录拆分 Agent（例如 Pi 的全局 `.pi/agent/skills` 与项目 `.pi/skills`）在卡片、筛选和同步目标计算中保持一致。
+
+### 4.2 组件复用
+
+| 组件 | 用途 |
+|------|------|
+| `Card` / `AppCard` / `ScrollArea` | 卡片容器 + 滚动 |
+| `Sheet` / `AlertDialog` | 编辑面板 / 确认对话框 |
+| `Tabs` / `Select` / `Input` / `Textarea` | 导航和表单 |
+| `Tooltip` / `Badge` / `Popover` | 提示、标记与 SKILL/MCP 超量 Agent 快速操作 |
+| `Markdown` | SKILL View 渲染 |
+| `Loader2` / `Stethoscope` / `Check` | 状态图标 |
+
+### 4.3 错误处理
+
+- MCP 保存失败 → 显示具体原因（`message` 字段）+ 6 秒自动消失 + ✕ 按钮
+- Sheet 关闭时自动清除错误状态（`dismissMcpSheet()`）
+- API 调用异常被外层 `try/catch` 捕获并展示
+
+### 4.4 类型定义
+
+```typescript
+interface McpServerVm {
+  id, name, enabled, transport, command?, args?, env?, url?, headers?
+  healthStatus?: 'healthy' | 'unhealthy' | 'auth_required' | 'stopped' | 'checking' | 'unknown' | null
+  healthMessage?: string | null
+}
+
+interface McpServerHealthResult {
+  status: 'healthy' | 'unhealthy' | 'auth_required' | 'unknown'
+  message?, authUrl?, needsClientSecret?
+}
+
+interface ToolInfo {
+  name: string
+  description?: string | null
+  inputSchema?: Record<string, unknown> | null
+}
+```
+
+---
+
+## 五、存储布局
+
+```
+~/.sasuke/
+├── settings.json          ← MCP 配置（context_servers 字段）
+│                            + 信任列表（trusted_workspaces 字段）
+
+~/.sasuke/skills/       ← 全局 SKILL
+  └── <name>/SKILL.md
+
+<workspace>/.sasuke/skills/ ← 项目级 SKILL（每 workspace 独立）
+  └── <name>/SKILL.md
+```
+
+---
+
+## 六、完整文件清单
+
+### 6.1 Rust 后端
+
+| 文件 | 变更类型 | 说明 |
+|------|----------|------|
+| `src/config/mod.rs` | 修改 | +`McpServerState` +`ToolInfo` +`McpServerHealthResult.tools` +`SkillMeta` +`SkillSource` +常量 |
+| `src/mcp/mod.rs` | **新增** | 514→~650 行: `McpManager` + 协议握手 + 状态机 + 缓存 + ACP 序列化 + catalog 渲染 + 超时保护 |
+| `src/skill/mod.rs` | **新增** | ~290→~350 行: `SkillManager` + CRUD + 优先级去重 + body 嵌入 + workspace 隔离 + 预算保护 |
+| `src/storage/mod.rs` | 修改 | `SasukePaths` 新增 global/project SKILL 目录方法 |
+| `src/lib.rs` | 修改 | 注册 `pub mod mcp` + `pub mod skill` |
+| `src/app/mod.rs` | 修改 | 委托方法 + 删除死代码（~100 行重复类型/函数） |
+| `src/app/node_executor.rs` | 修改 | `build_worker_invocation`: MCP/SKILL catalog + mcp_servers + workspace 隔离 |
+| `src/acp/client.rs` | 修改 | `session_new_params` / `session_load_params` 接入 `mcpServers` |
+| `src/provider/mod.rs` | 修改 | `WorkerInvocation` + `mcp_servers` 字段 + AcpProvider 传递修复 + 模板变量修正 |
+| `src/prompts.rs` | 修改 | `SKILL_CATALOG_BLOCK_*` 常量 |
+| `src/prompts/{en,zh-CN}/runtime/system.md` | 修改 | `{{skill_catalog}}` `{{mcp_tools}}` 占位符 |
+| `src/prompts/{en,zh-CN}/runtime/skill_catalog_block.md` | **新增** | Zed 模板对齐: `has_skills` + `<available_skills>` + `<skill_instructions>` |
+| `src-tauri/src/commands.rs` | 修改 | 11 个 MCP/SKILL commands + 2 个 ACP mcp_servers 传递点 |
+| `src-tauri/src/view_models.rs` | 修改 | ViewModels + 转换函数 |
+| `src-tauri/src/main.rs` | 修改 | 注册新 commands |
+| `Cargo.toml` | 修改 | `reqwest` + `url` 依赖 |
+| `tests/provider_prompt_bundle.rs` | 修改 | 补充缺失字段 |
+
+### 6.2 前端
+
+| 文件 | 变更类型 | 说明 |
+|------|----------|------|
+| `web/src/types.ts` | 修改 | MCP/SKILL 类型定义 + `ToolInfo` + `healthStatus` 类型修复 |
+| `web/src/api.ts` + `desktop.ts` + `client.ts` + `browser.ts` | 修改 | API 层 |
+| `web/src/pages/ContextManagementPage.tsx` | 修改 | 三个 Tab + MCP JSON 编辑器 + SKILL 表单 + 健康状态 + 错误处理优化 |
+| `web/src/i18n.ts` | 修改 | 中英文文案 + `errors.app.unexpected` 增加 `{{message}}` + `diagnoseServer` key |
+
+---
+
+## 七、数据流总览
+
+### 7.1 MCP 运行时数据流
+
+```
+settings.json
+  → McpManager::enabled_servers()               [过滤 enabled]
+    → state_cache 检查                          [缓存优先]
+      → verify_server()                         [缓存未命中: MCP initialize 握手]
+        → McpServerState::Running{tools}        [更新缓存]
+          → to_acp_mcp_servers()                [仅 healthy]
+            → WorkerInvocation.mcp_servers      [结构化配置]
+              → AcpProvider                     [&req.mcp_servers]
+                → client::run_prompt()          [ACP session/new]
+                  → Agent 直连 MCP             [路径 B: 不中转]
+```
+
+### 7.2 SKILL 运行时数据流
+
+```
+磁盘 (.sasuke/skills/<name>/SKILL.md)
+  → scan_skills_dir()                           [扫描目录 + 解析前置元数据]
+    → SkillManager::list()                      [global + project 分离]
+      → catalog_skills_for_agent_workspace()    [按 workspace 过滤]
+        → apply_skill_overrides()               [Project > Global 去重]
+          → select_catalog_skills()             [50KB 预算截断]
+            → render_skill_catalog_for_workspace()
+              → read_body_for_meta()            [读取 SKILL.md 正文]
+                → MiniJinja 渲染模板            [has_skills + body 嵌入]
+                  → WorkerInvocation.skill_catalog
+                    → system.md {{skill_catalog}}
+                      → ACP _meta.systemPrompt.append
+                        → Agent 收到完整 SKILL 指令
+```
+
+---
+
+## 八、与 Zed 的完整差异矩阵
+
+| 功能领域 | 能力 | Zed | sasuke | 差距 |
+|----------|------|-----|-----------|------|
+| **MCP — 配置** | JSON 编辑器 | ✅ | ✅ | — |
+| | Stdio + HTTP 传输 | ✅ | ✅ | — |
+| | OAuth 支持 | ✅ | ✅ (simplified) | 小幅 |
+| **MCP — 健康** | initialize 握手 | ✅ | ✅ | — |
+| | 统一协议 (HTTP 也发 initialize) | ✅ | ✅ | — |
+| | 状态机 | ✅ (7 states) | ✅ (5 states) | 小幅 |
+| | 状态缓存 | ✅ (内存) | ✅ (RefCell) | — |
+| | 工具发现 (tools/list) | ✅ | ✅ | — |
+| | 工具订阅 (list_changed) | ✅ | 🔜 | 待实施 |
+| | 长期进程 | ✅ | 🔜 | 待实施 |
+| **MCP — 传递** | ACP mcpServers | ✅ | ✅ | — |
+| | System Prompt 工具列表 | ✅ (cached) | ✅ (cached) | — |
+| | 健康门控 | ✅ | ✅ | — |
+| **SKILL — 管理** | 文件系统存储 | ✅ | ✅ | — |
+| | 全局 + 项目级 | ✅ | ✅ | — |
+| | 前置元数据解析 | ✅ | ✅ | — |
+| | SKILL.md 编辑 UI | ✅ | ✅ | — |
+| **SKILL — 传递** | System Prompt 目录 | ✅ | ✅ (Zed 模板) | — |
+| | Body 嵌入 | ✅ (lazy via SkillTool) | ✅ (eager 全量) | 不同路径 |
+| | 优先级去重 | ✅ | ✅ | — |
+| | Token 预算 | ✅ (50KB) | ✅ (50KB) | — |
+| | 项目隔离 | ✅ (ProjectState) | ✅ (workspace filter) | — |
+| **SKILL — 调用** | SkillTool (Agent 工具) | ✅ | ❌ | 路径 A 替代 |
+| | 斜杠命令 | ✅ | ✅ | 只索引元数据并发送普通文本，不做正文注入 |
+| | Mention 附件 | ✅ | ❌ | ACP 约束 |
+| | Body 懒加载 | ✅ | ❌ | eager 替代 |
+| **SKILL — 安全** | 项目信任门控 | ✅ | 🔜 | 待实施 |
+| | XML envelope 转义 | ✅ | N/A (无 envelope) | — |
+
+---
+
+## 九、后续规划
+
+### Phase 1 (本次已完成) ✅
+- MCP 配置管理 (CRUD + JSON 编辑器 + 健康检查)
+- MCP ACP 传递链路修复 (mcpServers 不再为空)
+- SKILL 配置管理 (CRUD + 文件系统)
+- SKILL System Prompt 注入 (Zed 模板格式 + body 嵌入)
+- 优先级去重 + Token 预算 + 项目隔离
+- 前端 UI (三个 Tab + 错误处理优化)
+- 协议统一 (HTTP 发合法 MCP initialize + 多行响应)
+
+### Phase 2 (后续 PR)
+- [ ] 长期进程管理 (Stdio 进程保持存活)
+- [ ] `tools/list_changed` 订阅
+- [ ] 信任门控 (C+1 方案: 本地自动信任 + 外部弹窗 + settings.json)
+
+### Phase 3 (远期)
+- [ ] BuiltIn SKILL 支持
+- [ ] File watch 自动刷新
+- [ ] AI-DYNAMIC 节点 MCP/SKILL 覆盖
+
+---
+
+> 基于 5 轮深度访谈 | 6 个规格文档 | 25 个文件代码变更
+> 生成日期：2026-06-11 | 最终歧义度: < 5%
