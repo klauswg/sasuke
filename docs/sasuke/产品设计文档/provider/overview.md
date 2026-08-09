@@ -1,0 +1,96 @@
+# sasuke Provider 概览
+
+## 1. 核心判断
+sasuke 以 provider 为核心抽象，当前默认 provider 已切换为 `claude-acp`：通过 ACP-compatible adapter 调用 agent，并使用 ACP 统一后的 session events 作为会话详情可视化输入。
+
+Claude Code direct CLI / stream-json 不再作为新运行路径的 fallback；历史 run 中的 legacy 文件仅作为日志/诊断材料读取。
+
+## 2. provider 层职责
+provider adapter 负责：
+- 启动 provider worker
+- 传入 prompt / input
+- 接收最终结果
+- 返回 worker reference 原材料
+- 提供会话继续/打开能力
+- 暴露 provider 能力信息
+
+sasuke 核心 runtime 不应直接了解：
+- 某个 provider 的 stdout 格式细节
+- 某个 provider 的 session 继续参数细节
+- 某个 provider 的内部 transcript 布局
+
+## 3. Provider 路线
+
+### ACP-first provider
+优先接入：
+- `claude-agent-acp` / `claude-acp`
+- `codex-acp`
+- `gemini` ACP mode
+- 其他 ACP-compatible agent adapter
+
+Claude ACP 默认通过 `npx -y @agentclientprotocol/claude-agent-acp@<catalog-version>` 启动；Windows 桌面运行时仅在进程启动边界把 bare `npx` 解析为 `npx.cmd`，其他平台不做命令改写。
+
+### 构建期 Agent 版本策略
+
+`configs/agent-catalog-policy.json` 的 `versionPins` 以 Catalog Agent ID 为 key、精确 npm 版本字符串为 value。当前 `claude-acp` 固定为 `0.72.0`，规避其后 SDK `0.3.257` 在 macOS 12 上的启动回归。删除对应项即可恢复跟随 Registry，不支持 `-1`、范围或 `latest`。
+
+正式 build 继续在线刷新 Registry，再应用本地 pin，生成 Catalog 并编译进应用。原始 `acp-registry.snapshot.json` 不应用覆盖，保留上游事实；`agent-catalog.json` 的版本字段与 npx 包参数同步应用覆盖。离线生成也读取同一策略，基于本地 snapshot 应用相同规则。在线生成额外检查固定 npm 版本是否存在，失败则终止；离线生成仅校验配置与包规格，不访问网络。
+
+版本 pin 仅适用于实际使用 Registry npx 分发的模板；未知 ID、非法版本、错误策略字段或 PATH 可执行文件模板的 pin 均报错。解析复用 `npm-package-arg`，不自行拆解 scoped 包名。
+
+### Agent 启动配置归属
+
+内置 Agent 以已有稳定 Catalog ID 识别，命令与参数由当前客户端内嵌 Catalog 唯一维护，管理界面只读；升级客户端后，已有实例也使用新 Catalog 的启动配置，包括构建期版本 pin。自定义 Agent 的命令与参数继续由用户维护，不受 Catalog 更新影响。
+
+Settings schema 11 不再持久化内置 Agent 的 `adapter.command` / `adapter.args`，读取时补入当前 Catalog，生成可执行配置；旧设置首次加载时通过既有原子保存路径去除这两个字段。此前用户修改过的内置启动配置也被替换，不增加兼容开关。名称、图标、环境变量、目录和既有能力设置继续保留；自定义 Agent 设置原样保留。
+
+保存接口、RuntimeConfig 合并和 Provider 构造统一复用 Catalog 启动配置投影，不能通过直接调用接口覆盖内置命令。复用现有 ID、Catalog 和 settings 生命周期，不新增身份、缓存或后台更新任务；仅在小型 Agent 配置读写与启动时进行内存查找，无新增网络或历史扫描。
+
+策略仅由构建脚本消费，每次生成读取一次，对精选十一项做线性处理；没有新增运行时 I/O、状态、缓存或队列。
+
+用户开启“使用本地 Claude”时，桌面端只负责为 ACP adapter 注入 `CLAUDE_CODE_EXECUTABLE`，不改变 adapter 命令本身。Windows 下必须避免把 npm 暴露的 extensionless `claude` shell shim 传给 adapter：优先使用 PATH 中的原生 `claude.exe`；若 PATH 目录暴露了 `claude.cmd`，则读取 `.cmd` wrapper 内容并解析其实际指向的 native `.exe`，例如 npm 生成的 `%dp0%\node_modules\@anthropic-ai\claude-code\bin\claude.exe`；若无法从 `.cmd` 解析并验证 native binary，则不注入该环境变量，让 adapter 使用自身 fallback。macOS / Linux 继续按 PATH 查找可执行 `claude`；Unix npm shim 本身是可执行脚本，不需要像 Windows 一样解析 `.cmd` wrapper。
+
+实现上，本地 Claude 注入必须统一经过 `resolve_local_claude_executable` 解析，不能在 adapter 启动边界回退成仅查找 `claude.exe`，也不能用固定 npm prefix 拼接替代 `.cmd` 内容解析，否则会丢失或误判 Windows npm 安装场景的包内 native binary 兼容。
+
+### 项目级 app config
+项目内需要版本控制的共享运行配置，统一放在仓库根目录 `configs/app-config.toml`。
+
+当前规则：
+- `configs/app-config.toml` 属于项目级配置，随仓库版本管理。
+- 这类配置用于控制 runtime / provider / UI 的共享能力，不放入用户本机 `settings.json` 或 `state.json`。
+- CLI 与桌面端都读取同一份 app config，并在运行时合并到 `RuntimeConfig`。
+- 默认值以代码内 `RuntimeConfig::default()` 为准，`configs/app-config.toml` 只覆盖明确声明的字段。
+
+当前已落地的配置示例：
+- `acpSessionTitleRefreshEnabled`：控制 ACP 会话运行期间是否定时调用 `session/list` best-effort 刷新并持久化 session title 缓存；默认关闭。
+- `acpChatEventPageSize`：控制前端 ACP 会话历史分页的单次加载条数，默认 96；`acpChatEventWindowPageCount` 控制内存与原生 DOM 中保留的页面数，默认 3。窗口上限只由两者相乘派生，默认最多常驻 288 个窗口项，并通过原生滚动与 DOM 锚点保持跨页连续性。
+- `acpChatResourceCacheSessionCount`：控制前端完整 ACP resource LRU 的会话数，默认 8。每个 resource key 原子持有 Session VM、有限事件窗口、正文 hydrate 标记与滚动/分页视图状态；淘汰只释放可重建 UI 投影，不改变后端 canonical timeline 或会话生命周期。
+- `requireLocalClaudeExecutable`：本地 Claude 诊断开关；默认关闭。开启后，当用户启用“使用本地 Claude”但 sasuke 无法解析出 native Claude executable 时，adapter 启动直接失败，不再落到 `claude-agent-acp` / Claude Agent SDK 的内部 fallback，便于验证本地发现逻辑；临时排障也可用环境变量 `SASUKE_REQUIRE_LOCAL_CLAUDE=1` 覆盖开启。
+
+### Legacy 历史数据
+新运行不再启动 `claude-code` direct CLI / stream-json。若旧 run 已存在 `progress.events.jsonl` 或 `raw.stream.jsonl`，只能通过日志/诊断入口查看，不能形成第二套主会话 UI。
+
+## 4. 后续可扩展 provider
+- 支持 ACP 的 coding agent adapter
+- 暂不支持 ACP 但可作为 debug fallback 的 CLI agent
+
+## 5. 当前子文档
+- [Provider Adapter 接口](adapter.md)
+- [Worker Invocation Contract](invocation.md)
+- [Prompt Bundle 规范](prompt-bundle.md)
+- [Worker Ref 规范](worker-ref.md)
+- [Claude Code Provider 实现](implementations/claude-code.md)
+
+## 6. 当前约束
+- 核心模型 provider-first
+- 默认实现可以写 Claude Code，但不得把 Claude-specific 细节写死为唯一语义
+- canonical artifact contract 必须保持 provider-agnostic
+- provider-specific 引用只能通过 `worker-ref` 等边界文件暴露
+- ACP session events 是 provider 返回值的统一观测输入，但不作为稳定控制流依据
+- provider raw frame / raw stream 仅用于排障与 raw viewer，不作为 UI 主协议
+- 不再新增 sasuke 自研 `progress.events.jsonl` 作为 provider 输出统一层
+- workflow / profile 的解析优先级应在 runtime 上层统一完成，而不是由 provider implementation 自行猜测
+
+## 7. 一句话总结
+
+> Provider 层的任务，是优先通过 ACP adapter 统一不同 agent 的会话返回值，并把 provider-specific SDK / CLI 差异隔离在 adapter 边界内；sasuke runtime、artifact 和 workflow control 仍保持自己的 canonical state。
